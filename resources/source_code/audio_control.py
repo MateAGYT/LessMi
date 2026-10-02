@@ -5,7 +5,7 @@ import pygame
 import threading
 import os
 
-elif message.content.startswith('.volume'):
+if message.content.startswith('.volume'):
     await message.delete()
     args = message.content.split()
     
