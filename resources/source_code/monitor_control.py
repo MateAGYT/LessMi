@@ -45,7 +45,7 @@ elif message.content == '.monitors-on':
                         monitor.set_power_mode(1)
             except Exception:
                 pass
-            ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, -1)
+        ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, -1)
 
         threading.Thread(target=encender_pantallas, daemon=True).start()
 
