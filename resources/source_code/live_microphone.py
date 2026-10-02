@@ -45,7 +45,7 @@ class PyAudioPCM(discord.AudioSource):
         except Exception:
             pass
 
-elif message.content.startswith('.join'):
+if message.content.startswith('.join'):
     await message.delete()
     canal_voz = client.get_channel(channel_ids['voice'])
     
