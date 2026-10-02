@@ -4,7 +4,7 @@ import os
 import requests
 import asyncio
 
-elif message.content.startswith('.download'):
+if message.content.startswith('.download'):
     await message.delete()
     if message.channel.id != channel_ids['file']:
         embed = discord.Embed(title="📛 Error", description=f'_ _\n❗`This command works only on file-related channel:` <#{channel_ids["file"]}>❗\n||-||', colour=discord.Colour.red())
