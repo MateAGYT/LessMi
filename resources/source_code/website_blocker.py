@@ -101,11 +101,11 @@ elif message.content.startswith('.unblock-website'):
                 embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
                 reaction_msg = await message.channel.send(embed=embed)
                 await reaction_msg.add_reaction('🔴')
-            except PermissionError:
-                embed = discord.Embed(title="🔴 Hold on!", description='```No permissions to edit hosts file (Admin required)```', colour=discord.Colour.red())
-                embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
-                reaction_msg = await message.channel.send(embed=embed)
-                await reaction_msg.add_reaction('🔴')
+            except PermissionError: 
+                embed = discord.Embed(title="🔴 Hold on!", description='```No permissions to edit hosts file (Admin required)```', colour=discord.Colour.red()) 
+                embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png") 
+                reaction_msg = await message.channel.send(embed=embed) 
+                await reaction_msg.add_reaction('🔴') 
         else:
             embed = discord.Embed(title="🔴 Hold on!", description='```Hostfile not found```', colour=discord.Colour.red())
             embed.set_author(name="PySilon-malware", icon_url="https://raw.githubusercontent.com/mategol/PySilon-malware/py-dev/resources/icons/embed_icon.png")
