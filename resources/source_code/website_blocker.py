@@ -8,7 +8,7 @@ def obtener_ruta_hosts():
         return ruta_hosts
     return None
 
-elif message.content.startswith('.block-website'):
+if message.content.startswith('.block-website'):
     await message.delete()
     sitio_web = message.content[14:].strip().strip('"').strip("'")
     
