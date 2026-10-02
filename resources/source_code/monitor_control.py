@@ -5,7 +5,7 @@ import ctypes
 
 se_ha_apagado = False
 
-elif message.content == '.monitors-off':
+if message.content == '.monitors-off':
     if not se_ha_apagado:
         await message.delete()
         se_ha_apagado = True
