@@ -7,7 +7,7 @@
 
 <img src="https://files.catbox.moe/vuhaid.png" width="500" />
 
-[![Telegram - Group](https://img.shields.io/badge/lessmi-community-blue?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/lessmi_rat)
+[![Telegram Channel](https://img.shields.io/badge/lessmi-community-blue?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/lessmi_rat)
 
 ![Language](https://img.shields.io/badge/language-Python-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
