@@ -290,7 +290,7 @@ It's temporarily unavailable — the grabber module is being reworked. Use `.cmd
 **Compile fails on dependencies.**
 Update `pip` (`python -m pip install --upgrade pip`) and re-run the `.bat`. Ensure you're on a real Windows machine, not Wine.
 
-**`monitors-off` and now it's black.**
+**I executed `.monitors-off` and now it's black.**
 That's intended — run `.monitors-on`. Same for `.kill-explorer` → `.start-explorer`.
 
 **Is it cross-platform?**
@@ -317,7 +317,6 @@ Windows only. macOS/Linux are not supported (yet).
   <br />
   <sub>1/62 detections — <a href="https://www.virustotal.com/gui/file/ef97165978ade6288fac42bfe9df497c3cfbc583d83d31a90effb48cd9b98b99?nocache=1">See the full report in VirusTotal.</a></sub>
 </div>
----
 
 # 🙏 Credits
 
