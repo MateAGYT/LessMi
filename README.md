@@ -7,7 +7,7 @@
 
 <img src="https://files.catbox.moe/vuhaid.png" width="500" />
 
-Join our Telegram community to stay tuned of the last changes and support us!<br>
+Join our Telegram community to stay tuned of the last changes and support us!<br><br>
 [![Telegram Channel](https://img.shields.io/badge/lessmi--community-blue?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/lessmi_rat)
 
 ![Language](https://img.shields.io/badge/language-Python-3776AB?logo=python&logoColor=white)
