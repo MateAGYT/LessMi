@@ -327,7 +327,7 @@ Windows only. macOS/Linux are not supported (yet).
 # 🗺️ Roadmap
 
 - [ ] **Slash commands** — clone every prefix command as a slash command.
-- [x] ~~Restore the **`take all` grabber** module.~~ ✅ **Done — fully available.**
+- [x] Restore the **`take all` grabber** module.
 - [ ] Even more commands (always).
 - [ ] Signed release binaries to reduce AV false positives.
 - [ ] Optional multi-bot sharding for large fleets.
