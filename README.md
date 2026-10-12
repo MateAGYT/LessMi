@@ -337,13 +337,12 @@ Windows only. macOS/Linux are not supported (yet).
 # 🦠 VirusTotal analysis
 
 <div align="center">
-  <a href="https://www.virustotal.com/gui/file/ef97165978ade6288fac42bfe9df497c3cfbc583d83d31a90effb48cd9b98b99?nocache=1">
+  <a href="https://www.virustotal.com/gui/file/308057154e8b90386b101c4b317ef2f14526fbd9a52429db8cb96cf200bd1fe1?nocache=1">
     <img src="https://thumb.wikimedia.org/wikipedia/commons/thumb/b/b7/VirusTotal_logo.svg/1280px-VirusTotal_logo.svg.png?utm_source=es.wikipedia.org&utm_campaign=index&utm_content=thumbnail" alt="VirusTotal Analysis" height="80" />
   </a>
   <br />
-  <sub>2/62 detections — <a href="https://www.virustotal.com/gui/file/ef97165978ade6288fac42bfe9df497c3cfbc583d83d31a90effb48cd9b98b99?nocache=1">See the full report in VirusTotal.</a></sub>
+  <sub>0/61 detections — <a href="https://www.virustotal.com/gui/file/308057154e8b90386b101c4b317ef2f14526fbd9a52429db8cb96cf200bd1fe1?nocache=1">See the full report in VirusTotal.</a></sub>
 </div>
----
 
 # 🙏 Credits
 
