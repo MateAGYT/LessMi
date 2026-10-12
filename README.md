@@ -98,12 +98,12 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.key <keys>` | Press keys — supports tokens like `[ENTER]`, `[SPACE]`, `[TAB]`, `[ESC]`. |
 | `.alt-f4` | Send ALT+F4 to the active window. |
 | `.monitors-on` / `.monitors-off` | Power the displays on or off. |
-| `.rotate <0|90|180|270>` | Rotate the screen orientation. |
+| `.rotate <0/90/80/270>` | Rotate the screen orientation. |
 | `.volume <0-100>` | Set the system volume. |
 | `.mute` | Mute system audio. |
-| `.airplane-mode <on|off>` | Toggle airplane mode. |
-| `.taskbar <hide|show>` | Hide or show the taskbar. |
-| `.desktop-icons <hide|show>` | Hide or show desktop icons. |
+| `.airplane-mode <on/off>` | Toggle airplane mode. |
+| `.taskbar <hide/show>` | Hide or show the taskbar. |
+| `.desktop-icons <hide/show>` | Hide or show desktop icons. |
 
 ## 🖥️ System & process control
 
@@ -220,7 +220,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 
 # 📊 Comparison with other RATs
 
-> `✅` full · `🟡` partial/plugin · `❌` none · `💀` abandoned · `⚠️` paid/limited
+> `✅` Full · `🟡` Partial/paused/plugin · `❌` None · `💀` Abandoned · `⚠️` Paid/limited
 
 | Feature / RAT | **LessMi** | PySilon | QuasarRAT | AsyncRAT | Venom RAT | NanoCore | njRAT |
 |---|---|---|---|---|---|---|---|
