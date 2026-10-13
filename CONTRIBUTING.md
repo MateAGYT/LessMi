@@ -111,9 +111,7 @@ refactor: clean on_message logic
    `python -m py_compile source_assembled.py builder.py`
 2. Describe what your PR changes and why.
 3. Link the related issue if there is one.
-
-> **NOTE: YOUR PULL REQUEST NEEDS NOT TO BE OBFUSCATED OR A CLOSE SOURCE.**
-5. Be responsive to review feedback.
+4. Be responsive to review feedback.
 
 ## License / Notice
 
@@ -121,3 +119,5 @@ This project is released for **educational purposes**. The creator is not
 responsible for any illegal or malicious use of the software, nor for any
 direct or indirect damage caused by it. Test it, enjoy it, and use it
 responsibly.
+
+> **NOTE: YOUR PULL REQUEST NEEDS NOT TO BE OBFUSCATED OR A CLOSE SOURCE.**
