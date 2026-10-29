@@ -1,3 +1,4 @@
+discord.py[voice]
 discord.py
 PyNaCl
 aiohttp
@@ -9,10 +10,12 @@ pillow
 opencv-python-headless
 numpy
 imageio
+audioop-lts
 imageio-ffmpeg
 sounddevice
 pynput
 pyautogui
+pycryptodomex
 plyer
 psutil
 pywin32
@@ -21,3 +24,4 @@ pycaw
 pygrabber
 ffmpeg-python
 pypiwin32
+pycryptodome

