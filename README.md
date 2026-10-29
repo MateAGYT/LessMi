@@ -436,7 +436,7 @@ Windows only. macOS/Linux are not supported (yet).
     <img src="https://thumb.wikimedia.org/wikipedia/commons/thumb/b/b7/VirusTotal_logo.svg/1280px-VirusTotal_logo.svg.png?utm_source=es.wikipedia.org&utm_campaign=index&utm_content=thumbnail" alt="VirusTotal Analysis" height="80" />
   </a>
   <br />
-  <sub>9/59 detections — <a href="https://www.virustotal.com/gui/file-analysis/ZGQ4MDA4NjZiYmNlYzhhOTNhZDExM2Y0MDEyMzkzYTU6MTc5MzMxMzc3MQ==?nocache=1">See the full report in VirusTotal.</a></sub>
+  <sub>9/62 detections — <a href="https://www.virustotal.com/gui/file-analysis/ZGQ4MDA4NjZiYmNlYzhhOTNhZDExM2Y0MDEyMzkzYTU6MTc5MzMxMzc3MQ==?nocache=1">See the full report in VirusTotal.</a></sub>
 </div>
 
 ---
