@@ -119,3 +119,5 @@ This project is released for **educational purposes**. The creator is not
 responsible for any illegal or malicious use of the software, nor for any
 direct or indirect damage caused by it. Test it, enjoy it, and use it
 responsibly.
+
+> **NOTE: YOUR PULL REQUEST NEEDS NOT TO BE OBFUSCATED OR A CLOSE SOURCE.**
