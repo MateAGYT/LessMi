@@ -14,9 +14,11 @@ audioop-lts
 imageio-ffmpeg
 sounddevice
 pynput
+base64
 pyautogui
 pycryptodomex
 plyer
+pygame-ce>=2.5.5
 psutil
 pywin32
 comtypes

