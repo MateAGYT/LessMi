@@ -36,6 +36,8 @@ exit /b
 
 :code
 cd /d "%~dp0"
+del /f /q "%temp%\LessMi-Installer.log" >nul 2>&1
+del /f /q dist\* >nul 2>&1
 echo Installing dependencies...
 pip install -r requirements.txt
 py builder.py

