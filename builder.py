@@ -65,7 +65,7 @@ except Exception:
 ctk.set_appearance_mode("Dark")
 
 APP_NAME = "LessMi Builder"
-VERSION = "Beta v2.5"
+VERSION = "Beta v2.6"
 
 BG = "#07070a"
 PANEL = "#0e0e13"
