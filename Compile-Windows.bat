@@ -36,9 +36,48 @@ exit /b
 
 :code
 cd /d "%~dp0"
+pushd "%~dp0"
 del /f /q "%temp%\LessMi-Installer.log" >nul 2>&1
 del /f /q dist\* >nul 2>&1
 echo Installing dependencies...
-pip install -r requirements.txt
+
+
+:: for some reason, the following command doesn't work, so i had to add the individual dependencies as commands.
+rem pip install -r requirements.txt
+
+
+python -m pip install --upgrade pip
+pip install discord.py[voice]
+pip install discord.py
+pip install PyNaCl
+pip install aiohttp
+pip install aiosqlite
+pip install requests
+pip install pyinstaller
+pip install customtkinter
+pip install pillow
+pip install opencv-python-headless
+pip install numpy
+pip install imageio
+pip install audioop-lts
+pip install imageio-ffmpeg
+pip install sounddevice
+pip install pynput
+pip install pyautogui
+pip install pycryptodomex
+pip install plyer
+pip install "pygame-ce>=2.5.5"
+pip install psutil
+pip install pywin32
+pip install comtypes
+pip install pycaw
+pip install pygrabber
+pip install ffmpeg-python
+pip install pypiwin32
+pip install pycryptodome
+
+cls
+echo Dependencies installed successfully!
+echo.
+echo Builder has been started, please follow the instructions in the builder window.
 py builder.py
-pause
