@@ -80,4 +80,4 @@ cls
 echo Dependencies installed successfully!
 echo.
 echo Builder has been started, please follow the instructions in the builder window.
-py builder.py
+python builder.py
