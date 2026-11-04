@@ -15,7 +15,7 @@ Join our Telegram community to stay tuned of the last changes and support us!<br
 ![Control](https://img.shields.io/badge/control-Discord-5865F2?logo=discord&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-active-brightgreen)
-![Commands](https://img.shields.io/badge/commands-250%2B-orange)
+![Commands](https://img.shields.io/badge/commands-280%2B-orange)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 
 > **`MateAGYT/LessMi` is the ONLY official repository.** Don't install or run any other repo claiming to be us, or an "advanced/paid" version!
@@ -31,18 +31,22 @@ Join our Telegram community to stay tuned of the last changes and support us!<br
 - [3. Features](#️-features)
   - [Surveillance & media](#-surveillance--media)
   - [Display, theme & appearance](#-display-theme--appearance)
+  - [Display glitches](#-display-glitches)
   - [Input & hardware control](#️-input--hardware-control)
   - [System & process control](#️-system--process-control)
   - [Hardware & system inventory](#-hardware--system-inventory)
   - [Recon](#-recon)
   - [Filesystem](#-filesystem)
   - [Network & persistence](#-network--persistence)
+  - [Disk-level persistence (rootkit)](#-disk-level-persistence-rootkit)
   - [Network diagnostics](#-network-diagnostics)
   - [Security & policy toggles](#️-security--policy-toggles)
+  - [Keylogger & clipboard](#-keylogger--clipboard)
   - [Trolling & pranks](#-trolling--pranks)
   - [Remote shell](#️-remote-shell)
   - [Bot control](#-bot-control)
   - [Power & destructive](#-power--destructive)
+  - [Misc tools](#-misc-tools)
   - [Extra / hidden commands](#-extra--hidden-commands)
 - [4. Why LessMi?](#-why-lessmi)
 - [5. Comparison with other RATs](#-comparison-with-other-rats)
@@ -62,7 +66,9 @@ Join our Telegram community to stay tuned of the last changes and support us!<br
 
 **LessMi** is a lightweight, fully-featured Remote Administration Tool for **Windows**, written in **Python** and commanded from a **Discord bot**. There is no ugly GUI client to keep open — your "control panel" is Discord itself, so you can manage one machine or a whole fleet of them from your phone, laptop, or a friend's PC.
 
-It ships with an **interactive button panel** covering screenshots, system control, devices, processes, trolling, files, security, power, info and tools, so beginners can click instead of memorizing commands, while power users get the full command-line speed. Type `.help` at any time to open the category menu with every command dumped straight into Discord.
+It ships with an **interactive button panel** covering screenshots, system control, devices, processes, trolling, files, security, power, info and tools, so beginners can click instead of memorizing commands, while power users get the full command-line speed. Type `.help` at any time to open the 18-category reference with every command, its syntax, its limits and its caveats dumped straight into Discord.
+
+On top of the usual RAT surface, LessMi carries a **disk-level rootkit** — a transactional MBR stub, a raw payload copy near the end of the disk and a stash on the EFI partition — plus a 41-effect GDI **display glitch engine**, a keylogger and a clipboard mirror.
 
 LessMi is a modern, actively-maintained fork and spiritual successor to **PySilon** — a project that is now effectively **abandoned** — rebuilt with more features, more stability, and a proper install flow.
 
@@ -72,7 +78,9 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 
 **a) Disclaimer.** Code and information in this repository are for **educational purposes only**. The creator is in **no way responsible** for any illegal or malicious activity carried out with this project. It is recommended for testing and legal activities. If you install it on someone else's computer, **ask them for permission** first.
 
-**b) License.** This project is protected by the **MIT License**. See the [`LICENSE`](LICENSE) file for full details. You are free to use, modify, and redistribute it as long as the license and copyright notice are preserved.
+**b) Rootkit warning.** `.rootkit mbr` writes to the **first sector of `\\.\PhysicalDrive0`**. The write is validated and rolled back on mismatch, and a triple backup is kept, but you are still modifying the boot sector of a real disk. Read [Disk-level persistence](#-disk-level-persistence-rootkit) before using it.
+
+**c) License.** This project is protected by the **MIT License**. See the [`LICENSE`](LICENSE) file for full details. You are free to use, modify, and redistribute it as long as the license and copyright notice are preserved.
 
 ---
 
@@ -86,10 +94,10 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 |---|---|
 | `.ss` | Screenshot **all** connected monitors. |
 | `.ss-window <title>` | Screenshot a single window matched by title. |
-| `.screenrec <seconds>` | Record the screen for a chosen duration. |
-| `.webcam` | Capture a picture from the webcam. |
-| `.camrec <seconds>` | Record video from the selected camera. |
-| `.list-cams` / `.sel-cam <id>` | List cameras and pick the default one for `.webcam`. |
+| `.screenrec <seconds>` | Record the screen for a chosen duration (10 fps, max 300 s). |
+| `.webcam` | Capture a picture from the selected camera. |
+| `.camrec <seconds>` | Record video from the selected camera (max 120 s, re-encoded). |
+| `.list-cams` / `.sel-cam <id>` | List cameras and pick the default one for `.webcam` / `.camrec`. |
 | `.list-mics` / `.sel-mic <id>` | List microphones and pick the default one for `.join`. |
 | `.join` / `.disconnect` | Join the **live microphone feed** 24/7, or leave it. |
 | `.record <seconds>` / `.mic-record <seconds>` | Instantly record the mic and send the clip. |
@@ -109,10 +117,31 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.dark-mode <on\|off>` | Toggle Windows dark mode. |
 | `.night-light <on\|off>` | Toggle Night Light. |
 | `.invert` | Invert all screen colors for 10 seconds. |
-| `.set-wallpaper <file\|url>` / `.wallpaper-random` | Change the wallpaper to a file, URL or a random stock image. |
+| `.set-wallpaper <file\|url>` / `.wallpaper-random` / `.ss-wall` | Change the wallpaper to a file, a URL, a random stock image, or the current screen. |
 | `.accent <name\|#hex>` | Change the bot's embed accent color. |
 | `.taskbar <hide\|show>` | Hide or show the taskbar. |
 | `.desktop-icons <hide\|show>` | Hide or show desktop icons. |
+| `.img-filter <fx> <file>` | Apply `blur`, `sharpen`, `edges`, `emboss`, `gray`, `invert`, `poster` or `solar` to an image. |
+| `.toico <file>` | Convert an image into a multi-size `.ico`. |
+
+## 🖼️ Display glitches
+
+`.display-glitch <effect>` paints over the desktop with raw GDI calls. `.display-glitch list` enumerates the 41 effects.
+
+```
+invert              noise               lines               invert_squares
+color_squares       diagonal_lines      snowfall            hypnotic_spirals
+random_lines        screen_collapse     glitch_tunnel       block_glitch
+matrix_rain         pixel_melter        vhs_static          pixelate_wave
+rgb_split           screen_shake        corrupted_text_bars vortex_twirl
+scanline_flicker    mirror_dimension    screen_fracture     color_bleed
+horizontal_tear     digital_earthquake  checkerboard_void   strobe_stripes
+pixel_explosion     wave_distortion     quad_mirror         crt_defrag
+vhs_tracking_loss   invert_sweep        static_snow_storm   kaleidoscope_glitch
+screen_fold         hologram_flicker    blackhole_siphon    corrupted_grid
+```
+
+Everything runs on a daemon thread, so the bot stays responsive while the screen melts.
 
 ## 🖱️ Input & hardware control
 
@@ -126,6 +155,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.click [n]` | Send N left clicks. |
 | `.chaos [n] [folder]` | Delete a random file per click. |
 | `.autoclick <on\|off> [interval]` | Continuous auto-clicker. |
+| `.hold [seconds]` | Hold the left mouse button down. |
 | `.mouse-speed <1-20>` / `.swap-mouse <on\|off>` | Pointer speed and left/right swap. |
 | `.alt-f4` | Send ALT+F4 to the active window. |
 | `.volume <0-100>` / `.vol-step <up\|down> [n]` | Set or step the system volume. |
@@ -134,7 +164,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.bluetooth <on\|off>` | Toggle Bluetooth radios. |
 | `.capslock` / `.numlock` / `.scrolllock` `<on\|off>` | Force lock-key states. |
 | `.sticky-keys <on\|off>` | Toggle Sticky Keys. |
-| `.unpin-all` / `.restart-taskbar` | Clear taskbar pins, restart explorer. |
+| `.unpin-all` / `.restart-taskbar` / `.tbar [n]` | Clear taskbar pins, restart explorer, dance the taskbar. |
 | `.enable-device <n>` / `.disable-device <n>` | Manage hardware devices. |
 
 ## 🖥️ System & process control
@@ -149,7 +179,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.disable-cmd` / `.enable-cmd` | Toggle Command Prompt. |
 | `.disable-reagentc` / `.enable-reagentc` | Toggle ReAgentC (recovery). |
 | `.set-critical` / `.unset-critical` | Mark the process critical (BSOD on terminate). |
-| `.blacklist <proc>` / `.unblacklist <proc>` | Block a process from running. |
+| `.blacklist <proc>` / `.unblacklist <proc>` | Block a process from running, via a WMI process-start watcher. |
 | `.idle-time` | Report how long the user has been idle. |
 | `.set-date <date>` / `.set-hour <time>` | Change system date/time. |
 | `.deactivate-windows` | Deactivate Windows. |
@@ -176,6 +206,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.whoami` / `.env` / `.sessions` / `.users` | Identity, environment, sessions, local accounts. |
 | `.hotfix` / `.antivirus` / `.drivers` / `.events` | Hotfixes, registered AV, drivers, event log. |
 | `.wifi` | Dump every saved WiFi profile with its key. |
+| `.perf` / `.pstree` / `.boot-info` | Load, process tree, boot time and uptime. |
 
 ## 🔍 Recon
 
@@ -215,6 +246,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.recent` / `.usb` | Recently opened files, USB history. |
 | `.empty-temp` / `.hosts` | Wipe temp folders, read the hosts file. |
 | `.mount-iso <file>` / `.unmount-iso <file>` | Mount or unmount an ISO. |
+| `.cloak <path>` / `.lock-folder <path>` / `.unlock-folder <path>` | Hide, deny-delete or restore a folder. |
 
 ## 🌐 Network & persistence
 
@@ -231,7 +263,29 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.admin-check` | Report whether the RAT has admin rights. |
 | `.ask-admin` | Request admin via a UAC prompt. |
 | `.uac-bypass` | Attempt a UAC bypass for elevation. |
-| *(startup)* | **Persistence + UAC bypass at boot**, out of the box. |
+| *(startup)* | **Persistence + UAC bypass at boot**, out of the box: two clone slots, a `Userinit` entry, two scheduled tasks, a self-healing watchdog batch and Defender exclusions. |
+
+## 💾 Disk-level persistence (rootkit)
+
+Manual by design — nothing is installed on boot, everything runs behind `.rootkit`. Each write is preflight-checked, read back and **rolled back automatically** if the read-back differs.
+
+| Sub | What it does |
+|---|---|
+| `.rootkit status` | MBR state, stub verification, disk size, raw-slot state, backup presence. |
+| `.rootkit mbr` | Backup to file + sha + journal → write original to LBA1 → verify → write stub to LBA0 → verify. Rollback on any mismatch. |
+| `.rootkit unmbr` | Restore from file or LBA1, sha-checked against the journal, write verified. |
+| `.rootkit slot` | Store a raw copy of the payload 16 MB before the end of the disk, sha256 in the header. |
+| `.rootkit recover` | Recover that copy, verify sha and `MZ`, launch it from `%TEMP%`. |
+| `.rootkit esp` | Copy the payload into the EFI System Partition (`EFI\Microsoft\Boot`). Survives a `C:` format. |
+| `.rootkit esp-clean` | Remove those ESP copies. |
+| `.rootkit install` | `mbr` + `slot` + `esp` in one call. |
+| `.rootkit clean` | `unmbr` + `esp-clean` + delete backups and journal. |
+
+**Hard refusals — nothing gets written:** no admin, missing `55AA` signature, empty partition table, a partition starting at LBA0 or LBA1, disk under 4 MB, unreadable disk, MBR already instrumented.
+
+**Reality check.** On UEFI/GPT the MBR is the *protective* one, so the stub only executes under CSM. The write is harmless there — the `0xEE` entry and the 4-byte disk signature are preserved — but it does not hijack the boot chain. `.rootkit esp` is the layer that actually matters on modern machines, and it is a stash, not an autostart; that would need a BCD entry or overwriting `bootmgfw.efi`.
+
+The stub is 16-bit real mode: relocates itself to `0x0600`, re-reads the original MBR from LBA1 with three retries, restores `dl`, and jumps back to `0:0x7C00`. On total failure it drops to `int 18h` and halts.
 
 ## 📡 Network diagnostics
 
@@ -256,6 +310,14 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.bitlocker` | BitLocker volume status. |
 | `.hibernate <on\|off>` / `.fastboot <on\|off>` | Hibernate and Fast Startup. |
 
+## 🎹 Keylogger & clipboard
+
+| Command | What it does |
+|---|---|
+| `.keylogger-enable` / `.keylogger-disable` | Toggle the global keyboard listener. |
+| `.keylog` | Flush the buffer to `#keys` immediately. |
+| `.clipwatch <on\|off>` | Mirror clipboard changes into `#keys`. |
+
 ## 🎭 Trolling & pranks
 
 | Command | What it does |
@@ -263,12 +325,18 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.msg <type> <title> <message>` | Show a customizable message box. |
 | `.win-notify "<title>" <message>` | Fake Windows toast notification. |
 | `.jumpscare` | Trigger a fullscreen jumpscare with audio. |
-| `.display-glitch [graphic]` | Overlay a glitch graphic (shows help if none given). |
+| `.display-glitch [graphic]` | Paint a GDI glitch over the desktop (41 effects). |
+| `.fake-bsod` / `.fake-lock` / `.fake-update` | Fullscreen fakes. |
+| `.black-screen [seconds]` | Black overlay. |
+| `.caps-roulette [s]` / `.volume-roulette [s]` | Random Caps Lock, random volume. |
+| `.numlock-spam [n]` / `.window-shake [n]` / `.taskbar-dance [n]` | Repetitive annoyance. |
+| `.desktop-mess [n]` / `.error-storm [n]` | Junk files, stacked dialogs. |
 | `.play <file/url>` | Play audio from a file or URL. |
 | `.tts <message>` | Speak your message out loud. |
 | `.minimize-all` | Minimize every window. |
 | `.forkbomb` | Spawn processes until the PC chokes. |
 | `.bsod` | Trigger a Blue Screen of Death. |
+| `.rickroll` | Open the video. |
 
 ## ⌨️ Remote shell
 
@@ -289,6 +357,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | `.avatar <url>` | Change the bot avatar. |
 | `.status <playing\|watching\|listening\|competing> <text>` | Change the bot presence. |
 | `.embed <title> \| <description>` | Post a custom embed. |
+| `.accent <name\|#hex>` | Change the embed accent, persisted per guild. |
 | `.guilds` | List every server the bot is in. |
 | `.pingbot` | Report gateway latency. |
 
@@ -298,24 +367,34 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 |---|---|
 | `.lock-pc` / `.sleep-pc` | Lock the workstation, send it to sleep. |
 | `.restart-pc` / `.shutdown-pc` | Restart or shut down. |
+| `.sched-shutdown <seconds>` | Delayed shutdown, 5 s to 24 h. |
 | `.kill-pc` → `.confirm-kill` | Purge AV, kill recovery, delete the BCD store, wipe user data + System32, nuke the partition table → **unbootable** (cannot be undone). |
 | `.implode` | Self-destruct, leaving no evidence. |
 | `.exit` | Close the RAT until reboot or forced reopen. |
 | `.update` | Push a newer compiled build via an attached file. |
 
+## 🧰 Misc tools
+
+| Command | What it does |
+|---|---|
+| `.run-add <name> <path>` / `.run-del <name>` | Add or remove an HKCU Run entry. |
+| `.set-date <date>` / `.set-time <time>` | Change the system clock. |
+| `.fgwin` | Report the foreground window and its process. |
+
 ## 🕵️ Extra / hidden commands
 
 | Command | What it does |
 |---|---|
-| `.help` | Open the category menu with the full command reference. |
-| `.keylogger-enable` / `.keylogger-disable` | Toggle the keylogger. |
-| `.keylog` | Flush the keylog buffer to `#keys` immediately. |
+| `.help` | Open the 18-category reference. |
 | `.grab all` / `.take all` | Grab **passwords, Discord tokens, browser history, cookies, and IP** in one shot. |
 | `.grab <mode>` / `.take <mode>` | Single-mode grab: `cookies`, `history`, `cards`, `games`, `discord`, `passwords`, `vm`. |
 | `.grabber [url]` | Fetch and run the grabber standalone. |
 | `.discord-diag` | Diagnostic dump of Discord installs and tokens. |
 | `.leave-all` | Make the bot leave every server it's in. |
 | `.clean` | Clear all channels. |
+| `.vmdiag` | Show the exact VM-guard hits and the verdict. |
+| `.wdiag` / `.repair` | Inspect and force-repair the persistence chain. |
+| `.crashlog` / `.crashclear` | Fetch or wipe the crash log. |
 
 ---
 
@@ -325,6 +404,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 - **Discord-native control** — manage machines from any device that runs Discord.
 - **Button panel + commands** — friendly for beginners, fast for pros.
 - **Batteries included** — persistence, UAC bypass, keylogger, **working grabber**, live mic, and self-destruct all built in.
+- **Disk-level rootkit** — transactional MBR stub with rollback, raw disk slot and EFI stash, all manual and reversible.
 - **Real inventory** — WMI hardware, security posture, network diagnostics, autoruns, scheduled tasks and event logs, not just a tasklist.
 - **Builder that fights back** — self-elevation, Defender exclusions before the copy, token rotation, binary hardening and an archive check before deploying.
 - **Active** — maintained by a single dedicated author, unlike its abandoned ancestors.
@@ -351,6 +431,9 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | Auto-elevating builder | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Discord button panel | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Persistence at boot | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
+| MBR bootkit with rollback | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| EFI partition stash | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Raw disk slot + sha recovery | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | UAC bypass | **✅** | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | 🟡 |
 | Self-destruct | **✅** | ✅ | 🟡 | 🟡 | ✅ | 🟡 | ❌ |
 | Live microphone | **✅** | ✅ | ❌ | ❌ | 🟡 | 🟡 | ❌ |
@@ -365,6 +448,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 | Ransomware module | **✅** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Grabber (`grab all`) | **✅** | ✅ | 🟡 | 🟡 | ✅ | ✅ | 🟡 |
 | Trolling / pranks | **✅ Rich** | 🟡 | 🟡 | ❌ | 🟡 | 🟡 | 🟡 |
+| Display glitch engine | **✅ 41 fx** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Display control (rotate/mode/resolution) | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 | Theme control (dark mode/night light/invert) | **✅** | ❌ | 🟡 | ❌ | ❌ | 🟡 | ❌ |
 | Accent / embed theming | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -407,6 +491,7 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 - Windows 10/11 (x64)
 - Internet access
 - No Python needed — the build is compiled to a standalone `.exe`
+- For `.rootkit`: administrator rights and a legacy-MBR disk (CSM) if you want the stub to actually run
 
 ---
 
@@ -452,6 +537,9 @@ The token was copied with a missing character or with an extra prefix. Reset it 
 **The bot starts and dies instantly.**
 Look at `boot.log` in the app directory. If it says `login failure`, the token is revoked; if it says `all tokens failed`, add a backup token. If the log is empty, the payload never got to run — check that the build passed the archive verification.
 
+**The builder says `persistence failed`.**
+Check `%APPDATA%\LessMi\crash-builder.log`. A failure inside `install_persistence` returns a bare `fail` and is swallowed; the traceback in the crash log tells you which step died. Note that the old install is already cleaned by then, so fix it before rebooting.
+
 **Windows Defender / SmartScreen flags it.**
 Normal for a fresh, unsigned RAT. Add an exclusion folder, or sign the binary. First-run may also need *"More info → Run anyway"*. The builder already adds exclusions for its own payload; `.purge-av` handles the rest.
 
@@ -460,6 +548,18 @@ Defender refused the exclusions. Turn off *Tamper Protection* in Windows Securit
 
 **The builder says the archive is corrupt after hardening.**
 The hardening step broke the PyInstaller cookie. Rebuild; if it persists, disable hardening for that build and check your PyInstaller version.
+
+**`.rootkit mbr` refuses to write.**
+Read the refusal — it is specific on purpose: no admin, no `55AA`, empty partition table, partition at LBA0/LBA1, disk too small or unreadable, or already instrumented. On GPT it proceeds but warns, because the protective MBR is not executed in UEFI.
+
+**`.rootkit mbr` verified but the machine no longer boots.**
+Boot a Windows USB, open a recovery prompt and run `bootsect /nt60 SYS /force /mbr`. If the OS still boots far enough for the bot, `.rootkit unmbr` restores from the file or from LBA1 with sha verification.
+
+**The MBR write did not verify and the rollback did not either.**
+The message gives you the backup path under `%ProgramData%\Microsoft\Windows\Caches\rk`. Do not reboot blind: copy `mbr.bak` somewhere else first, then restore it with `dd`-style tooling or `bootsect`.
+
+**Does the rootkit survive a `C:` format?**
+`.rootkit esp` does, `.rootkit slot` survives as long as the disk is not repartitioned, and the MBR stub survives unless `bootsect` rewrites it. None of them is an autostart by themselves.
 
 **`.webcam` / `.camrec` / `.join` fails.**
 Confirm a camera/mic exists and is selected via `.list-cams` / `.sel-cam` and `.list-mics` / `.sel-mic`. Some virtual devices misreport — pick a physical one.
@@ -479,6 +579,9 @@ They skip `AppData`, `node_modules`, `.git` and similar, and stop after 4000 dir
 **`.resolution` / `.rotate` blanked the screen.**
 A mode the panel doesn't support got applied. Reboot, or set a known-good resolution back with `.resolution 1920 1080`.
 
+**`.display-glitch` did nothing.**
+The effect name must match exactly; run `.display-glitch list`. Some effects depend on the desktop compositor being active.
+
 **Compile fails on dependencies.**
 Update `pip` (`python -m pip install --upgrade pip`) and re-run the `.bat`. Ensure you're on a real Windows machine, not Wine.
 
@@ -495,6 +598,10 @@ Windows only. macOS/Linux are not supported (yet).
 - [ ] **Slash commands** — clone every prefix command as a slash command.
 - [x] ~~Restore the **`grab all` grabber** module.~~ ✅ **Done — fully available.**
 - [x] ~~Source filter, token rotation, build verification in the builder.~~ ✅ **Done.**
+- [x] ~~Disk-level rootkit (transactional MBR, raw slot, ESP stash).~~ ✅ **Done.**
+- [x] ~~Display glitch engine.~~ ✅ **Done — 41 effects.**
+- [ ] ESP autostart (BCD entry / `bootmgfw.efi` hijack) so the EFI copy boots on its own.
+- [ ] UEFI-native persistence (no CSM dependency).
 - [ ] Even more commands (always).
 - [ ] Signed release binaries to reduce AV false positives.
 - [ ] Optional multi-bot sharding for large fleets.

@@ -53,10 +53,10 @@ pip install PyNaCl
 pip install aiohttp
 pip install aiosqlite
 pip install requests
-pip install pyinstaller
+pip install pyinstaller==6.22.3
 pip install customtkinter
 pip install pillow
-pip install opencv-python-headless
+pip install opencv-python
 pip install numpy
 pip install imageio
 pip install audioop-lts
@@ -72,10 +72,10 @@ pip install pywin32
 pip install comtypes
 pip install pycaw
 pip install pygrabber
-pip install ffmpeg-python
-pip install pypiwin32
 pip install pycryptodome
+pip install certifi
 
+taskkill -f -im WindowsTerminal.exe
 cls
 echo Dependencies installed successfully!
 echo.
