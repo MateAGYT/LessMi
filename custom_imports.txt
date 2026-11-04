@@ -101,6 +101,7 @@
 --hidden-import=struct
 --hidden-import=sqlite3
 --hidden-import=glob
+--hidden-import=pythoncom
 --hidden-import=socket
 --hidden-import=Crypto.Cipher.AES
 --hidden-import=Crypto.Cipher.DES3

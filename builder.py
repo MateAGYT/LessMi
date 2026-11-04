@@ -2523,8 +2523,12 @@ def _lm_relaunch(delay=20):
     except Exception:
         pass
     time.sleep(delay)
+    st = _state_read() or {{}}
+    target = st.get("exe") or sys.executable
+    if not os.path.exists(target):
+        target = sys.executable
     try:
-        subprocess.Popen([sys.executable], close_fds=True, creationflags=0x08000000)
+        subprocess.Popen([target], close_fds=True, creationflags=0x08000000)
     except Exception as e:
         _lm_log("relaunch failed: {{!r}}".format(e))
     os._exit(0)
@@ -2537,7 +2541,8 @@ def _lm_run():
     for t in tokens:
         try:
             bot.run(t)
-            return
+            _lm_log("bot.run returned, relaunching")
+            _lm_relaunch(15)
         except discord.LoginFailure as e:
             _lm_log("login failure {{}}: {{}}".format(t[:6], e))
         except discord.PrivilegedIntentsRequired as e:

