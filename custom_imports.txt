@@ -1,3 +1,4 @@
+--uac-admin
 --hidden-import=discord
 --hidden-import=discord.ext.commands
 --hidden-import=discord.ext.tasks
