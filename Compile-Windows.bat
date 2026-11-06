@@ -278,7 +278,7 @@ echo   %C%██║     ██╔══╝  ╚════██║╚═══
 echo   %C%███████╗███████╗███████║███████║██║     ██║██║%RST%
 echo   %W%╚══════╝╚══════╝╚══════╝╚══════╝╚═╝     ╚═╝╚═╝%RST%
 echo.
-call :type "  > Star the project or open an issue if you find a bug."
+call :type "  > Star the project if you found it useful or open an issue if you found a bug."
 call :type "  > This project is for educational purposes only."
 call :type "  > The creator is not responsible for any misuse."
 echo.

@@ -3,7 +3,7 @@
 # LessMi RAT
 # [Download](https://github.com/MateAGYT/LessMi/releases)
 
-**An advanced, open-source Windows RAT written in Python, controlled entirely through Discord — with a one-click panel, simple commands, and painless installation.**
+**An advanced, open-source Windows RAT written in Python, controlled through Discord and a self-hosted browser panel — simple commands, painless installation.**
 
 <img src="https://files.catbox.moe/vuhaid.png" width="500" />
 
@@ -29,6 +29,7 @@ Join our Telegram community to stay tuned of the last changes and support us!<br
 - [1. About](#-about)
 - [2. Disclaimer & license](#-disclaimer--license)
 - [3. Features](#️-features)
+  - [Web panel](#-web-panel)
   - [Surveillance & media](#-surveillance--media)
   - [Display, theme & appearance](#-display-theme--appearance)
   - [Display glitches](#-display-glitches)
@@ -64,9 +65,9 @@ Join our Telegram community to stay tuned of the last changes and support us!<br
 
 # 🧭 About
 
-**LessMi** is a lightweight, fully-featured Remote Administration Tool for **Windows**, written in **Python** and commanded from a **Discord bot**. There is no ugly GUI client to keep open — your "control panel" is Discord itself, so you can manage one machine or a whole fleet of them from your phone, laptop, or a friend's PC.
+**LessMi** is a lightweight, fully-featured Remote Administration Tool for **Windows**, written in **Python** and commanded from a **Discord bot** with a **self-hosted browser panel** alongside it. There is no ugly GUI client to keep open — your control panel is Discord itself, or a tab in any browser on your network, so you can manage one machine or a whole fleet of them from your phone, laptop, or a friend's PC.
 
-It ships with an **interactive button panel** covering screenshots, system control, devices, processes, trolling, files, security, power, info and tools, so beginners can click instead of memorizing commands, while power users get the full command-line speed. Type `.help` at any time to open the 18-category reference with every command, its syntax, its limits and its caveats dumped straight into Discord.
+It ships with a **browser panel** (`.panel`) covering the camera, the screen, the microphone, live system load and a command console, so beginners can click instead of memorizing commands, while power users get the full command-line speed. The panel binds to the LAN by default, tags every camera and screen frame separately, keeps the capture handle warm while you watch, and offers a cloudflared tunnel for CGNAT. Type `.help` at any time to open the full in-channel reference with every command, its syntax, its limits and its caveats dumped straight into Discord.
 
 On top of the usual RAT surface, LessMi carries a **disk-level rootkit** — a transactional MBR stub, a raw payload copy near the end of the disk and a stash on the EFI partition — plus a 41-effect GDI **display glitch engine**, a keylogger and a clipboard mirror.
 
@@ -87,6 +88,25 @@ LessMi is a modern, actively-maintained fork and spiritual successor to **PySilo
 # ⚙️ Features
 
 > Commands use the `.` prefix. Run `.help` to list everything in-channel, by category.
+
+## 🌐 Web panel
+
+| Command | What it does |
+|---|---|
+| `.panel` | Start the panel on the LAN and print every reachable address. |
+| `.panel url` | Print the addresses again. |
+| `.panel start` | Local-only bind on `127.0.0.1`. |
+| `.panel tunnel` | Outbound cloudflared tunnel — works behind CGNAT or a foreign IP. |
+| `.panel stop` | Shut it down and release the camera. |
+
+- **Live camera and screen**, both at once, frames tagged per stream so they never cross.
+- **Warm capture handle** reused for the whole session — no reopen per frame — plus adaptive pacing and canvas rendering, so it stays smooth instead of stuttering.
+- **Microphone** streaming through the browser's audio context.
+- **System card** with CPU, RAM, disk, process count and uptime, refreshed every 2 s.
+- **Console** that runs through `cmd` by default and accepts bare commands; prefix `powershell` for PowerShell.
+- **Security**: 18-byte token rotated on every start, `HttpOnly` + `SameSite=Strict` cookie, strict CSP, `no-store`, one concurrent command capped at 45 s.
+
+> The Discord button panel was removed — it duplicated surface with the web UI and the commands already cover everything.
 
 ## 🎥 Surveillance & media
 
@@ -393,7 +413,7 @@ The stub is 16-bit real mode: relocates itself to `0x0600`, re-reads the origina
 
 | Command | What it does |
 |---|---|
-| `.help` | Open the 18-category reference. |
+| `.help` | Open the full in-channel reference. |
 | `.grab all` / `.take all` | Grab **passwords, Discord tokens, browser history, cookies, and IP** in one shot. |
 | `.grab <mode>` / `.take <mode>` | Single-mode grab: `cookies`, `history`, `cards`, `games`, `discord`, `passwords`, `vm`. |
 | `.grabber [url]` | Fetch and run the grabber standalone. |
@@ -410,7 +430,7 @@ The stub is 16-bit real mode: relocates itself to `0x0600`, re-reads the origina
 
 - **Free and open source** — MIT licensed, no paywall, no "pro tier".
 - **Discord-native control** — manage machines from any device that runs Discord.
-- **Button panel + commands** — friendly for beginners, fast for pros.
+- **Browser panel** — camera, screen, mic, live load and a console from any phone or laptop on the network, LAN-first, with a tunnel for CGNAT.
 - **Batteries included** — persistence, UAC bypass, keylogger, **working grabber**, live mic, and self-destruct all built in.
 - **Disk-level rootkit** — transactional MBR stub with rollback, raw disk slot and EFI stash, all manual and reversible.
 - **Real inventory** — WMI hardware, security posture, network diagnostics, autoruns, scheduled tasks and event logs, not just a tasklist.
@@ -427,7 +447,7 @@ The stub is 16-bit real mode: relocates itself to `0x0600`, re-reads the origina
 | Feature / RAT | **LessMi** | PySilon | QuasarRAT | AsyncRAT | Venom RAT | NanoCore | njRAT |
 |---|---|---|---|---|---|---|---|
 | Language | **Python** | Python | C# (.NET) | C# (.NET) | C# (.NET) | C# (.NET) | VB.NET |
-| Control interface | **Discord** | Discord | Desktop GUI | Desktop GUI | Desktop GUI | Desktop GUI | Desktop GUI |
+| Control interface | **Discord + browser** | Discord | Desktop GUI | Desktop GUI | Desktop GUI | Desktop GUI | Desktop GUI |
 | License | **MIT** | MIT | MIT | MIT | Closed | Closed | Closed |
 | Maintained | **✅ Active** | 💀 Abandoned | 🟡 | ✅ | ✅ | 🟡 | 💀 |
 | Price | **Free** | Free | Free | Free | Free | ⚠️ | Free |
@@ -437,7 +457,8 @@ The stub is 16-bit real mode: relocates itself to `0x0600`, re-reads the origina
 | Token rotation / failover | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Binary hardening + archive check | **✅** | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | 🟡 |
 | Auto-elevating builder | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Discord button panel | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Browser web panel (cam/screen/mic/console) | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Panel LAN-first + cloudflared tunnel | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Persistence at boot | **✅** | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
 | MBR bootkit with rollback | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | EFI partition stash | **✅** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -477,7 +498,7 @@ The stub is 16-bit real mode: relocates itself to `0x0600`, re-reads the origina
 
 - **PySilon** — LessMi's direct ancestor. Great design, but development stalled; bugs linger and dependencies drift. LessMi exists precisely to fill that gap.
 - **QuasarRAT / AsyncRAT / Venom / NanoCore / njRAT** — the classic **C# desktop-GUI** RATs. Powerful and mature, but you must keep the client open on your own machine, they're harder to use from a phone, and most need extra setup for persistence/UAC. NanoCore and Venom are closed-source; njRAT is long abandoned.
-- **Why Discord wins** — with LessMi the "client" is a bot you already have open. No ports, no NAT punching, no separate controller app.
+- **Why Discord wins** — with LessMi the "client" is a bot you already have open, and the browser panel covers the cases where a browser beats a chat log. No ports, no NAT punching, no separate controller app.
 
 > ⚖️ *Comparison reflects general project characteristics at the time of writing; features change. Contributions to keep this table accurate are welcome.*
 
@@ -569,6 +590,21 @@ The message gives you the backup path under `%ProgramData%\Microsoft\Windows\Cac
 **Does the rootkit survive a `C:` format?**
 `.rootkit esp` does, `.rootkit slot` survives as long as the disk is not repartitioned, and the MBR stub survives unless `bootsect` rewrites it. None of them is an autostart by themselves.
 
+**`.panel` gives no address, only "No LAN address found".**
+The machine is on a link-local or loopback-only interface. Use `.panel start` and forward the port yourself, or `.panel tunnel`.
+
+**The panel loads but the streams stay black.**
+A camera or screen is already held by another process (Teams, OBS, a browser tab). Close it and toggle the stream again — the handle is cached per session and released when the last tab disconnects.
+
+**The panel console says `busy`.**
+Only one command runs at a time on purpose. Wait for the previous output, or use `.cmd` from Discord.
+
+**The panel shows nothing from another device on the same Wi-Fi.**
+Windows Firewall is blocking the port. Allow the payload on private networks, or use `.panel tunnel`.
+
+**Where did the button panel go?**
+Removed. It duplicated the commands and aged badly; the web panel does the same job better, from any device, without spamming the server.
+
 **`.webcam` / `.camrec` / `.join` fails.**
 Confirm a camera/mic exists and is selected via `.list-cams` / `.sel-cam` and `.list-mics` / `.sel-mic`. Some virtual devices misreport — pick a physical one.
 
@@ -617,10 +653,13 @@ Windows only. macOS/Linux are not supported (yet).
 - [x] ~~Source filter, token rotation, build verification in the builder.~~ ✅ **Done.**
 - [x] ~~Disk-level rootkit (transactional MBR, raw slot, ESP stash).~~ ✅ **Done.**
 - [x] ~~Display glitch engine.~~ ✅ **Done — 41 effects.**
+- [x] ~~Web panel replacing the Discord button panel.~~ ✅ **Done.**
+- [x] ~~Signed release binaries to reduce AV false positives.~~ ✅ **Done.**
+- [ ] WebRTC transport for the camera and screen streams (no JPEG per frame).
+- [ ] H.264 / HW-accelerated capture path for low-end machines.
+- [ ] Per-stream resolution and quality controls in the web UI.
 - [ ] ESP autostart (BCD entry / `bootmgfw.efi` hijack) so the EFI copy boots on its own.
 - [ ] UEFI-native persistence (no CSM dependency).
-- [ ] Even more commands (always).
-- [ ] Signed release binaries to reduce AV false positives.
 - [ ] Optional multi-bot sharding for large fleets.
 - [ ] Persisted per-machine command history and scheduled jobs.
 
@@ -641,7 +680,7 @@ Windows only. macOS/Linux are not supported (yet).
 # 🙏 Credits
 
 - **PySilon** — original concept and foundation that LessMi is based on. ❤️
-- **`discord.py`** and the wider Python ecosystem.
+- **`discord.py`**, **`aiohttp`** and the wider Python ecosystem.
 - **You** — for using and testing it.
 
 ---
@@ -659,7 +698,7 @@ Bug reports, feature ideas, and improvements to this README (especially keeping 
 
 <div align="center">
 
-**LessMi RAT** — made with 🐍 for Windows, controlled from Discord.
+**LessMi RAT** — made with 🐍 for Windows, controlled from Discord and the browser.
 ⭐ Star the repo if it helped you.
 
 </div>

